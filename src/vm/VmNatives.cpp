@@ -31,6 +31,14 @@ extern std::vector<std::string> g_scriptArgv;
 #define M_E 2.71828182845904523536
 #endif
 
+// One engine behind random.*, randint(), rand() and Math.random(), so that
+// random.seed(n) makes the whole family reproducible.
+static std::mt19937_64 &sharedRng()
+{
+    static std::mt19937_64 rng(std::random_device{}());
+    return rng;
+}
+
 static double toNum2(const QuantumValue &v, const std::string &ctx)
 {
     if (v.isNumber())
@@ -259,7 +267,7 @@ void VM::registerNatives()
         return QuantumValue(out.str()); });
     reg("randint", [](std::vector<QuantumValue> args) -> QuantumValue
         {
-        static std::mt19937_64 rng(std::random_device{}());
+        auto &rng = sharedRng();
         long long lo = args.empty() ? 0 : static_cast<long long>(args[0].asNumber());
         long long hi = args.size() > 1 ? static_cast<long long>(args[1].asNumber()) : lo;
         if (lo > hi) std::swap(lo, hi);
@@ -351,60 +359,44 @@ void VM::registerNatives()
         { return QuantumValue(std::atan(toNum2(a[0], "atan"))); });
     reg("atan2", [](std::vector<QuantumValue> a) -> QuantumValue
         { return QuantumValue(std::atan2(toNum2(a[0], "atan2"), toNum2(a[1], "atan2"))); });
-    // Shared by min/max: call a key function (Python max(xs, key=fn) style)
-    auto callKeyFn = [this](QuantumValue fn, QuantumValue arg) -> QuantumValue
+    // min / max over several arguments or one iterable, with Python's key=
+    // (also a positional function) and default=; the first extreme wins.
+    for (const char *which : {"min", "max"})
     {
-        if (fn.isNative())
-            return fn.asNative()->fn({arg});
-        if (fn.isFunction())
-        {
-            push(fn);
-            push(arg);
-            callClosure(fn.asFunction(), 1, 0);
-            runFrame(frames_.size() - 1);
-            return pop();
-        }
-        throw TypeError("min/max key= is not callable");
-    };
-    auto minmaxWithKey = [callKeyFn](std::vector<QuantumValue> &a, bool wantMax,
-                                     const char *name) -> QuantumValue
-    {
-        auto &arr = *a[0].asArray();
-        if (arr.empty())
-            throw RuntimeError(std::string(name) + "(): empty");
-        QuantumValue best = arr[0];
-        double bestKey = toNum2(callKeyFn(a[1], arr[0]), name);
-        for (size_t i = 1; i < arr.size(); i++)
-        {
-            double k = toNum2(callKeyFn(a[1], arr[i]), name);
-            if (wantMax ? (k > bestKey) : (k < bestKey))
+        bool wantMax = std::string(which) == "max";
+        std::string fname = which;
+        reg(which, [this, wantMax, fname](std::vector<QuantumValue> a) -> QuantumValue
             {
-                bestKey = k;
-                best = arr[i];
+            auto kw = takeKwargs(a);
+            QuantumValue key;
+            if (a.size() == 2 && a[0].isArray() && (a[1].isFunction() || a[1].isBoundMethod())) {
+                key = a[1];
+                a.pop_back();
             }
-        }
-        return best;
-    };
-    reg("min", [minmaxWithKey](std::vector<QuantumValue> a) -> QuantumValue
-        {
-        if (a.empty()) throw RuntimeError("min() expected args");
-        if (a.size()>=2 && a[0].isArray() && (a[1].isFunction() || a[1].isNative()))
-            return minmaxWithKey(a, false, "min");
-        if (a.size()==1 && a[0].isArray()) {
-            auto &arr=*a[0].asArray(); if(arr.empty()) throw RuntimeError("min(): empty");
-            double m=toNum2(arr[0],"min"); for(size_t i=1;i<arr.size();i++) m=std::min(m,toNum2(arr[i],"min")); return QuantumValue(m);
-        }
-        double m=toNum2(a[0],"min"); for(size_t i=1;i<a.size();i++) m=std::min(m,toNum2(a[i],"min")); return QuantumValue(m); });
-    reg("max", [minmaxWithKey](std::vector<QuantumValue> a) -> QuantumValue
-        {
-        if (a.empty()) throw RuntimeError("max() expected args");
-        if (a.size()>=2 && a[0].isArray() && (a[1].isFunction() || a[1].isNative()))
-            return minmaxWithKey(a, true, "max");
-        if (a.size()==1 && a[0].isArray()) {
-            auto &arr=*a[0].asArray(); if(arr.empty()) throw RuntimeError("max(): empty");
-            double m=toNum2(arr[0],"max"); for(size_t i=1;i<arr.size();i++) m=std::max(m,toNum2(arr[i],"max")); return QuantumValue(m);
-        }
-        double m=toNum2(a[0],"max"); for(size_t i=1;i<a.size();i++) m=std::max(m,toNum2(a[i],"max")); return QuantumValue(m); });
+            if (kw && kw->count("key")) key = kw->at("key");
+            Array items;
+            if (a.size() == 1 && a[0].isArray()) items = *a[0].asArray();
+            else if (a.size() == 1 && a[0].isString())
+                for (char c : a[0].asString()) items.push_back(QuantumValue(std::string(1, c)));
+            else if (a.size() == 1 && a[0].isDict())
+                for (auto &kv : *a[0].asDict()) items.push_back(QuantumValue(kv.first));
+            else items = a;
+            if (items.empty()) {
+                if (kw && kw->count("default")) return kw->at("default");
+                throw RuntimeError(fname + "() arg is an empty sequence");
+            }
+            bool keyed = key.isFunction() || key.isBoundMethod();
+            QuantumValue best = items[0];
+            QuantumValue bestKey = keyed ? invokeCallable(key, {best}) : best;
+            for (size_t i = 1; i < items.size(); ++i) {
+                QuantumValue k = keyed ? invokeCallable(key, {items[i]}) : items[i];
+                if (wantMax ? stlLess(bestKey, k) : stlLess(k, bestKey)) {
+                    best = items[i];
+                    bestKey = k;
+                }
+            }
+            return best; });
+    }
 
     // ── Utility ───────────────────────────────────────────────────────────
     reg("len", [](std::vector<QuantumValue> args) -> QuantumValue
@@ -445,8 +437,20 @@ void VM::registerNatives()
         return QuantumValue(arr); });
     reg("print", [](std::vector<QuantumValue> args) -> QuantumValue
         {
-        for (size_t i=0;i<args.size();i++) { if(i) std::cout<<" "; std::cout<<args[i].toString(); }
-        std::cout<<"\n";
+        // Python keyword arguments arrive as a trailing dict (see Op::CALL).
+        std::string sep = " ", end = "\n";
+        if (!args.empty() && args.back().isDict() && args.back().asDict()->count("__kwargs__"))
+        {
+            auto kw = args.back().asDict();
+            args.pop_back();
+            auto s = kw->find("sep");
+            if (s != kw->end() && !s->second.isNil()) sep = s->second.toString();
+            auto e = kw->find("end");
+            if (e != kw->end() && !e->second.isNil()) end = e->second.toString();
+        }
+        for (size_t i=0;i<args.size();i++) { if(i) std::cout<<sep; std::cout<<args[i].toString(); }
+        std::cout<<end;
+        std::cout.flush();
         return QuantumValue(); });
     reg("__contains__", [](std::vector<QuantumValue> args) -> QuantumValue
         {
@@ -809,15 +813,147 @@ void VM::registerNatives()
             if((*nat)->fn({v}).isTruthy()) arr->push_back(v);
         }
         return QuantumValue(arr); });
-    reg("sorted", [](std::vector<QuantumValue> args) -> QuantumValue
+    // Emitted first in a compiled .py program (see compileSource).
+    reg("__python_repr__", [](std::vector<QuantumValue>) -> QuantumValue
         {
-        if(args.empty()||!args[0].isArray()) throw RuntimeError("sorted() requires array");
-        auto copy=std::make_shared<Array>(*args[0].asArray());
-        bool rev=args.size()>1&&args[1].isTruthy();
-        std::sort(copy->begin(),copy->end(),[rev](const QuantumValue &a,const QuantumValue &b){
-            bool lt = a.isNumber()&&b.isNumber() ? a.asNumber()<b.asNumber() : a.toString()<b.toString();
-            return rev ? !lt : lt;
-        });
+        g_pythonRepr = true;
+        return QuantumValue(); });
+
+    // Python set(iterable) / frozenset(...): a dict of members → true, the
+    // same shape set literals compile to. Weak: a C++ class's own `set()`
+    // setter still wins under implicit `this`.
+    for (const char *setName : {"set", "frozenset"})
+    {
+        reg(setName, [](std::vector<QuantumValue> args) -> QuantumValue
+            {
+            auto s = std::make_shared<Dict>();
+            if (args.empty() || args[0].isNil()) return QuantumValue(s);
+            const QuantumValue &src = args[0];
+            if (src.isArray())
+                for (auto &v : *src.asArray()) (*s)[v.toString()] = QuantumValue(true);
+            else if (src.isString())
+                for (char c : src.asString()) (*s)[std::string(1, c)] = QuantumValue(true);
+            else if (src.isDict())
+                for (auto &kv : *src.asDict()) (*s)[kv.first] = QuantumValue(true);
+            return QuantumValue(s); });
+        weakGlobals_.insert(setName);
+    }
+
+    // Python's str.replace replaces every occurrence (JS's replaces the
+    // first). The parser routes `.replace(...)` calls in Python code here;
+    // anything that is not a string gets its own replace method.
+    reg("__py_replace__", [this](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        if (args.empty()) return QuantumValue();
+        QuantumValue obj = args[0];
+        std::vector<QuantumValue> rest(args.begin() + 1, args.end());
+        if (!obj.isString() || rest.size() < 2)
+            return callBuiltinMethod(obj, "replace", rest, 0);
+        std::string s = obj.asString(), from = rest[0].toString(), to = rest[1].toString();
+        long long limit = rest.size() > 2 && rest[2].isNumber() ? (long long)rest[2].asNumber() : -1;
+        if (from.empty()) return QuantumValue(s);
+        std::string out;
+        size_t p = 0, f;
+        long long done = 0;
+        while ((limit < 0 || done < limit) && (f = s.find(from, p)) != std::string::npos) {
+            out += s.substr(p, f - p) + to;
+            p = f + from.size();
+            ++done;
+        }
+        return QuantumValue(out + s.substr(p)); });
+
+    // Python's `string` module (`import string`). The global `string` stays
+    // the C++ conversion function; an import binds the module over it.
+    auto pyStringModule = std::make_shared<Dict>();
+    {
+        const std::string lower = "abcdefghijklmnopqrstuvwxyz", upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                          digits = "0123456789", punct = "!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~",
+                          ws = " \t\n\r\x0b\x0c";
+        (*pyStringModule)["ascii_lowercase"] = QuantumValue(lower);
+        (*pyStringModule)["ascii_uppercase"] = QuantumValue(upper);
+        (*pyStringModule)["ascii_letters"] = QuantumValue(lower + upper);
+        (*pyStringModule)["digits"] = QuantumValue(digits);
+        (*pyStringModule)["hexdigits"] = QuantumValue(digits + "abcdefABCDEF");
+        (*pyStringModule)["octdigits"] = QuantumValue(std::string("01234567"));
+        (*pyStringModule)["punctuation"] = QuantumValue(punct);
+        (*pyStringModule)["whitespace"] = QuantumValue(ws);
+        (*pyStringModule)["printable"] = QuantumValue(digits + lower + upper + punct + ws);
+        auto capwords = std::make_shared<QuantumNative>();
+        capwords->name = "string.capwords";
+        capwords->fn = [](std::vector<QuantumValue> a) -> QuantumValue
+        {
+            std::istringstream words(a.empty() ? "" : a[0].toString());
+            std::string w, out;
+            while (words >> w)
+            {
+                for (auto &c : w)
+                    c = (char)std::tolower((unsigned char)c);
+                w[0] = (char)std::toupper((unsigned char)w[0]);
+                out += (out.empty() ? "" : " ") + w;
+            }
+            return QuantumValue(out);
+        };
+        (*pyStringModule)["capwords"] = QuantumValue(capwords);
+    }
+
+    // `import M [as A]` / `from M import N [as A]` for a module with no file
+    // on disk (see Compiler::compileImport): binds what the VM provides.
+    // A plain `import random` of an existing global is a no-op; an alias or a
+    // from-import binds the module / member under the new name.
+    reg("__import_bind__", [this, pyStringModule](std::vector<QuantumValue> a) -> QuantumValue
+        {
+        std::string module = a.size() > 0 ? a[0].toString() : "";
+        std::string name = a.size() > 1 ? a[1].toString() : "";
+        std::string alias = a.size() > 2 ? a[2].toString() : "";
+        auto moduleValue = [&](const std::string &m) -> QuantumValue {
+            if (m == "string") return QuantumValue(pyStringModule);
+            return globals->has(m) ? globals->get(m) : QuantumValue();
+        };
+        auto bind = [&](const std::string &n, const QuantumValue &v) {
+            globals->define(n, v);
+            weakGlobals_.erase(n);
+        };
+        if (module.empty()) {
+            QuantumValue mod = moduleValue(name);
+            if (!mod.isNil() && (!alias.empty() || name == "string"))
+                bind(alias.empty() ? name : alias, mod);
+            return QuantumValue();
+        }
+        QuantumValue mod = moduleValue(module);
+        std::string target = alias.empty() ? name : alias;
+        if (mod.isDict() && mod.asDict()->count(name))
+            bind(target, mod.asDict()->at(name));
+        else if (!alias.empty() && globals->has(name))
+            bind(target, globals->get(name));
+        return QuantumValue(); });
+
+    // sorted(iterable, key=None, reverse=False). Positionally, a function is
+    // the key (a two-parameter one, a comparator) and a bool is `reverse`.
+    reg("sorted", [this](std::vector<QuantumValue> args) -> QuantumValue
+        {
+        auto kw = takeKwargs(args);
+        if (args.empty()) throw RuntimeError("sorted() requires an iterable");
+        auto copy = std::make_shared<Array>();
+        if (args[0].isArray()) *copy = *args[0].asArray();
+        else if (args[0].isString())
+            for (char c : args[0].asString()) copy->push_back(QuantumValue(std::string(1, c)));
+        else if (args[0].isDict())
+            for (auto &kv : *args[0].asDict()) copy->push_back(QuantumValue(kv.first));
+        else throw RuntimeError("sorted() requires an iterable, got " + args[0].typeName());
+        QuantumValue key, cmp;
+        bool reverse = false;
+        for (size_t i = 1; i < args.size(); ++i) {
+            if (args[i].isBool()) reverse = args[i].asBool();
+            else if (args[i].isClosure() && args[i].asFunction()->chunk->params.size() == 2) cmp = args[i];
+            else if (args[i].isFunction() || args[i].isBoundMethod()) key = args[i];
+        }
+        if (kw) {
+            auto k = kw->find("key");
+            if (k != kw->end()) key = k->second;
+            auto r = kw->find("reverse");
+            if (r != kw->end()) reverse = r->second.isTruthy();
+        }
+        sortValues(*copy, key, cmp, reverse);
         return QuantumValue(copy); });
     reg("reversed", [](std::vector<QuantumValue> args) -> QuantumValue
         {
@@ -1201,7 +1337,7 @@ void VM::registerNatives()
                 { return QuantumValue(std::cbrt(toNum2(a[0], "Math.cbrt"))); });
         mathReg("random", [](std::vector<QuantumValue>)
                 {
-            static std::mt19937_64 rng(std::random_device{}());
+            auto &rng = sharedRng();
             std::uniform_real_distribution<double> dist(0.0,1.0);
             return QuantumValue(dist(rng)); });
         // Expose PI and E on the Math object too
@@ -1985,7 +2121,7 @@ void VM::registerNatives()
         randomNat->name = "random.random";
         randomNat->fn = [](std::vector<QuantumValue>) -> QuantumValue
         {
-            static std::mt19937_64 rng(std::random_device{}());
+            auto &rng = sharedRng();
             std::uniform_real_distribution<double> dist(0.0, 1.0);
             return QuantumValue(dist(rng));
         };
@@ -1993,7 +2129,7 @@ void VM::registerNatives()
         randintNat->name = "random.randint";
         randintNat->fn = [](std::vector<QuantumValue> args) -> QuantumValue
         {
-            static std::mt19937_64 rng(std::random_device{}());
+            auto &rng = sharedRng();
             long long lo = args.empty() ? 0 : static_cast<long long>(args[0].asNumber());
             long long hi = args.size() > 1 ? static_cast<long long>(args[1].asNumber()) : lo;
             if (lo > hi) std::swap(lo, hi);
@@ -2009,7 +2145,7 @@ void VM::registerNatives()
                 return QuantumValue(out);
             auto pool = *args[0].asArray();
             int k = std::max(0, static_cast<int>(args[1].asNumber()));
-            static std::mt19937_64 rng(std::random_device{}());
+            auto &rng = sharedRng();
             std::shuffle(pool.begin(), pool.end(), rng);
             for (int i = 0; i < k && i < static_cast<int>(pool.size()); ++i)
                 out->push_back(pool[i]);
@@ -2019,7 +2155,7 @@ void VM::registerNatives()
         randNat->name = "rand";
         randNat->fn = [](std::vector<QuantumValue> args) -> QuantumValue
         {
-            static std::mt19937_64 rng(std::random_device{}());
+            auto &rng = sharedRng();
             if (args.empty()) {
                 std::uniform_real_distribution<double> dist(0.0, 1.0);
                 return QuantumValue(dist(rng));
@@ -2033,6 +2169,80 @@ void VM::registerNatives()
         (*randomDict)["random"] = QuantumValue(randomNat);
         (*randomDict)["randint"] = QuantumValue(randintNat);
         (*randomDict)["sample"] = QuantumValue(sampleNat);
+
+        // The rest of Python's `random` module.
+        auto randomFn = [&](const std::string &name, QuantumNativeFunc fn)
+        {
+            auto nat = std::make_shared<QuantumNative>();
+            nat->name = "random." + name;
+            nat->fn = std::move(fn);
+            (*randomDict)[name] = QuantumValue(nat);
+        };
+        // Elements of a sequence argument: array, or the characters of a string.
+        auto elements = [](const QuantumValue &v)
+        {
+            Array items;
+            if (v.isArray())
+                items = *v.asArray();
+            else if (v.isString())
+                for (char c : v.asString())
+                    items.push_back(QuantumValue(std::string(1, c)));
+            else if (v.isDict())
+                for (auto &kv : *v.asDict())
+                    items.push_back(QuantumValue(kv.first));
+            return items;
+        };
+        randomFn("seed", [](std::vector<QuantumValue> a) -> QuantumValue
+                 {
+            if (a.empty() || a[0].isNil())
+                sharedRng().seed(std::random_device{}());
+            else if (a[0].isNumber())
+                sharedRng().seed(static_cast<unsigned long long>(a[0].asNumber()));
+            else
+                sharedRng().seed(std::hash<std::string>{}(a[0].toString()));
+            return QuantumValue(); });
+        randomFn("choice", [elements](std::vector<QuantumValue> a) -> QuantumValue
+                 {
+            Array items = a.empty() ? Array{} : elements(a[0]);
+            if (items.empty()) throw RuntimeError("IndexError: Cannot choose from an empty sequence");
+            std::uniform_int_distribution<size_t> dist(0, items.size() - 1);
+            return items[dist(sharedRng())]; });
+        randomFn("choices", [elements](std::vector<QuantumValue> a) -> QuantumValue
+                 {
+            // choices(population, weights=None, k=1) — positional k only
+            Array items = a.empty() ? Array{} : elements(a[0]);
+            size_t k = a.size() > 1 && a.back().isNumber() ? (size_t)a.back().asNumber() : 1;
+            auto out = std::make_shared<Array>();
+            if (items.empty()) return QuantumValue(out);
+            std::uniform_int_distribution<size_t> dist(0, items.size() - 1);
+            for (size_t i = 0; i < k; ++i) out->push_back(items[dist(sharedRng())]);
+            return QuantumValue(out); });
+        randomFn("shuffle", [](std::vector<QuantumValue> a) -> QuantumValue
+                 {
+            if (!a.empty() && a[0].isArray())
+                std::shuffle(a[0].asArray()->begin(), a[0].asArray()->end(), sharedRng());
+            return QuantumValue(); });
+        randomFn("uniform", [](std::vector<QuantumValue> a) -> QuantumValue
+                 {
+            double lo = a.size() > 0 && a[0].isNumber() ? a[0].asNumber() : 0.0;
+            double hi = a.size() > 1 && a[1].isNumber() ? a[1].asNumber() : 1.0;
+            if (lo > hi) std::swap(lo, hi);
+            return QuantumValue(std::uniform_real_distribution<double>(lo, hi)(sharedRng())); });
+        randomFn("randrange", [](std::vector<QuantumValue> a) -> QuantumValue
+                 {
+            // randrange(stop) / randrange(start, stop[, step])
+            long long start = 0, stop = 0, step = 1;
+            if (a.size() == 1) stop = (long long)a[0].asNumber();
+            else if (a.size() >= 2) {
+                start = (long long)a[0].asNumber();
+                stop = (long long)a[1].asNumber();
+                if (a.size() > 2) step = (long long)a[2].asNumber();
+            }
+            if (step == 0) throw RuntimeError("ValueError: randrange() step must not be zero");
+            long long n = step > 0 ? (stop - start + step - 1) / step : (start - stop - step - 1) / -step;
+            if (n <= 0) throw RuntimeError("ValueError: empty range for randrange()");
+            std::uniform_int_distribution<long long> dist(0, n - 1);
+            return QuantumValue((double)(start + step * dist(sharedRng()))); });
         globals->define("random", QuantumValue(randomDict));
         globals->define("rand", QuantumValue(randNat));
     }
@@ -2349,39 +2559,9 @@ void VM::registerNatives()
             return QuantumValue();
         };
 
-        auto dateDict = std::make_shared<Dict>();
-        auto dateNow = std::make_shared<QuantumNative>();
-        dateNow->name = "Date.now";
-        dateNow->fn = [nowMs](std::vector<QuantumValue>) -> QuantumValue
-        {
-            return QuantumValue(*nowMs);
-        };
-        (*dateDict)["now"] = QuantumValue(dateNow);
-        auto dateNew = std::make_shared<QuantumNative>();
-        dateNew->name = "Date.__new__";
-        dateNew->fn = [nowMs](std::vector<QuantumValue>) -> QuantumValue
-        {
-            auto instance = std::make_shared<Dict>();
-            auto locale = std::make_shared<QuantumNative>();
-            locale->name = "DateInstance.toLocaleString";
-            locale->fn = [nowMs](std::vector<QuantumValue>) -> QuantumValue
-            {
-                std::time_t secs = static_cast<std::time_t>(*nowMs / 1000.0);
-                std::tm tmValue{};
-#ifdef _WIN32
-                localtime_s(&tmValue, &secs);
-#else
-                tmValue = *std::localtime(&secs);
-#endif
-                std::ostringstream out;
-                out << std::put_time(&tmValue, "%Y-%m-%d %H:%M:%S");
-                return QuantumValue(out.str());
-            };
-            (*instance)["toLocaleString"] = QuantumValue(locale);
-            return QuantumValue(instance);
-        };
-        (*dateDict)["__new__"] = QuantumValue(dateNew);
-        globals->define("Date", QuantumValue(dateDict));
+        // Real JS Date (VmJsRuntime.cpp); Date.now() includes the simulated
+        // time setTimeout advances.
+        globals->define("Date", makeJsDateModule(nowMs));
 
         reg("setTimeout", [nowMs, nextTimerId, activeTimers, invoke](std::vector<QuantumValue> args) mutable -> QuantumValue
             {

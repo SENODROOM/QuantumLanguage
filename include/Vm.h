@@ -65,6 +65,10 @@ struct CallFrame
     size_t ip;        // instruction pointer
     size_t stackBase; // where locals start on the value stack
     int argCount = 0; // arguments the caller actually supplied (incl. self)
+    // Per parameter slot, whether the caller supplied it — set when keyword
+    // arguments leave gaps (`f(a, c=3)` skips `b`); empty means "the first
+    // argCount slots".
+    std::vector<bool> passed;
 };
 
 // ─── ExceptionHandler ─────────────────────────────────────────────────────────
@@ -84,6 +88,20 @@ QuantumValue makeStlIterator(std::shared_ptr<Array> arr, long pos);
 std::shared_ptr<Array> stlIteratorArray(const QuantumValue &v);
 long stlIteratorPos(const QuantumValue &v);
 QuantumValue stlIteratorDeref(const QuantumValue &v);
+
+// Keyword arguments reach a keyword-aware native (print, sorted, list.sort,
+// min, max) as a trailing dict tagged "__kwargs__" (see Op::CALL). Removes
+// and returns it, or nullptr when the call had none.
+std::shared_ptr<Dict> takeKwargs(std::vector<QuantumValue> &args);
+
+// ─── JavaScript runtime objects (VmJsRuntime.cpp) ─────────────────────────────
+// Date / URL / URLSearchParams are dicts tagged by a hidden key; their methods
+// dispatch through callJsObjectMethod (from VM::callDictMethod).
+bool isJsDate(const QuantumValue &v);
+double jsDateMs(const QuantumValue &v);
+QuantumValue makeJsDateModule(std::shared_ptr<double> simulatedMs);
+bool callJsObjectMethod(const std::shared_ptr<Dict> &d, const std::string &method,
+                        const std::vector<QuantumValue> &args, QuantumValue &out);
 
 // ─── VM ───────────────────────────────────────────────────────────────────────
 class VM
@@ -106,6 +124,20 @@ private:
     // Open upvalues linked list (for closing)
     std::vector<std::shared_ptr<Upvalue>> openUpvalues_;
 
+    // Keyword-argument binding (Op::KW_NAMES → the next CALL).
+    std::vector<std::string> pendingKwNames_;
+    // Set by bindKeywordArgs: the args on the stack are already laid out one
+    // per parameter, so callClosure must not re-collect varargs.
+    bool kwArranged_ = false;
+    std::vector<bool> kwPassed_;
+    // Reorders the `argCount` values on top of the stack, named by `names`,
+    // into `closure`'s parameter order: keywords bind by name, unmatched
+    // ones fill a **kwargs dict (or remaining slots), extras a *args array.
+    // `hasSelf`: the closure's first parameter is a receiver not yet on the
+    // stack. Returns the new argument count.
+    int bindKeywordArgs(const std::shared_ptr<Closure> &closure, int argCount,
+                        const std::vector<std::string> &names, bool hasSelf);
+
     long long stepCount_ = 0;
     static constexpr long long MAX_STEPS = 200'000'000;
     std::vector<std::pair<QuantumValue, size_t>> pendingInstances_;
@@ -113,6 +145,7 @@ private:
     // ── Native registration ───────────────────────────────────────────────────
     void registerNatives();
     void registerStlNatives(); // <algorithm>-style free functions (VmStl.cpp)
+    void registerJsRuntimeNatives(); // URL, window, encodeURIComponent (VmJsRuntime.cpp)
     // Globals that yield to a same-named member inside a method: common
     // identifiers like `next`/`count`/`find` registered as STL algorithms
     // must not shadow a C++ class's own `next` field or `find()` method under
@@ -121,6 +154,11 @@ private:
     // Ordering used by sort/max_element/... without a comparator: numbers,
     // strings, arrays (pairs) lexicographically, instances via __lt__.
     bool stlLess(const QuantumValue &a, const QuantumValue &b);
+    // Stable sort shared by sorted() and list.sort(): `key` (Python key=)
+    // maps each element to its sort key; otherwise `cmp` is a JS/C++/Ruby
+    // comparator (a number < 0 or `true` means a sorts first). `reverse`
+    // keeps equal elements in order, as Python's does.
+    void sortValues(Array &arr, const QuantumValue &key, const QuantumValue &cmp, bool reverse);
 
     // ── Execution ────────────────────────────────────────────────────────────
     void runFrame(size_t stopDepth = 0);

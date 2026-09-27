@@ -313,8 +313,18 @@ QuantumValue VM::callStringMethod(const std::string &str, const std::string &m,
     }
     if (m == "split")
     {
-        std::string sep = args.empty() ? "" : (args[0].isNil() ? "" : args[0].toString());
         auto arr = std::make_shared<Array>();
+        // split() / split(None): runs of whitespace, ignoring leading and
+        // trailing whitespace (Python, Ruby). split("") is JS's char split.
+        if (args.empty() || args[0].isNil())
+        {
+            std::istringstream words(str);
+            std::string w;
+            while (words >> w)
+                arr->push_back(QuantumValue(w));
+            return QuantumValue(arr);
+        }
+        std::string sep = args[0].toString();
         if (sep.empty())
         {
             for (char c : str)

@@ -157,6 +157,17 @@ Token Lexer::readNumber()
             }
             num += advance();
         }
+        // Exponent: 1e20, 2.5E-3, 6e+10
+        if ((current() == 'e' || current() == 'E') &&
+            (std::isdigit((unsigned char)peek()) ||
+             ((peek() == '+' || peek() == '-') && std::isdigit((unsigned char)peek(2)))))
+        {
+            num += advance(); // e
+            if (current() == '+' || current() == '-')
+                num += advance();
+            while (pos < src.size() && std::isdigit((unsigned char)current()))
+                num += advance();
+        }
         // Strip C integer/float suffixes: LL, ULL, LU, L, U, F, f (e.g. 1000000007LL, 3.14f)
         while (pos < src.size() && (current() == 'L' || current() == 'l' ||
                                     current() == 'U' || current() == 'u' ||

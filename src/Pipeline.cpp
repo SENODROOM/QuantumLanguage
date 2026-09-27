@@ -1,4 +1,5 @@
 #include "ModuleResolver.h"
+#include "Dialect.h"
 #include "Pipeline.h"
 #include "Lexer.h"
 #include "Parser.h"
@@ -21,7 +22,21 @@ std::shared_ptr<Chunk> compileSource(const std::string &source,
     Lexer lexer(source);
     auto tokens = lexer.tokenize();
     Parser parser(std::move(tokens));
+    const bool python = fileExtLower(sourcePath) == ".py";
+    parser.setPythonSource(python);
     auto ast = parser.parse();
+
+    // A Python program prints Python's way (True / None / 'str' in lists).
+    // Done by an instruction rather than a runner flag so that a bundled
+    // .exe behaves the same.
+    if (python && ast->is<BlockStmt>())
+    {
+        CallExpr call;
+        call.callee = std::make_unique<ASTNode>(Identifier{"__python_repr__"}, 0);
+        auto &stmts = ast->as<BlockStmt>().statements;
+        stmts.insert(stmts.begin(), std::make_unique<ASTNode>(
+                                        ExprStmt{std::make_unique<ASTNode>(std::move(call), 0)}, 0));
+    }
 
     resolveUseDirectives(*ast, source, sourcePath);
     resolveImports(*ast, sourcePath);

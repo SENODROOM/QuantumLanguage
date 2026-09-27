@@ -184,9 +184,12 @@ void Compiler::compileNode(ASTNode &node) {
           emitBreak(ln);
         else if constexpr (std::is_same_v<T, ContinueStmt>)
           emitContinue(ln);
-        else if constexpr (std::is_same_v<T, ImportStmt>) { /* natives handle
-                                                               imports */
-        } else if constexpr (std::is_same_v<T, ExprStmt>) {
+        else if constexpr (std::is_same_v<T, ImportStmt>)
+          compileImport(n, ln);
+        else if constexpr (std::is_same_v<T, GlobalStmt>) {
+          // scoping only — read by compileFunction's local analysis
+        }
+        else if constexpr (std::is_same_v<T, ExprStmt>) {
           compileExpr(*n.expr);
           if (!n.expr->template is<ReturnStmt>())
             emit(Op::POP, 0, ln);

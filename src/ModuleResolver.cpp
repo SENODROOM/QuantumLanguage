@@ -173,16 +173,22 @@ namespace
                 // bare `import moduleA, moduleB` -- pulls in every exported
                 // symbol from each named module (no per-symbol selection,
                 // no module namespace object).
+                ImportStmt hostModules; // no file on disk: the VM binds these
                 for (const auto &item : imp.imports)
                 {
                     fs::path modPath = resolveModulePath(item.name, dir);
                     if (modPath.empty())
-                        continue; // host-language library, see above
+                    {
+                        hostModules.imports.push_back(item); // host-language library
+                        continue;
+                    }
 
                     auto exports = loadModuleExports(modPath, resolving);
                     for (auto &kv : exports)
                         newStmts.push_back(std::move(kv.second));
                 }
+                if (!hostModules.imports.empty())
+                    newStmts.push_back(std::make_unique<ASTNode>(std::move(hostModules), stmt->line));
             }
         }
 

@@ -45,6 +45,7 @@ VM::VM()
     globals = std::make_shared<Environment>();
     registerNatives();
     registerStlNatives();
+    registerJsRuntimeNatives();
 }
 
 // ─── Run ─────────────────────────────────────────────────────────────────────
@@ -156,6 +157,23 @@ bool VM::valuesEqual(const QuantumValue &a, const QuantumValue &b)
         }
         return true;
     }
+    // Reference types compare by identity: `node == node->parent->left`,
+    // `x != NIL` sentinel checks (an __eq__ overload is dispatched earlier,
+    // in execBinary).
+    if (a.isInstance() && b.isInstance())
+        return a.asInstance() == b.asInstance();
+    if (a.isClosure() && b.isClosure())
+        return a.asFunction() == b.asFunction();
+    if (a.isNative() && b.isNative())
+        return a.asNative() == b.asNative();
+    if (a.isClass() && b.isClass())
+        return a.asClass() == b.asClass();
+    if (a.isBoundMethod() && b.isBoundMethod())
+        return a.asBoundMethod()->method == b.asBoundMethod()->method &&
+               valuesEqual(a.asBoundMethod()->self, b.asBoundMethod()->self);
+    if (a.isPointer() && b.isPointer())
+        return a.asPointer()->cell == b.asPointer()->cell &&
+               a.asPointer()->offset == b.asPointer()->offset;
     return false;
 }
 
@@ -167,6 +185,17 @@ QuantumValue VM::execBinary(Op op, const QuantumValue &L_in, const QuantumValue 
     QuantumValue R = R_in;
     if (L.isNative()) L = L.asNative()->fn({});
     if (R.isNative()) R = R.asNative()->fn({});
+
+    // A JS Date in arithmetic or ordering is its epoch ms (`Date.now() - d`,
+    // `d1 < d2`), as through valueOf.
+    if (op == Op::SUB || op == Op::MUL || op == Op::DIV || op == Op::MOD || op == Op::LT ||
+        op == Op::GT || op == Op::LTE || op == Op::GTE)
+    {
+        if (isJsDate(L))
+            L = QuantumValue(jsDateMs(L));
+        if (isJsDate(R))
+            R = QuantumValue(jsDateMs(R));
+    }
 
     // STL iterator arithmetic and comparison: v.begin() + n, it - first,
     // it != v.end(), ++it.
@@ -495,10 +524,116 @@ void VM::callValue(QuantumValue callee, int argCount, int line)
     throw TypeError("Cannot call value of type " + callee.typeName(), line);
 }
 
+int VM::bindKeywordArgs(const std::shared_ptr<Closure> &closure, int argCount,
+                        const std::vector<std::string> &names, bool hasSelf)
+{
+    const auto &params = closure->chunk->params;
+    size_t start = (hasSelf && !params.empty()) ? 1 : 0;
+    if ((int)names.size() != argCount || stack_.size() < (size_t)argCount)
+        return argCount;
+
+    std::vector<QuantumValue> args(stack_.end() - argCount, stack_.end());
+    std::vector<std::string> P(params.begin() + start, params.end());
+    int vi = -1, ki = -1; // *args / **kwargs slots
+    for (size_t i = 0; i < P.size(); ++i)
+    {
+        if (P[i].rfind("**", 0) == 0)
+            ki = ki < 0 ? (int)i : ki;
+        else if (!P[i].empty() && P[i][0] == '*')
+            vi = vi < 0 ? (int)i : vi;
+    }
+    auto isPlain = [&](size_t i) { return (int)i != vi && (int)i != ki; };
+
+    std::vector<QuantumValue> slot(P.size());
+    std::vector<bool> filled(P.size(), false);
+    auto varargs = std::make_shared<Array>();
+    auto kwargs = std::make_shared<Dict>();
+    std::vector<QuantumValue> leftovers; // unmatched keywords with no **kwargs
+
+    // Positional arguments fill the plain parameters before any *args; the
+    // rest go to *args (or are dropped, as for an ordinary over-long call).
+    size_t next = 0;
+    for (size_t a = 0; a < args.size(); ++a)
+    {
+        if (!names[a].empty())
+            continue;
+        while (next < P.size() && !isPlain(next))
+        {
+            if ((int)next == vi)
+                break;
+            next++;
+        }
+        if (next < P.size() && (int)next != vi)
+        {
+            slot[next] = args[a];
+            filled[next++] = true;
+        }
+        else if (vi >= 0)
+            varargs->push_back(args[a]);
+    }
+    for (size_t a = 0; a < args.size(); ++a)
+    {
+        if (names[a].empty())
+            continue;
+        auto it = std::find(P.begin(), P.end(), names[a]);
+        if (it != P.end())
+        {
+            size_t i = it - P.begin();
+            slot[i] = args[a];
+            filled[i] = true;
+        }
+        else if (ki >= 0)
+            (*kwargs)[names[a]] = args[a];
+        else
+            leftovers.push_back(args[a]);
+    }
+    // No such parameter and no **kwargs: fall back to the next free slot,
+    // the positional binding keyword arguments always had.
+    for (auto &v : leftovers)
+    {
+        size_t i = 0;
+        while (i < P.size() && (filled[i] || !isPlain(i)))
+            i++;
+        if (i < P.size())
+        {
+            slot[i] = v;
+            filled[i] = true;
+        }
+    }
+    if (vi >= 0)
+    {
+        slot[vi] = QuantumValue(varargs);
+        filled[vi] = true;
+    }
+    if (ki >= 0)
+    {
+        slot[ki] = QuantumValue(kwargs);
+        filled[ki] = true;
+    }
+
+    for (int i = 0; i < argCount; ++i)
+        stack_.pop_back();
+    for (auto &v : slot)
+        push(v);
+    kwPassed_.assign(start, true); // the receiver
+    kwPassed_.insert(kwPassed_.end(), filled.begin(), filled.end());
+    kwArranged_ = true;
+    return static_cast<int>(P.size());
+}
+
 void VM::callClosure(std::shared_ptr<Closure> closure, int argCount, int line)
 {
     auto &ch = *closure->chunk;
     auto &params = ch.params;
+    // Arguments already laid out per parameter by bindKeywordArgs.
+    if (kwArranged_)
+    {
+        kwArranged_ = false;
+        size_t stackBase = stack_.size() - argCount;
+        frames_.push_back({closure, 0, stackBase, argCount, std::move(kwPassed_)});
+        kwPassed_.clear();
+        return;
+    }
     // Recorded before padding: a parameter default applies only to an
     // argument the caller left out, never to an explicitly passed nil.
     int suppliedArgs = argCount;
@@ -542,10 +677,14 @@ void VM::callClosure(std::shared_ptr<Closure> closure, int argCount, int line)
         argCount = fixedArgs + 1;
     }
 
-    // Fill missing args with nil (existing logic)
+    // Fill missing args with nil (existing logic); an unfilled **kwargs
+    // parameter is an empty dict, as in Python.
     while (argCount < (int)params.size())
     {
-        push(QuantumValue());
+        if (params[argCount].rfind("**", 0) == 0)
+            push(QuantumValue(std::make_shared<Dict>()));
+        else
+            push(QuantumValue());
         argCount++;
     }
 
@@ -558,6 +697,15 @@ void VM::callClosure(std::shared_ptr<Closure> closure, int argCount, int line)
 
     size_t stackBase = stack_.size() - argCount;
     frames_.push_back({closure, 0, stackBase, suppliedArgs});
+}
+
+std::shared_ptr<Dict> takeKwargs(std::vector<QuantumValue> &args)
+{
+    if (args.empty() || !args.back().isDict() || !args.back().asDict()->count("__kwargs__"))
+        return nullptr;
+    auto kw = args.back().asDict();
+    args.pop_back();
+    return kw;
 }
 
 QuantumValue VM::invokeCallable(const QuantumValue &fn, const std::vector<QuantumValue> &args)

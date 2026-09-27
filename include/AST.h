@@ -154,6 +154,17 @@ struct FunctionDecl
     ASTNodePtr body;              // BlockStmt
     bool isExported = false;
     std::vector<std::string> cppParamTypes; // C++ param types, for overloads
+    // Declared with Python's `def`: a name the body assigns before reading
+    // it is a local of the function (Compiler::compileFunction).
+    bool pythonScope = false;
+};
+
+// Python `global a, b` / `nonlocal a, b` — names the enclosing def must not
+// treat as its own locals. No runtime effect.
+struct GlobalStmt
+{
+    std::vector<std::string> names;
+    bool isNonlocal = false;
 };
 
 struct ReturnStmt
@@ -295,7 +306,7 @@ using NodeVariant = std::variant<
     ImportStmt, ClassDecl,
     TernaryExpr,
     AddressOfExpr, DerefExpr, ArrowExpr,
-    NewExpr>;
+    NewExpr, GlobalStmt>;
 
 struct ASTNode
 {

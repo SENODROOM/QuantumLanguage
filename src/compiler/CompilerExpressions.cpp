@@ -105,6 +105,7 @@ void Compiler::compileAssign(AssignExpr &e, int line)
 {
     const std::string normalizedOp =
         e.op == "post+=" ? "+=" : e.op == "post-=" ? "-="
+                              : e.op == "kwarg"    ? "="
                                                    : e.op;
     bool compound = (normalizedOp != "=");
 
@@ -290,11 +291,34 @@ void Compiler::compileAssign(AssignExpr &e, int line)
 
 void Compiler::compileCall(CallExpr &e, int line)
 {
+    // Keyword-argument names of the values pushed so far ("" = positional);
+    // emitted as Op::KW_NAMES before the CALL when any name is present.
+    std::vector<std::string> kwNames;
+    auto emitCallWithNames = [&](int argCount)
+    {
+        bool anyKw = std::any_of(kwNames.begin(), kwNames.end(),
+                                 [](const std::string &n) { return !n.empty(); });
+        if (anyKw && (int)kwNames.size() == argCount)
+        {
+            std::string joined;
+            for (size_t i = 0; i < kwNames.size(); ++i)
+                joined += (i ? "\x1f" : "") + kwNames[i];
+            emit(Op::KW_NAMES, addStr(joined), line);
+        }
+        emit(Op::CALL, argCount, line);
+    };
     auto emitArgValues = [&](ASTNode &arg) -> int
     {
         if (arg.is<AssignExpr>())
         {
             auto &assign = arg.as<AssignExpr>();
+            if (assign.op == "kwarg" && assign.target->is<Identifier>())
+            {
+                // Python `f(key=value)`: just the value, bound by name.
+                compileExpr(*assign.value);
+                kwNames.push_back(assign.target->as<Identifier>().name);
+                return 1;
+            }
             if (assign.op == "=" && assign.target->is<Identifier>())
             {
                 // `f(name = value)` — compile the full assignment, which
@@ -304,8 +328,10 @@ void Compiler::compileCall(CallExpr &e, int line)
                 // a Python keyword arg (value binds positionally to the param
                 // of that name; the incidental global write is harmless) and
                 // a Ruby assignment-in-argument, `arr.unshift(cur = x)`,
-                // where updating `cur` is the whole point.
+                // where updating `cur` is the whole point. It also binds by
+                // name when the callee has a parameter of that name.
                 compileExpr(arg);
+                kwNames.push_back(assign.target->as<Identifier>().name);
                 return 1;
             }
             if (assign.op == "unpack" && assign.target->is<TupleLiteral>())
@@ -316,11 +342,13 @@ void Compiler::compileCall(CallExpr &e, int line)
                     for (size_t i = 0; i + 1 < targets.size(); ++i)
                         compileExpr(*targets[i]);
                     compileExpr(*assign.value);
+                    kwNames.insert(kwNames.end(), targets.size(), "");
                     return static_cast<int>(targets.size());
                 }
             }
         }
         compileExpr(arg);
+        kwNames.push_back("");
         return 1;
     };
 
@@ -394,7 +422,7 @@ void Compiler::compileCall(CallExpr &e, int line)
             int argCount = 0;
             for (auto &arg : e.args)
                 argCount += emitArgValues(*arg);
-            emit(Op::CALL, argCount, line);
+            emitCallWithNames(argCount);
             return;
         }
     }
@@ -410,7 +438,7 @@ void Compiler::compileCall(CallExpr &e, int line)
             int argCount = 0;
             for (auto &arg : e.args)
                 argCount += emitArgValues(*arg);
-            emit(Op::CALL, argCount, line);
+            emitCallWithNames(argCount);
             return;
         }
         if (mem.object->is<CallExpr>())
@@ -423,7 +451,7 @@ void Compiler::compileCall(CallExpr &e, int line)
                 int argCount = 0;
                 for (auto &arg : e.args)
                     argCount += emitArgValues(*arg);
-                emit(Op::CALL, argCount, line);
+                emitCallWithNames(argCount);
                 return;
             }
         }
@@ -433,7 +461,7 @@ void Compiler::compileCall(CallExpr &e, int line)
         int argCount = 0;
         for (auto &arg : e.args)
             argCount += emitArgValues(*arg);
-        emit(Op::CALL, argCount, line);
+        emitCallWithNames(argCount);
         return;
     }
     // Arrow method call: obj->method(args). Same shape as the member-call
@@ -448,9 +476,34 @@ void Compiler::compileCall(CallExpr &e, int line)
         int argCount = 0;
         for (auto &arg : e.args)
             argCount += emitArgValues(*arg);
-        emit(Op::CALL, argCount, line);
+        emitCallWithNames(argCount);
         return;
     }
+    // `reverse(s.begin(), s.end())` / `sort(...)` on a std::string mutates it
+    // in place, but strings are immutable values here: compile it as
+    // `s = __str_inplace__(s, reverse(...))`, which keeps `s` unless the
+    // algorithm produced a new string (arrays are mutated in place anyway).
+    if (e.callee->is<Identifier>() && e.args.size() >= 2 && e.args[0]->is<CallExpr>())
+    {
+        const std::string &fn = e.callee->as<Identifier>().name;
+        auto &first = e.args[0]->as<CallExpr>();
+        if ((fn == "reverse" || fn == "sort" || fn == "stable_sort") && first.args.empty() &&
+            first.callee->is<MemberExpr>() && first.callee->as<MemberExpr>().member == "begin" &&
+            first.callee->as<MemberExpr>().object->is<Identifier>())
+        {
+            std::string target = first.callee->as<MemberExpr>().object->as<Identifier>().name;
+            emit(Op::LOAD_GLOBAL, addStr("__str_inplace__"), line);
+            emitLoad(target, line);
+            compileExpr(*e.callee);
+            for (auto &arg : e.args)
+                compileExpr(*arg);
+            emit(Op::CALL, static_cast<int>(e.args.size()), line);
+            emit(Op::CALL, 2, line);
+            emitStore(target, line);
+            return;
+        }
+    }
+
     // Regular call. Keyword/assignment args (`f(name=value)`) are handled
     // uniformly by emitArgValues, the same as in the method-call path above.
     compileExpr(*e.callee);
@@ -458,7 +511,7 @@ void Compiler::compileCall(CallExpr &e, int line)
     int argCount = 0;
     for (auto &arg : e.args)
         argCount += emitArgValues(*arg);
-    emit(Op::CALL, argCount, line);
+    emitCallWithNames(argCount);
 }
 
 void Compiler::compileIndex(IndexExpr &e, int line)

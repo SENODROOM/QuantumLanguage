@@ -120,9 +120,13 @@ ASTNodePtr Parser::parseStatement()
     case TokenType::DEF:
     case TokenType::FUNCTION:
     {
+        bool isDef = check(TokenType::DEF);
         consume();
         if (current().type == TokenType::IDENTIFIER)
+        {
+            nextFnIsPython_ = isDef;
             return parseFunctionDecl();
+        }
         auto lam = parseLambda();
         while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
             consume();
@@ -488,6 +492,21 @@ ASTNodePtr Parser::parseStatement()
         return parseExprStmt();
     }
     default:
+        // Python `global a, b` / `nonlocal a` inside a def (not a C++-style
+        // declaration of a variable whose type is named `global`).
+        if (check(TokenType::IDENTIFIER) && inPythonCode() &&
+            (current().value == "global" || current().value == "nonlocal") &&
+            pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::IDENTIFIER)
+        {
+            GlobalStmt gs;
+            gs.isNonlocal = consume().value == "nonlocal";
+            do
+                gs.names.push_back(expect(TokenType::IDENTIFIER, "Expected a name").value);
+            while (match(TokenType::COMMA));
+            while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
+                consume();
+            return std::make_unique<ASTNode>(std::move(gs), ln);
+        }
         // Handle C++ "delete ptr" and "delete[] ptr" as no-ops (GC handles memory)
         if (check(TokenType::IDENTIFIER) && current().value == "delete")
         {
@@ -503,6 +522,17 @@ ASTNodePtr Parser::parseStatement()
             while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
                 consume();
             return std::make_unique<ASTNode>(BlockStmt{}, ln);
+        }
+        // C++ `cerr << ...` / `clog << ...` — like cout, written to stderr.
+        if (check(TokenType::IDENTIFIER) && (current().value == "cerr" || current().value == "clog") &&
+            pos + 1 < tokens.size() && tokens[pos + 1].type == TokenType::LSHIFT)
+        {
+            consume(); // eat cerr / clog
+            CallExpr call;
+            call.callee = std::make_unique<ASTNode>(Identifier{"__cerr__"}, ln);
+            call.args = parseStreamInsertions();
+            return std::make_unique<ASTNode>(
+                ExprStmt{std::make_unique<ASTNode>(std::move(call), ln)}, ln);
         }
         // Handle C++ "using namespace X;" as a no-op
         if (check(TokenType::IDENTIFIER) && current().value == "using")
@@ -1313,6 +1343,8 @@ ASTNodePtr Parser::parseFunctionDecl()
     int ln = current().line;
     const bool isCpp = nextFnIsCpp_;
     nextFnIsCpp_ = false;
+    const bool isPython = nextFnIsPython_;
+    nextFnIsPython_ = false;
     // Accept IDENTIFIER or keyword tokens used as function names (e.g. "input", "display")
     Token nameToken = check(TokenType::IDENTIFIER) ? consume() : (check(TokenType::INPUT) || check(TokenType::PRINT)) ? consume()
                                                                                                                       : expect(TokenType::IDENTIFIER, "Expected function name");
@@ -1376,6 +1408,7 @@ ASTNodePtr Parser::parseFunctionDecl()
     }
 
     fnIsCpp_.push_back(isCpp);
+    pyDepth_ += isPython ? 1 : 0;
     ASTNodePtr body;
     try
     {
@@ -1384,9 +1417,11 @@ ASTNodePtr Parser::parseFunctionDecl()
     catch (...)
     {
         fnIsCpp_.pop_back();
+        pyDepth_ -= isPython ? 1 : 0;
         throw;
     }
     fnIsCpp_.pop_back();
+    pyDepth_ -= isPython ? 1 : 0;
     FunctionDecl fd;
     fd.name = nameToken.value;
     fd.params = std::move(params);
@@ -1394,6 +1429,7 @@ ASTNodePtr Parser::parseFunctionDecl()
     fd.paramIsRef = std::move(paramIsRef);
     fd.defaultArgs = std::move(defaultArgs);
     fd.returnType = returnType;
+    fd.pythonScope = isPython;
     fd.body = std::move(body);
     return std::make_unique<ASTNode>(std::move(fd), ln);
 }
@@ -1530,6 +1566,7 @@ ASTNodePtr Parser::parseClassDecl()
                 consume();
 
             // Optional fn/def/function keyword
+            bool methodIsPython = check(TokenType::DEF); // `def m(self)`: Python body
             if (check(TokenType::FN) || check(TokenType::DEF) || check(TokenType::FUNCTION))
                 consume();
 
@@ -2067,6 +2104,7 @@ ASTNodePtr Parser::parseClassDecl()
             }
             skipNewlines();
             fnIsCpp_.push_back(methodHasReturnType);
+            pyDepth_ += methodIsPython ? 1 : 0;
             ASTNodePtr body;
             try
             {
@@ -2075,9 +2113,11 @@ ASTNodePtr Parser::parseClassDecl()
             catch (...)
             {
                 fnIsCpp_.pop_back();
+                pyDepth_ -= methodIsPython ? 1 : 0;
                 throw;
             }
             fnIsCpp_.pop_back();
+            pyDepth_ -= methodIsPython ? 1 : 0;
 
             if (!initAssignments.empty())
             {
@@ -2094,6 +2134,7 @@ ASTNodePtr Parser::parseClassDecl()
             methodFd.paramIsRef = std::move(methodParamIsRef);
             methodFd.defaultArgs = std::move(methodDefaultArgs);
             methodFd.cppParamTypes = std::move(methodCppTypes);
+            methodFd.pythonScope = methodIsPython;
             methodFd.body = std::move(body);
             auto fn = std::make_unique<ASTNode>(std::move(methodFd), ln);
 
@@ -3020,15 +3061,19 @@ ASTNodePtr Parser::parseInputStmt()
     return std::make_unique<ASTNode>(InputStmt{target, std::move(prompt), nullptr}, ln);
 }
 
-ASTNodePtr Parser::parseCoutStmt()
+// The `<< a << b << endl` chain after cout/cerr, each segment wrapped for
+// C++ stream formatting: `__cout__(value[, "name"])` formats like an ostream
+// (bools as 1/0, doubles to 6 significant digits, stream manipulator state),
+// and `setw(n)` / `setprecision(n)` / `setfill(c)` become
+// `__cout_manip__("setw", n)`. A bare identifier also passes its name so an
+// otherwise-undefined `fixed` / `left` / `hex` acts as the manipulator, while
+// a variable of that name still prints its value.
+std::vector<ASTNodePtr> Parser::parseStreamInsertions()
 {
-    // cout << expr1 << expr2 << endl;
-    // We must NOT call parseExpr() here because parseShift() inside it would
-    // greedily consume << as a bitwise-shift operator.
-    // Instead we call parseAddSub() — one level below shift — so each <<
-    // stays available as the stream-insertion separator.
     int ln = current().line;
     std::vector<ASTNodePtr> args;
+    auto node = [&](auto &&n)
+    { return std::make_unique<ASTNode>(std::forward<decltype(n)>(n), ln); };
 
     while (true)
     {
@@ -3043,20 +3088,50 @@ ASTNodePtr Parser::parseCoutStmt()
         if (check(TokenType::IDENTIFIER) && current().value == "endl")
         {
             consume();
-            args.push_back(std::make_unique<ASTNode>(StringLiteral{"\n"}, ln));
+            args.push_back(node(StringLiteral{"\n"}));
             continue;
         }
 
         // Parse the next segment at add/sub precedence so << isn't swallowed
-        args.push_back(parseAddSub());
+        auto seg = parseAddSub();
+        CallExpr wrap;
+        if (seg->is<CallExpr>() && seg->as<CallExpr>().callee->is<Identifier>())
+        {
+            const std::string &fn = seg->as<CallExpr>().callee->as<Identifier>().name;
+            if (fn == "setw" || fn == "setprecision" || fn == "setfill")
+            {
+                wrap.callee = node(Identifier{"__cout_manip__"});
+                wrap.args.push_back(node(StringLiteral{fn}));
+                for (auto &a : seg->as<CallExpr>().args)
+                    wrap.args.push_back(std::move(a));
+                args.push_back(node(std::move(wrap)));
+                continue;
+            }
+        }
+        wrap.callee = node(Identifier{"__cout__"});
+        std::string name = seg->is<Identifier>() ? seg->as<Identifier>().name : "";
+        wrap.args.push_back(std::move(seg));
+        if (!name.empty())
+            wrap.args.push_back(node(StringLiteral{name}));
+        args.push_back(node(std::move(wrap)));
     }
 
     while (check(TokenType::NEWLINE) || check(TokenType::SEMICOLON))
         consume();
+    return args;
+}
 
+ASTNodePtr Parser::parseCoutStmt()
+{
+    // cout << expr1 << expr2 << endl;
+    // We must NOT call parseExpr() here because parseShift() inside it would
+    // greedily consume << as a bitwise-shift operator.
+    // Instead we call parseAddSub() — one level below shift — so each <<
+    // stays available as the stream-insertion separator.
+    int ln = current().line;
     // A stream writes exactly what it is given: no separators, and no
     // newline beyond the endl / "\n" segments in the chain.
-    PrintStmt ps{std::move(args), false};
+    PrintStmt ps{parseStreamInsertions(), false};
     ps.sep = "";
     ps.end = "";
     return std::make_unique<ASTNode>(std::move(ps), ln);

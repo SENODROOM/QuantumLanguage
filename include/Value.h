@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
+#include <deque>
 #include <unordered_map>
 #include <memory>
 #include <functional>
@@ -31,7 +32,7 @@ struct QuantumNative
 struct QuantumValue;
 
 using Array = std::vector<QuantumValue>;
-using Dict = std::unordered_map<std::string, QuantumValue>;
+class Dict; // insertion-ordered string → value map, defined below
 
 // ─── Pointer Type ─────────────────────────────────────────────────────────────
 
@@ -119,6 +120,123 @@ struct QuantumValue
     std::string toString() const;
     std::string typeName() const;
 };
+
+// ─── Dict ─────────────────────────────────────────────────────────────────────
+// Python dicts, JS objects and Ruby hashes all iterate in insertion order, so
+// the map behind them does too: entries are kept in order, with a
+// hash index for lookup. The interface is the subset of std::unordered_map
+// the VM uses. Entries live in a deque so a reference from operator[] stays
+// valid across later insertions, as with unordered_map; erasing shifts later
+// entries (dict deletes are rare next to reads and inserts).
+class Dict
+{
+public:
+    using value_type = std::pair<std::string, QuantumValue>;
+    using iterator = std::deque<value_type>::iterator;
+    using const_iterator = std::deque<value_type>::const_iterator;
+
+    Dict() = default;
+
+    iterator begin() { return entries_.begin(); }
+    iterator end() { return entries_.end(); }
+    const_iterator begin() const { return entries_.begin(); }
+    const_iterator end() const { return entries_.end(); }
+    size_t size() const { return entries_.size(); }
+    bool empty() const { return entries_.empty(); }
+
+    iterator find(const std::string &key)
+    {
+        auto it = index_.find(key);
+        return it == index_.end() ? entries_.end() : entries_.begin() + it->second;
+    }
+    const_iterator find(const std::string &key) const
+    {
+        auto it = index_.find(key);
+        return it == index_.end() ? entries_.end() : entries_.begin() + it->second;
+    }
+    size_t count(const std::string &key) const { return index_.count(key); }
+
+    QuantumValue &operator[](const std::string &key)
+    {
+        auto it = index_.find(key);
+        if (it != index_.end())
+            return entries_[it->second].second;
+        index_.emplace(key, entries_.size());
+        entries_.emplace_back(key, QuantumValue());
+        return entries_.back().second;
+    }
+    QuantumValue &at(const std::string &key)
+    {
+        auto it = index_.find(key);
+        if (it == index_.end())
+            throw std::out_of_range("Dict::at: missing key '" + key + "'");
+        return entries_[it->second].second;
+    }
+    const QuantumValue &at(const std::string &key) const
+    {
+        auto it = index_.find(key);
+        if (it == index_.end())
+            throw std::out_of_range("Dict::at: missing key '" + key + "'");
+        return entries_[it->second].second;
+    }
+
+    std::pair<iterator, bool> insert(const value_type &kv)
+    {
+        auto it = find(kv.first);
+        if (it != end())
+            return {it, false};
+        index_.emplace(kv.first, entries_.size());
+        entries_.push_back(kv);
+        return {entries_.end() - 1, true};
+    }
+    template <class V>
+    std::pair<iterator, bool> emplace(const std::string &key, V &&value)
+    {
+        auto it = find(key);
+        if (it != end())
+            return {it, false};
+        index_.emplace(key, entries_.size());
+        entries_.emplace_back(key, QuantumValue(std::forward<V>(value)));
+        return {entries_.end() - 1, true};
+    }
+
+    size_t erase(const std::string &key)
+    {
+        auto it = index_.find(key);
+        if (it == index_.end())
+            return 0;
+        erase(entries_.begin() + it->second);
+        return 1;
+    }
+    iterator erase(const_iterator pos)
+    {
+        size_t at = static_cast<size_t>(pos - entries_.cbegin());
+        index_.erase(entries_[at].first);
+        auto next = entries_.erase(entries_.begin() + at);
+        for (size_t i = at; i < entries_.size(); ++i)
+            index_[entries_[i].first] = i;
+        return next;
+    }
+    void clear()
+    {
+        entries_.clear();
+        index_.clear();
+    }
+    void reserve(size_t n) { index_.reserve(n); }
+
+private:
+    std::deque<value_type> entries_; // deque: references survive insertion
+    std::unordered_map<std::string, size_t> index_;
+};
+
+// Python display conventions for the running program (a .py source; set by
+// the __python_repr__ native the compiler emits first): True / False / None,
+// and 'single-quoted' strings inside printed lists and dicts.
+extern bool g_pythonRepr;
+
+// How a tagged JS runtime dict (Date, URL, URLSearchParams) prints; sets
+// `handled` to false for an ordinary dict. Defined in VmJsRuntime.cpp.
+std::string jsDisplayString(const std::shared_ptr<Dict> &d, bool &handled);
 
 // ─── Environment ──────────────────────────────────────────────────────────────
 

@@ -900,6 +900,12 @@ std::vector<ASTNodePtr> Parser::parseArgList() {
       while (la < tokens.size() && tokens[la].type == TokenType::NEWLINE)
         ++la;
       if (la < tokens.size() && tokens[la].type == TokenType::ASSIGN) {
+        // `f(key=value)` written tight is a Python keyword argument ("kwarg":
+        // bound to the parameter by name, no variable written). Spaced,
+        // `f(cur = x)` keeps its assignment-in-argument meaning (Ruby, C) —
+        // it still binds by name when the callee has such a parameter.
+        bool tight = tokens[la].line == current().line &&
+                     tokens[la].col == current().col + (int)current().value.size();
         std::string kwName = consume().value; // save keyword name
         while (check(TokenType::NEWLINE))
           consume();
@@ -907,11 +913,11 @@ std::vector<ASTNodePtr> Parser::parseArgList() {
         skipNewlines();
         auto val = parseExpr();
         skipNewlines();
-        // Wrap as AssignExpr{name, val} so compiler's allKeyword check
-        // can bundle all kwargs into a dict for **kwargs params.
+        // Wrap as AssignExpr{name, val}; the compiler passes the names to
+        // the call (Op::KW_NAMES) so they bind to parameters by name.
         auto keyIdent = std::make_unique<ASTNode>(Identifier{kwName}, argLn);
         AssignExpr ae;
-        ae.op = "=";
+        ae.op = tight ? "kwarg" : "=";
         ae.target = std::move(keyIdent);
         ae.value = std::move(val);
         args.push_back(std::make_unique<ASTNode>(std::move(ae), argLn));

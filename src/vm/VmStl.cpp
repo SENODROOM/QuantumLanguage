@@ -6,6 +6,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
 #include <memory>
 #include <string>
 #include <vector>
@@ -125,8 +128,124 @@ bool VM::stlLess(const QuantumValue &a, const QuantumValue &b)
     return a.toString() < b.toString();
 }
 
+namespace
+{
+// Formatting state of cout, which persists across statements like the real
+// stream: `cout << fixed << setprecision(2);` affects later insertions.
+struct StreamState
+{
+    int precision = 6;
+    bool fixed = false, scientific = false, boolalpha = false, leftAlign = false;
+    int base = 10;
+    int width = 0; // applies to the next insertion only
+    char fill = ' ';
+};
+
+std::string formatNumber(double v, const StreamState &st)
+{
+    bool integral = std::isfinite(v) && std::floor(v) == v && std::fabs(v) < 1e15;
+    std::ostringstream out;
+    if (st.base != 10 && integral)
+        out << (st.base == 16 ? std::hex : std::oct) << static_cast<long long>(v);
+    else if (st.fixed)
+        out << std::fixed << std::setprecision(st.precision) << v;
+    else if (st.scientific)
+        out << std::scientific << std::setprecision(st.precision) << v;
+    else if (integral)
+        out << static_cast<long long>(v); // an int prints as an int
+    else
+        out << std::setprecision(st.precision) << v; // ostream default (%g)
+    return out.str();
+}
+} // namespace
+
+void VM::sortValues(Array &arr, const QuantumValue &key, const QuantumValue &cmp, bool reverse)
+{
+    auto callable = [](const QuantumValue &f)
+    { return f.isClosure() || f.isBoundMethod() || f.isNative(); };
+    std::vector<std::pair<QuantumValue, QuantumValue>> items; // (sort key, element)
+    items.reserve(arr.size());
+    for (auto &v : arr)
+        items.emplace_back(callable(key) ? invokeCallable(key, {v}) : v, v);
+    auto less = [&](const QuantumValue &a, const QuantumValue &b)
+    {
+        if (!callable(cmp))
+            return stlLess(a, b);
+        QuantumValue r = invokeCallable(cmp, {a, b});
+        return r.isNumber() ? r.asNumber() < 0 : r.isTruthy();
+    };
+    std::stable_sort(items.begin(), items.end(), [&](const auto &x, const auto &y)
+                     { return reverse ? less(y.first, x.first) : less(x.first, y.first); });
+    for (size_t i = 0; i < items.size(); ++i)
+        arr[i] = items[i].second;
+}
+
 void VM::registerStlNatives()
 {
+    // ── C++ ostream formatting (see Parser::parseStreamInsertions) ─────────
+    {
+        auto st = std::make_shared<StreamState>();
+        auto nat = [&](const std::string &name, QuantumNativeFunc fn)
+        {
+            auto n = std::make_shared<QuantumNative>();
+            n->name = name;
+            n->fn = std::move(fn);
+            globals->define(name, QuantumValue(n));
+        };
+        nat("__cout__", [st](std::vector<QuantumValue> a) -> QuantumValue
+            {
+            QuantumValue v = arg(a, 0);
+            // A bare manipulator name that is not a variable: cout << fixed
+            if (v.isNil() && a.size() > 1)
+            {
+                std::string m = a[1].toString();
+                bool handled = true;
+                if (m == "fixed") { st->fixed = true; st->scientific = false; }
+                else if (m == "scientific") { st->scientific = true; st->fixed = false; }
+                else if (m == "defaultfloat") st->fixed = st->scientific = false;
+                else if (m == "left") st->leftAlign = true;
+                else if (m == "right" || m == "internal") st->leftAlign = false;
+                else if (m == "boolalpha") st->boolalpha = true;
+                else if (m == "noboolalpha") st->boolalpha = false;
+                else if (m == "hex") st->base = 16;
+                else if (m == "oct") st->base = 8;
+                else if (m == "dec") st->base = 10;
+                else if (m == "flush" || m == "showpoint" || m == "noshowpoint" ||
+                         m == "showpos" || m == "noshowpos" || m == "uppercase" ||
+                         m == "nouppercase") {}
+                else if (m == "ends") return QuantumValue(std::string(1, '\0'));
+                else handled = false;
+                if (handled) return QuantumValue(std::string());
+            }
+            std::string s;
+            if (v.isBool())
+                s = st->boolalpha ? (v.asBool() ? "true" : "false") : (v.asBool() ? "1" : "0");
+            else if (v.isNumber())
+                s = formatNumber(v.asNumber(), *st);
+            else
+                s = v.toString();
+            if ((int)s.size() < st->width)
+            {
+                std::string pad(st->width - s.size(), st->fill);
+                s = st->leftAlign ? s + pad : pad + s;
+            }
+            st->width = 0;
+            return QuantumValue(s); });
+        nat("__cout_manip__", [st](std::vector<QuantumValue> a) -> QuantumValue
+            {
+            std::string m = arg(a, 0).toString();
+            QuantumValue v = arg(a, 1);
+            if (m == "setw") st->width = v.isNumber() ? (int)v.asNumber() : 0;
+            else if (m == "setprecision") st->precision = v.isNumber() ? (int)v.asNumber() : 6;
+            else if (m == "setfill") st->fill = v.toString().empty() ? ' ' : v.toString()[0];
+            return QuantumValue(std::string()); });
+        nat("__cerr__", [](std::vector<QuantumValue> a) -> QuantumValue
+            {
+            for (auto &v : a) std::cerr << v.toString();
+            std::cerr.flush();
+            return QuantumValue(); });
+    }
+
     auto reg = [&](const std::string &name, QuantumNativeFunc fn, bool weak = true)
     {
         auto nat = std::make_shared<QuantumNative>();
@@ -150,9 +269,22 @@ void VM::registerStlNatives()
     auto endOf = [](const Range &r)
     { return makeStlIterator(r.arr, r.e); };
 
+    // See Compiler::compileCall: `s = __str_inplace__(s, reverse(s.begin(), s.end()))`.
+    reg("__str_inplace__", [](std::vector<QuantumValue> a) -> QuantumValue
+        {
+        if (a.size() > 1 && a[0].isString() && a[1].isString()) return a[1];
+        return arg(a, 0); },
+        /*weak=*/false);
+
     for (const char *name : {"sort", "stable_sort"})
         reg(name, [lessBy](std::vector<QuantumValue> a) -> QuantumValue
             {
+            if (!a.empty() && a[0].isString())
+            {
+                std::string s = a[0].asString(); // sort(s.begin(), s.end()) on a string
+                std::sort(s.begin(), s.end());
+                return QuantumValue(s);
+            }
             Range r;
             if (!toRange(arg(a, 0), arg(a, 1), r)) return QuantumValue();
             std::stable_sort(r.arr->begin() + r.b, r.arr->begin() + r.e, lessBy(arg(a, 2)));

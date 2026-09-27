@@ -6,6 +6,31 @@
 #include <iomanip>
 #include <cstdint>
 
+bool g_pythonRepr = false;
+
+// A string element of a printed array/dict: double-quoted by default;
+// under Python repr, single-quoted unless it contains a ' and no ".
+static std::string quoteForDisplay(const std::string &s)
+{
+    if (!g_pythonRepr)
+        return "\"" + s + "\"";
+    bool useDouble = s.find('\'') != std::string::npos && s.find('"') == std::string::npos;
+    char q = useDouble ? '"' : '\'';
+    std::string out(1, q);
+    for (char c : s)
+    {
+        if (c == '\\' || c == q)
+            out += '\\';
+        if (c == '\n')
+            out += "\\n";
+        else if (c == '\t')
+            out += "\\t";
+        else
+            out += c;
+    }
+    return out + q;
+}
+
 // ─── QuantumValue ─────────────────────────────────────────────────────────────
 
 bool QuantumValue::isTruthy() const
@@ -27,8 +52,9 @@ std::string QuantumValue::toString() const
     return std::visit([](const auto &v) -> std::string
                       {
         using T = std::decay_t<decltype(v)>;
-        if constexpr (std::is_same_v<T, QuantumNil>)  return "nil";
-        if constexpr (std::is_same_v<T, bool>)        return v ? "true" : "false";
+        if constexpr (std::is_same_v<T, QuantumNil>)  return g_pythonRepr ? "None" : "nil";
+        if constexpr (std::is_same_v<T, bool>)
+            return g_pythonRepr ? (v ? "True" : "False") : (v ? "true" : "false");
         if constexpr (std::is_same_v<T, double>) {
             if (std::floor(v) == v && std::abs(v) < 1e15)
                 return std::to_string((long long)v);
@@ -41,18 +67,21 @@ std::string QuantumValue::toString() const
             std::string s = "[";
             for (size_t i = 0; i < v->size(); i++) {
                 if (i) s += ", ";
-                if ((*v)[i].isString()) s += "\"" + (*v)[i].toString() + "\"";
+                if ((*v)[i].isString()) s += quoteForDisplay((*v)[i].asString());
                 else s += (*v)[i].toString();
             }
             return s + "]";
         }
         if constexpr (std::is_same_v<T, std::shared_ptr<Dict>>) {
+            bool special = false;
+            std::string shown = jsDisplayString(v, special); // Date, URL, ...
+            if (special) return shown;
             std::string s = "{";
             bool first = true;
             for (auto& [k, val] : *v) {
                 if (!first) s += ", ";
-                s += "\"" + k + "\": ";
-                if (val.isString()) s += "\"" + val.toString() + "\"";
+                s += quoteForDisplay(k) + ": ";
+                if (val.isString()) s += quoteForDisplay(val.asString());
                 else s += val.toString();
                 first = false;
             }

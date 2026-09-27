@@ -641,7 +641,16 @@ ASTNodePtr Parser::parsePostfix()
                 mem = expect(TokenType::IDENTIFIER, "Expected member name").value;
             }
 
-            if (check(TokenType::LPAREN))
+            if (check(TokenType::LPAREN) && mem == "replace" && inPythonCode())
+            {
+                // Python's str.replace replaces every occurrence, JS's only
+                // the first: __py_replace__(obj, args...) (VmNatives.cpp).
+                auto args = parseArgList();
+                args.insert(args.begin(), std::move(expr));
+                expr = std::make_unique<ASTNode>(
+                    CallExpr{std::make_unique<ASTNode>(Identifier{"__py_replace__"}, ln), std::move(args)}, ln);
+            }
+            else if (check(TokenType::LPAREN))
             {
                 auto memExpr = std::make_unique<ASTNode>(MemberExpr{std::move(expr), mem}, ln);
                 auto args = parseArgList();

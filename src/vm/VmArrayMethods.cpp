@@ -164,13 +164,29 @@ QuantumValue VM::callArrayMethod(std::shared_ptr<Array> arr,
     std::reverse(arr->begin(), arr->end());
     return QuantumValue(arr);
   }
+  // arr.sort() / arr.sort((a, b) => a - b) (JS, Ruby block) /
+  // list.sort(key=f, reverse=True) (Python) — in place, stable.
   if (m == "sort") {
-    std::sort(arr->begin(), arr->end(),
-              [](const QuantumValue &a, const QuantumValue &b) {
-                return a.isNumber() && b.isNumber()
-                           ? a.asNumber() < b.asNumber()
-                           : a.toString() < b.toString();
-              });
+    auto kw = takeKwargs(args);
+    QuantumValue key, cmp;
+    bool reverse = false;
+    for (auto &a : args) {
+      if (a.isBool())
+        reverse = a.asBool();
+      else if (a.isClosure() && a.asFunction()->chunk->params.size() == 1)
+        key = a;
+      else if (a.isFunction() || a.isBoundMethod())
+        cmp = a;
+    }
+    if (kw) {
+      auto k = kw->find("key");
+      if (k != kw->end())
+        key = k->second;
+      auto r = kw->find("reverse");
+      if (r != kw->end())
+        reverse = r->second.isTruthy();
+    }
+    sortValues(*arr, key, cmp, reverse);
     return QuantumValue(arr);
   }
   if (m == "join") {

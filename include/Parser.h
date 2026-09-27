@@ -17,6 +17,9 @@ class Parser
 public:
     explicit Parser(std::vector<Token> tokens);
     ASTNodePtr parse();
+    // The whole file is Python (.py): Python semantics apply everywhere, not
+    // just inside `def` bodies (see pyDepth_).
+    void setPythonSource(bool python) { pythonFile_ = python; }
 
 private:
     std::vector<Token> tokens;
@@ -37,6 +40,12 @@ private:
     // return type). Set for the next parseFunctionDecl by nextFnIsCpp_.
     std::vector<bool> fnIsCpp_;
     bool nextFnIsCpp_ = false;
+    // > 0 inside a Python `def` body, where a method name shared with JS
+    // takes its Python meaning: `s.replace(a, b)` replaces every occurrence.
+    int pyDepth_ = 0;
+    bool nextFnIsPython_ = false;
+    bool pythonFile_ = false;
+    bool inPythonCode() const { return pythonFile_ || pyDepth_ > 0; }
     // True when the '{' at pos holds no top-level `key: value` colon.
     bool braceIsInitList() const;
     // Merges same-named C++ methods into one dispatcher that picks an
@@ -69,6 +78,7 @@ private:
     ASTNodePtr parsePrintStmt();
     ASTNodePtr parseInputStmt();
     ASTNodePtr parseCoutStmt(); // cout << x << y << endl
+    std::vector<ASTNodePtr> parseStreamInsertions(); // the `<< a << b` chain
     ASTNodePtr parseCinStmt();  // cin >> x >> y
     ASTNodePtr parseImportStmt(bool isFrom = false);
     ASTNodePtr parseExprStmt();

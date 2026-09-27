@@ -8,6 +8,12 @@
 QuantumValue VM::callDictMethod(std::shared_ptr<Dict> dict,
                                 const std::string &m,
                                 std::vector<QuantumValue> args) {
+  // JS Date / URL / URLSearchParams objects (VmJsRuntime.cpp)
+  {
+    QuantumValue out;
+    if (callJsObjectMethod(dict, m, args, out))
+      return out;
+  }
   // Ruby's `obj.respond_to?(:name)` reflection check. The native
   // objects this VM hands back for Thread/Queue/socket/... are dicts
   // whose methods are ordinary keys, so membership is the answer.
@@ -63,17 +69,85 @@ QuantumValue VM::callDictMethod(std::shared_ptr<Dict> dict,
       dict->erase(args[0].toString());
     return QuantumValue(true);
   }
+  // Python sets are dicts of members mapped to true (as set literals
+  // compile); C++ std::set / std::map spell the same operations
+  // insert / erase / count(key).
+  if (m == "add" || m == "insert") {
+    // map.insert({k, v}) / insert(make_pair(k, v)) keeps an existing key
+    if (m == "insert" && args.size() == 1 && args[0].isArray() && args[0].asArray()->size() == 2) {
+      const Array &kv = *args[0].asArray();
+      dict->insert({kv[0].toString(), kv[1]});
+    } else if (!args.empty())
+      (*dict)[args[0].toString()] = args.size() > 1 ? args[1] : QuantumValue(true);
+    return QuantumValue();
+  }
+  if (m == "discard" || m == "remove" || m == "erase") {
+    size_t n = args.empty() ? 0 : dict->erase(args[0].toString());
+    if (m == "remove" && n == 0)
+      throw RuntimeError("KeyError: " + (args.empty() ? std::string() : args[0].toString()));
+    return QuantumValue((double)n);
+  }
+  if (m == "count" && args.size() == 1 && !args[0].isFunction() && !args[0].isBoundMethod())
+    return QuantumValue((double)dict->count(args[0].toString()));
+  if (m == "copy")
+    return QuantumValue(std::make_shared<Dict>(*dict));
+  if (m == "union" || m == "intersection" || m == "difference" ||
+      m == "symmetric_difference") {
+    auto out = std::make_shared<Dict>(m == "intersection" ? Dict() : *dict);
+    for (auto &other : args) {
+      Dict members;
+      if (other.isDict())
+        members = *other.asDict();
+      else if (other.isArray())
+        for (auto &v : *other.asArray())
+          members[v.toString()] = QuantumValue(true);
+      if (m == "union")
+        for (auto &kv : members)
+          out->insert(kv);
+      else if (m == "intersection")
+        for (auto &kv : *dict)
+          if (members.count(kv.first))
+            out->insert(kv);
+      else if (m == "difference")
+        for (auto &kv : members)
+          out->erase(kv.first);
+      else
+        for (auto &kv : members)
+          if (!out->erase(kv.first))
+            out->insert(kv);
+    }
+    return QuantumValue(out);
+  }
+  if (m == "issubset" || m == "issuperset" || m == "isdisjoint") {
+    if (args.empty() || !args[0].isDict())
+      return QuantumValue(false);
+    const Dict &other = *args[0].asDict();
+    const Dict &small = m == "issuperset" ? other : *dict;
+    const Dict &big = m == "issuperset" ? *dict : other;
+    for (auto &kv : small) {
+      bool in = big.count(kv.first) > 0;
+      if (m == "isdisjoint" ? in : !in)
+        return QuantumValue(false);
+    }
+    return QuantumValue(true);
+  }
   if (m == "clear") {
     dict->clear();
     return QuantumValue();
   }
   if (m == "size" || m == "length")
     return QuantumValue((double)dict->size());
-  // Python dict.update(other) — merge keys from another dict
+  // Python dict.update(other) — merge keys from another dict; on a set,
+  // set.update(iterable) adds each element.
   if (m == "update") {
-    if (!args.empty() && args[0].isDict())
-      for (auto &kv : *args[0].asDict())
-        (*dict)[kv.first] = kv.second;
+    for (auto &a : args) {
+      if (a.isDict())
+        for (auto &kv : *a.asDict())
+          (*dict)[kv.first] = kv.second;
+      else if (a.isArray())
+        for (auto &v : *a.asArray())
+          (*dict)[v.toString()] = QuantumValue(true);
+    }
     return QuantumValue();
   }
   // Python dict.pop(key[, default])

@@ -99,6 +99,7 @@ private:
     void compilePrint(PrintStmt &s, int line);
     void compileInput(InputStmt &s, int line);
     void compileTry(TryStmt &s, int line);
+    void compileImport(ImportStmt &s, int line);
     void compileRaise(RaiseStmt &s, int line);
 
     // Expressions
@@ -129,7 +130,8 @@ private:
         const std::vector<bool> &paramIsRef,
         const std::vector<ASTNodePtr> &defaultArgs,
         ASTNode *body,
-        int line);
+        int line,
+        bool pythonScope = false); // `def`: assigned-first names are locals
 
     // Helper: emit variable load/store based on scope resolution
     void emitLoad(const std::string &name, int line);

@@ -161,6 +161,8 @@ static const char *opName(Op op)
         return "ARROW";
     case Op::PRINT:
         return "PRINT";
+    case Op::KW_NAMES:
+        return "KW_NAMES";
     default:
         return "??";
     }
@@ -191,6 +193,7 @@ void disassembleInstruction(const Chunk &chunk, size_t idx, std::ostream &out)
     case Op::SET_MEMBER:
     case Op::BIND_METHOD:
     case Op::GET_SUPER:
+    case Op::KW_NAMES:
         showConst();
         break;
     case Op::LOAD_LOCAL:

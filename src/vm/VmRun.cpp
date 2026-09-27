@@ -5,6 +5,20 @@
 #include <string>
 #include <unordered_set>
 
+// Method lookup on one class. The class parser stores a C++/JS/Ruby
+// `toString()` / `to_string()` / `to_s`-style method as `__str__` (so
+// printing an instance uses it), so an explicit call by the original name
+// resolves to it too.
+static std::unordered_map<std::string, std::shared_ptr<Closure>>::iterator
+findMethod(QuantumClass *k, const std::string &name)
+{
+    auto it = k->methods.find(name);
+    if (it == k->methods.end() &&
+        (name == "toString" || name == "to_string" || name == "to_str"))
+        it = k->methods.find("__str__");
+    return it;
+}
+
 void VM::runFrame(size_t stopDepth)
 {
     // Outer retry loop: a QuantumError thrown by any opcode (division by
@@ -95,8 +109,29 @@ void VM::runFrame(size_t stopDepth)
         case Op::NOP:
             break;
         case Op::ARG_PASSED:
-            push(QuantumValue(instr.operand < frame.argCount));
+            if (!frame.passed.empty())
+                push(QuantumValue(instr.operand < (int)frame.passed.size() &&
+                                  frame.passed[instr.operand]));
+            else
+                push(QuantumValue(instr.operand < frame.argCount));
             break;
+
+        case Op::KW_NAMES:
+        {
+            // Names for the next CALL's arguments ("" = positional).
+            pendingKwNames_.clear();
+            const std::string joined = consts[instr.operand].asString();
+            size_t startPos = 0;
+            while (true)
+            {
+                size_t sep = joined.find('\x1f', startPos);
+                pendingKwNames_.push_back(joined.substr(startPos, sep - startPos));
+                if (sep == std::string::npos)
+                    break;
+                startPos = sep + 1;
+            }
+            break;
+        }
 
         // ── Globals ───────────────────────────────────────────────────────
         case Op::DEFINE_GLOBAL:
@@ -135,7 +170,7 @@ void VM::runFrame(size_t stopDepth)
                     bool isMethod = false;
                     for (auto *k = inst->klass.get(); k && !isMethod; k = k->base.get())
                     {
-                        auto mit = k->methods.find(name);
+                        auto mit = findMethod(k, name);
                         if (mit != k->methods.end())
                         {
                             auto bm = std::make_shared<QuantumBoundMethod>();
@@ -178,7 +213,7 @@ void VM::runFrame(size_t stopDepth)
                             auto *k = inst->klass.get();
                             while (k && !found)
                             {
-                                auto mit = k->methods.find(name);
+                                auto mit = findMethod(k, name);
                                 if (mit != k->methods.end())
                                 {
                                     auto bm = std::make_shared<QuantumBoundMethod>();
@@ -391,6 +426,64 @@ void VM::runFrame(size_t stopDepth)
             int argCount = instr.operand;
             QuantumValue callee = stack_[stack_.size() - argCount - 1];
 
+            // Keyword arguments from a preceding KW_NAMES: bind them to the
+            // callee's parameters by name. Natives take them positionally,
+            // except the keyword-aware ones, which receive a trailing
+            // kwargs dict (see takeKwargs).
+            if (!pendingKwNames_.empty())
+            {
+                std::vector<std::string> names;
+                names.swap(pendingKwNames_);
+                if ((int)names.size() == argCount)
+                {
+                    if (callee.isFunction() && !callee.isNative())
+                        argCount = bindKeywordArgs(callee.asFunction(), argCount, names, false);
+                    else if (callee.isBoundMethod())
+                        argCount = bindKeywordArgs(callee.asBoundMethod()->method, argCount, names, true);
+                    else if (callee.isClass())
+                    {
+                        std::shared_ptr<Closure> init;
+                        for (auto *k = callee.asClass().get(); k && !init; k = k->base.get())
+                            for (const char *initName : {"__init__", "init", "constructor"})
+                            {
+                                auto it = k->methods.find(initName);
+                                if (it != k->methods.end())
+                                {
+                                    init = it->second;
+                                    break;
+                                }
+                            }
+                        if (init)
+                            argCount = bindKeywordArgs(init, argCount, names, true);
+                    }
+                    else if (callee.isNative() && [&]
+                             {
+                                 static const std::unordered_set<std::string> kwAware = {
+                                     "print", "sorted", "min", "max", "__method__sort"};
+                                 return kwAware.count(callee.asNative()->name) > 0;
+                             }())
+                    {
+                        auto kw = std::make_shared<Dict>();
+                        (*kw)["__kwargs__"] = QuantumValue(true);
+                        std::vector<QuantumValue> positional;
+                        for (int i = 0; i < argCount; ++i)
+                        {
+                            QuantumValue v = stack_[stack_.size() - argCount + i];
+                            if (names[i].empty())
+                                positional.push_back(v);
+                            else
+                                (*kw)[names[i]] = v;
+                        }
+                        for (int i = 0; i < argCount; ++i)
+                            stack_.pop_back();
+                        for (auto &v : positional)
+                            push(v);
+                        push(QuantumValue(kw));
+                        argCount = static_cast<int>(positional.size()) + 1;
+                    }
+                }
+            }
+
             // C++ dialect tolerance: properties like .size/.length yield a
             // number directly, so "v.size()" ends up calling that number —
             // a zero-arg call on a number is the number itself.
@@ -526,6 +619,14 @@ void VM::runFrame(size_t stopDepth)
             // Trim stack back to base - 1 to remove the callee slot
             while (stack_.size() > base - 1)
                 stack_.pop_back();
+            // A constructor yields its instance even when it exits through
+            // `return <expr>` (an overload dispatcher, `return None`).
+            if (!pendingInstances_.empty() &&
+                frames_.size() == pendingInstances_.back().second)
+            {
+                result = pendingInstances_.back().first;
+                pendingInstances_.pop_back();
+            }
             push(std::move(result));
             break;
         }
@@ -767,7 +868,7 @@ void VM::runFrame(size_t stopDepth)
                 bool found = false;
                 while (k && !found)
                 {
-                    auto mit = k->methods.find(name);
+                    auto mit = findMethod(k, name);
                     if (mit != k->methods.end())
                     {
                         auto bm = std::make_shared<QuantumBoundMethod>();
@@ -1193,6 +1294,11 @@ void VM::runFrame(size_t stopDepth)
             if (isStlIterator(v))
             {
                 push(stlIteratorDeref(v)); // *it
+                break;
+            }
+            if (v.isInstance())
+            {
+                push(v); // `*this`, `*node`: objects are held by reference already
                 break;
             }
             if (!v.isPointer())

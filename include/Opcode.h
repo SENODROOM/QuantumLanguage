@@ -119,6 +119,10 @@ enum class Op : uint8_t
 
     // Default parameters
     ARG_PASSED, // push whether the caller supplied argument slot[operand]
+
+    // Keyword arguments: constants[operand] names the arguments of the CALL
+    // that follows, '\x1f'-separated in argument order ("" = positional).
+    KW_NAMES,
 };
 
 // ─── Instruction ─────────────────────────────────────────────────────────────

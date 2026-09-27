@@ -50,7 +50,8 @@ void Compiler::compileVarDecl(VarDecl &s, int line)
 
 void Compiler::compileFunctionDecl(FunctionDecl &s, int line)
 {
-    auto fnChunk = compileFunction(s.name, s.params, s.paramIsRef, s.defaultArgs, s.body.get(), line);
+    auto fnChunk = compileFunction(s.name, s.params, s.paramIsRef, s.defaultArgs, s.body.get(), line,
+                                   s.pythonScope);
     auto closureTpl = std::make_shared<Closure>(fnChunk);
     emit(Op::LOAD_CONST, addConst(QuantumValue(closureTpl)), line);
     emit(fnChunk->upvalueCount > 0 ? Op::MAKE_CLOSURE : Op::MAKE_FUNCTION, 0, line);
@@ -166,7 +167,8 @@ void Compiler::compileClassDecl(ClassDecl &s, int line)
         for (auto &d : fd.defaultArgs)
             methodDefaults.push_back(std::move(d));
 
-        auto fnChunk = compileFunction(fd.name, methodParams, methodRefs, methodDefaults, fd.body.get(), method->line);
+        auto fnChunk = compileFunction(fd.name, methodParams, methodRefs, methodDefaults, fd.body.get(),
+                                       method->line, fd.pythonScope);
         // Hand the default expressions back to the AST node that owns them.
         for (size_t i = 0; i < fd.defaultArgs.size(); ++i)
             fd.defaultArgs[i] = std::move(methodDefaults[methodDefaults.size() - fd.defaultArgs.size() + i]);
@@ -382,6 +384,23 @@ void Compiler::compileInput(InputStmt &s, int line)
     }
     else
         emit(Op::POP, 0, line);
+}
+
+// Imports left after ModuleResolver inlined the on-disk modules name
+// host-language libraries the VM provides natively (`import string`,
+// `from random import choice`, `import numpy as np`). Each item becomes
+// __import_bind__(module, name, alias), which binds whatever the VM has.
+void Compiler::compileImport(ImportStmt &s, int line)
+{
+    for (auto &item : s.imports)
+    {
+        emit(Op::LOAD_GLOBAL, addStr("__import_bind__"), line);
+        emit(Op::LOAD_CONST, addStr(s.module), line);
+        emit(Op::LOAD_CONST, addStr(item.name), line);
+        emit(Op::LOAD_CONST, addStr(item.alias), line);
+        emit(Op::CALL, 3, line);
+        emit(Op::POP, 0, line);
+    }
 }
 
 void Compiler::compileTry(TryStmt &s, int line)
