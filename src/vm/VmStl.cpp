@@ -174,8 +174,31 @@ void VM::sortValues(Array &arr, const QuantumValue &key, const QuantumValue &cmp
         QuantumValue r = invokeCallable(cmp, {a, b});
         return r.isNumber() ? r.asNumber() < 0 : r.isTruthy();
     };
-    std::stable_sort(items.begin(), items.end(), [&](const auto &x, const auto &y)
-                     { return reverse ? less(y.first, x.first) : less(x.first, y.first); });
+    auto before = [&](const auto &x, const auto &y)
+    { return reverse ? less(y.first, x.first) : less(x.first, y.first); };
+
+    // Bottom-up merge sort instead of std::stable_sort: the comparator is user
+    // code, and std::stable_sort is undefined behaviour (it reads out of bounds
+    // and crashed the VM) when that isn't a strict weak ordering — e.g. the
+    // common `sort(() => Math.random() - 0.5)` shuffle. Every index here is
+    // bounds-checked, so an inconsistent comparator only yields some order.
+    std::vector<std::pair<QuantumValue, QuantumValue>> buf(items.size());
+    const size_t n = items.size();
+    for (size_t width = 1; width < n; width *= 2)
+    {
+        for (size_t lo = 0; lo < n; lo += 2 * width)
+        {
+            size_t mid = std::min(lo + width, n), hi = std::min(lo + 2 * width, n);
+            size_t i = lo, j = mid, k = lo;
+            while (i < mid && j < hi)
+                buf[k++] = before(items[j], items[i]) ? std::move(items[j++]) : std::move(items[i++]);
+            while (i < mid)
+                buf[k++] = std::move(items[i++]);
+            while (j < hi)
+                buf[k++] = std::move(items[j++]);
+        }
+        items.swap(buf);
+    }
     for (size_t i = 0; i < items.size(); ++i)
         arr[i] = items[i].second;
 }
