@@ -578,7 +578,7 @@ const std::string &S(const QV &v)
         tmp = javaUn(jop::VSTR, v).asString();
         return tmp;
     }
-    return std::get<std::string>(v.data);
+    return v.strRef();
 }
 
 QV I(int64_t v) { return jlong(v); }
@@ -1258,7 +1258,7 @@ void registerJavaLibNatives(const std::function<void(const std::string &, Quantu
         QV &f = self.asInstance()->fields["$s"];
         if (!f.isString())
             f = QV(std::string());
-        return std::get<std::string>(f.data);
+        return f.strMut();
     };
     reg("__jn_StringBuilder_append", [sbText](std::vector<QV> a) -> QV
         {

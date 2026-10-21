@@ -80,7 +80,7 @@ When `hello.exe` runs, it checks for the `QNTM_VM!` magic trailer, reads back th
 **`qrun` — direct interpretation:**
 
 ```
-.sa source  →  Lexer  →  Parser  →  TypeChecker  →  Compiler  →  VM::run()
+.sa source  →  dialect passes  →  Lexer  →  Parser  →  @use / imports  →  TypeChecker  →  Compiler  →  VM::run()
 ```
 
 Same front-end and same VM. The only difference is that no `.exe` is written to disk.
@@ -89,9 +89,11 @@ Same front-end and same VM. The only difference is that no `.exe` is written to 
 
 ### The Compiler
 
-The compiler (`src/compiler/`) walks the AST in a single pass and emits a flat array of `Instruction` structs into a `Chunk`. Each `Chunk` represents one function body (or the top-level script). Functions are compiled into nested `Chunk`s stored as constants of the parent chunk, then wrapped at runtime by `MAKE_CLOSURE`.
+**The compiler is written in Quantum** (`selfhost/`, see `selfhost/README.md`): dialect passes, lexer, parser, module resolution, type checker, code generator and bytecode writer are `.sa` files. It is self-hosting — `selfhost/compiler.qbc` is the compiler compiled by itself, a fixed point that `selfhost/bootstrap.sh` rebuilds after a change — and qrun carries that bytecode inside the executable, running it on the same VM as the programs it compiles (`src/HostedCompiler.cpp`). The C/C++ and Java front-ends (`src/cpp/`, `src/java/`) parse their languages in C++ and hand their syntax trees to the same code generator.
 
-The compiler maintains a `CompilerState` stack that tracks locals, scope depth, and upvalue captures across nested function boundaries. Forward jumps are emitted with a placeholder operand and backpatched once the target instruction index is known.
+The code generator (`selfhost/codegen.sa`) walks the AST in a single pass and emits a flat array of instructions into a chunk. Each chunk represents one function body (or the top-level script). Functions are compiled into nested chunks stored as constants of the parent chunk, then wrapped at runtime by `MAKE_CLOSURE`.
+
+The code generator keeps a stack of compiler states that tracks locals, scope depth, and upvalue captures across nested function boundaries. Forward jumps are emitted with a placeholder operand and backpatched once the target instruction index is known.
 
 Key instruction categories:
 

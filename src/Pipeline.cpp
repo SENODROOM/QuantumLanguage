@@ -1,13 +1,10 @@
-#include "ModuleResolver.h"
-#include "Dialect.h"
 #include "Pipeline.h"
-#include "Lexer.h"
-#include "Parser.h"
-#include "Compiler.h"
-#include "TypeChecker.h"
-#include "Disassembler.h"
 #include "Diagnostics.h"
+#include "Disassembler.h"
 #include "Error.h"
+#include "HostedCompiler.h"
+#include "Serializer.h"
+#include "SourceFiles.h"
 #include "cpp/Cpp.h"
 #include "java/JavaSema.h"
 
@@ -103,14 +100,16 @@ std::string strictCppReport(const cpp::Unsupported &u, const std::string &path, 
 }
 } // namespace
 
-// ─── Compile source → Chunk ───────────────────────────────────────────────────
+// ─── Compile source → bytecode ────────────────────────────────────────────────
 
-std::shared_ptr<Chunk> compileSource(const std::string &source,
-                                     const std::string &sourcePath,
-                                     bool debug)
+namespace
 {
-    // C/C++: the typed front-end (src/cpp/) when the program is within its
-    // subset; otherwise the dialect pipeline below.
+// `multiSyntax` reports whether the self-hosted compiler parsed the program
+// (rather than the C/C++ or Java front-end).
+std::vector<uint8_t> compileToBytes(const std::string &source, const std::string &sourcePath,
+                                    std::string *compiledOut, bool &multiSyntax)
+{
+    multiSyntax = false;
     const std::string ext = fileExtLower(sourcePath);
     // Java: its own front-end (src/java/), always strict — a program javac
     // rejects is a compile error, reported the way javac reports it.
@@ -121,12 +120,10 @@ std::shared_ptr<Chunk> compileSource(const std::string &source,
             (unsigned char)text[2] == 0xBF)
             text.erase(0, 3);
         ASTNodePtr program = java::compileProgram(sourcePath, text);
-        Compiler compiler;
-        auto chunk = compiler.compile(*program);
-        if (debug)
-            disassembleChunk(*chunk, std::cerr);
-        return chunk;
+        return hosted::compileAst(*program);
     }
+    // C/C++: the typed front-end (src/cpp/) when the program is within its
+    // subset; otherwise the multi-syntax pipeline below.
     if ((ext == ".cpp" || ext == ".c" || ext == ".cc" || ext == ".cxx") && !std::getenv("QUANTUM_OLD_CPP"))
     {
         std::ifstream in(sourcePath, std::ios::binary);
@@ -137,11 +134,7 @@ std::shared_ptr<Chunk> compileSource(const std::string &source,
             try
             {
                 ASTNodePtr program = cpp::compileProgram(sourcePath, ss.str());
-                Compiler compiler;
-                auto chunk = compiler.compile(*program);
-                if (debug)
-                    disassembleChunk(*chunk, std::cerr);
-                return chunk;
+                return hosted::compileAst(*program);
             }
             catch (const cpp::LinkError &l)
             {
@@ -161,51 +154,30 @@ std::shared_ptr<Chunk> compileSource(const std::string &source,
         else if (g_strictMode)
             throw CompileError(sourcePath + ": error: cannot open source file\n");
     }
+    // Everything else: the self-hosted compiler — dialect passes, lexer,
+    // parser, @use / import resolution, type warnings, code generation.
+    multiSyntax = true;
+    return hosted::compileSource(source, sourcePath, true, compiledOut);
+}
+} // namespace
 
-    Lexer lexer(source);
-    auto tokens = lexer.tokenize();
-    Parser parser(std::move(tokens));
-    const bool python = fileExtLower(sourcePath) == ".py";
-    parser.setPythonSource(python);
-    auto ast = parser.parse();
+std::vector<uint8_t> compileSourceBytes(const std::string &source, const std::string &sourcePath,
+                                        std::string *compiledOut)
+{
+    bool multiSyntax = false;
+    return compileToBytes(source, sourcePath, compiledOut, multiSyntax);
+}
 
-    // A Python program prints Python's way (True / None / 'str' in lists).
-    // Done by an instruction rather than a runner flag so that a bundled
-    // .exe behaves the same.
-    if (python && ast->is<BlockStmt>())
-    {
-        CallExpr call;
-        call.callee = std::make_unique<ASTNode>(Identifier{"__python_repr__"}, 0);
-        auto &stmts = ast->as<BlockStmt>().statements;
-        stmts.insert(stmts.begin(), std::make_unique<ASTNode>(
-                                        ExprStmt{std::make_unique<ASTNode>(std::move(call), 0)}, 0));
-    }
-
-    resolveUseDirectives(*ast, source, sourcePath);
-    resolveImports(*ast, sourcePath);
-
-    try
-    {
-        TypeChecker tc;
-        tc.check(ast);
-    }
-    catch (const StaticTypeError &e)
-    {
-        std::cerr << Colors::YELLOW << "[TypeWarning] " << Colors::RESET
-                  << e.what() << " (line " << e.line << ")\n";
-    }
-
-    Compiler compiler;
-    auto chunk = compiler.compile(*ast);
-
+std::shared_ptr<Chunk> compileSource(const std::string &source, const std::string &sourcePath, bool debug,
+                                     std::string *compiledOut)
+{
+    bool multiSyntax = false;
+    auto chunk = Serializer::deserialize(compileToBytes(source, sourcePath, compiledOut, multiSyntax));
     if (debug)
     {
-        std::cerr << Colors::CYAN << "[DEBUG] Bytecode — " << sourcePath << "\n"
-                  << Colors::RESET;
+        if (multiSyntax)
+            std::cerr << Colors::CYAN << "[DEBUG] Bytecode — " << sourcePath << "\n" << Colors::RESET;
         disassembleChunk(*chunk, std::cerr);
     }
     return chunk;
 }
-
-// Dialect front-end (Ruby/C/C++ source-to-source passes) lives in
-// src/dialect/ and is reached through applyDialect() in Dialect.h.

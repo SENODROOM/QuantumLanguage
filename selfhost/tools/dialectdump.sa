@@ -1,0 +1,14 @@
+# Prints a program after the self-hosted dialect passes, as `qrun --dialect`
+# prints it after the C++ ones:
+#   qrun selfhost/tools/dialectdump.sa <file>
+# @use "../dialect.sa"
+
+let path = sys.argv[1]
+let source = read_file(path)
+if source == nil {
+    print("ERROR\tcannot read " + path)
+} else {
+    # text mode, as the C++ runner reads a program
+    source = source.split("\r\n").join("\n")
+    print(applyDialect(source, path), end="")
+}

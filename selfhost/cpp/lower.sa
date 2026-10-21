@@ -1,0 +1,2446 @@
+# Lowering for the typed C/C++ front-end: C++ AST -> Quantum AST with C++
+# semantics. A port of src/cpp/CppLower.cpp (stmt.sa holds its statements,
+# expr*.sa CppExpr.cpp, lib.sa CppLib.cpp).
+#
+# Runtime representation (all on the existing VM):
+#   integers, char, enums, double -> numbers (char holds its code)
+#   bool -> bool;  std::string / const char* -> string (immutable)
+#   class object -> array [descriptor, field...]   (slot 0 = descriptor dict)
+#   vector / array / deque / ... -> array;  pair / tuple -> array
+#   map / set -> dict of encoded key -> [key, value] / [key]
+#   optional -> nil | [value];  variant -> [index, value]
+#   T* / unique_ptr<T> to an object -> the object;  nullptr -> nil
+#   T* / T& to a scalar -> Ref [container, key] (a boxed local is [value])
+#
+# The lowerer's state lives in CXL_* globals (one program at a time).
+# @use "./types.sa"
+
+let CXL_PROG = nil
+let CXL_GLOBAL = nil
+let CXL_STD = nil
+let CXL_CLASS_ORDER = []
+let CXL_GLOBALS_IN_ORDER = []
+let CXL_ALL_FUNCS = []
+let CXL_TOP_FNS = []
+let CXL_TOP_INIT = []
+let CXL_PLANS = {}
+let CXL_PLAN_COUNT = 0
+let CXL_PLAN_INITS = []
+let CXL_BUILTIN_EXC = {}
+let CXL_TEMP_COUNTER = 0
+let CXL_STATIC_COUNTER = 0
+let CXL_LOCAL_CLASS_COUNTER = 0
+let CXL_FUNC_DECLS = []
+let CXL_LINE = 0
+let CXL_FN = nil
+let CXL_PRE = nil
+let CXL_CAN_HOIST = false
+let CXL_EXPLICIT_CONV = false
+let CXL_CUR_FN = nil
+let CXL_LOCAL_TYPES = {}
+let CXL_LAMBDA_HINTS = []
+let CXL_CALLED_UNDEFINED = {}
+let CXL_INSTANCES = {}
+let CXL_DTOR_MEMO = {}
+let CXL_CLASS_INSTANCES = {}
+let CXL_INSTANCE_OF = {}
+let CXL_PHASE = 0
+let CXL_TEMPS_TRACKED = -1
+let CXL_TEMPS_MARK = ""
+let CXL_STRICT = false
+
+fn cxLowererInit(prog, strict) {
+    CXL_PROG = prog
+    CXL_STRICT = strict
+    CXL_CLASS_ORDER = []
+    CXL_GLOBALS_IN_ORDER = []
+    CXL_ALL_FUNCS = []
+    CXL_TOP_FNS = []
+    CXL_TOP_INIT = []
+    CXL_PLANS = {}
+    CXL_PLAN_COUNT = 0
+    CXL_PLAN_INITS = []
+    CXL_BUILTIN_EXC = {}
+    CXL_TEMP_COUNTER = 0
+    CXL_STATIC_COUNTER = 0
+    CXL_LOCAL_CLASS_COUNTER = 0
+    CXL_FUNC_DECLS = []
+    CXL_LINE = 0
+    CXL_FN = nil
+    CXL_PRE = nil
+    CXL_CAN_HOIST = false
+    CXL_EXPLICIT_CONV = false
+    CXL_CUR_FN = nil
+    CXL_LOCAL_TYPES = {}
+    CXL_LAMBDA_HINTS = []
+    CXL_CALLED_UNDEFINED = {}
+    CXL_INSTANCES = {}
+    CXL_DTOR_MEMO = {}
+    CXL_CLASS_INSTANCES = {}
+    CXL_INSTANCE_OF = {}
+    CXL_PHASE = 0
+    CXL_TEMPS_TRACKED = -1
+    CXL_TEMPS_MARK = ""
+    CXL_GLOBAL = cxNewScope("", nil)
+    CXL_STD = cxNewScope("std", CXL_GLOBAL)
+    CXL_STD["isStd"] = true
+    let s = cxSym("Namespace")
+    s["ns"] = CXL_STD
+    CXL_GLOBAL["syms"]["std"] = s
+    cxDeclareBuiltins()
+}
+
+fn cxNewScope(qname, parent) {
+    return cxNewScopeRaw(qname, parent)
+}
+
+fn cxFailU(msg, line) {
+    let ln = line
+    if ln == 0 {
+        ln = CXL_LINE
+    }
+    raise cxUnsupported(msg, "", ln)
+}
+
+fn cxTempName() {
+    CXL_TEMP_COUNTER = CXL_TEMP_COUNTER + 1
+    return "__t" + cxI64Str(CXL_TEMP_COUNTER)
+}
+
+fn cxMangle(sc, name) {
+    if sc != nil and sc["qname"] != "" {
+        return sc["qname"] + "::" + name
+    }
+    return name
+}
+
+fn cxBuiltinExceptionClass(n) {
+    if n in CXL_BUILTIN_EXC {
+        return CXL_BUILTIN_EXC[n]
+    }
+    return nil
+}
+
+let CX_EXC_CLASSES = [["exception", ""], ["bad_alloc", "exception"], ["bad_cast", "exception"],
+                      ["bad_variant_access", "exception"], ["bad_optional_access", "exception"],
+                      ["bad_function_call", "exception"], ["logic_error", "exception"],
+                      ["invalid_argument", "logic_error"], ["out_of_range", "logic_error"],
+                      ["length_error", "logic_error"], ["domain_error", "logic_error"],
+                      ["runtime_error", "exception"], ["range_error", "runtime_error"],
+                      ["overflow_error", "runtime_error"], ["underflow_error", "runtime_error"],
+                      ["system_error", "runtime_error"]]
+
+# std exception classes: layout [desc, what], constructible from a string
+fn cxDeclareBuiltins() {
+    for e in CX_EXC_CLASSES {
+        let c = cxNewClass()
+        c["name"] = e[0]
+        c["qname"] = "std::" + e[0]
+        c["builtin"] = true
+        c["resolved"] = true
+        c["polymorphic"] = true
+        c["aggregate"] = false
+        c["hasUserCtor"] = true
+        c["nslots"] = 2
+        if e[1] != "" {
+            c["bases"].push(CXL_BUILTIN_EXC[e[1]])
+        }
+        c["scope"] = cxNewScope(c["qname"], CXL_STD)
+        c["scope"]["cls"] = c
+        CXL_BUILTIN_EXC[e[0]] = c
+        let s = cxSym("Type")
+        s["type"] = cxClassT(c)
+        CXL_STD["syms"][e[0]] = s
+    }
+}
+
+fn cxLast(xs) {
+    return xs[len(xs) - 1]
+}
+
+# ── pass 1: declarations ────────────────────────────────────────────────────
+
+fn cxCollect(decls, sc) {
+    for d in decls {
+        CXL_LINE = d["line"]
+        let k = d["k"]
+        if k == "Namespace" {
+            let ns = sc
+            if d["anonymous"] {
+                let n = "(anon" + cxI64Str(d["tu"]) + ")"
+                if !(n in sc["syms"]) {
+                    let s = cxSym("Namespace")
+                    s["ns"] = cxNewScope(cxMangle(sc, n), sc)
+                    sc["syms"][n] = s
+                    sc["usings"].push(s["ns"])
+                }
+                ns = sc["syms"][n]["ns"]
+            } else {
+                for part in d["name"] {
+                    let found = nil
+                    if part in ns["syms"] {
+                        found = ns["syms"][part]
+                    }
+                    if found == nil or found["kind"] != "Namespace" {
+                        let s = cxSym("Namespace")
+                        if part == "std" and ns["id"] == CXL_GLOBAL["id"] {
+                            s["ns"] = CXL_STD
+                        } else {
+                            s["ns"] = cxNewScope(cxMangle(ns, part), ns)
+                        }
+                        ns["syms"][part] = s
+                        found = s
+                    }
+                    ns = found["ns"]
+                }
+            }
+            cxCollect(d["decls"], ns)
+        } elif k == "Class" {
+            if !d["forwardOnly"] {
+                cxCollectClass(d, sc, "")
+            } elif len(d["name"]) > 0 and cxLast(d["name"]) != "" and !(cxLast(d["name"]) in sc["syms"]) {
+                # forward declaration: the definition fills it in later
+                cxCollectClass(d, sc, "")
+            }
+        } elif k == "Enum" {
+            if !d["forwardOnly"] {
+                cxCollectEnum(d, sc)
+            }
+        } elif k == "Alias" {
+            let s = cxSym("Type")
+            s["aliasDecl"] = d
+            s["aliasScope"] = sc
+            sc["syms"][d["name"][0]] = s
+        } elif k == "Func" {
+            CXL_FUNC_DECLS.push([d, sc])
+        } elif k == "Var" {
+            if len(d["name"]) > 1 {
+                # out-of-class static member definition: int Cls::n = 0;
+                CXL_GLOBALS_IN_ORDER.push([d, sc])
+            } elif !(d["isExtern"] and d["var"]["init"] == "None") {
+                let s = cxSym("Var")
+                s["global"] = cxMangle(sc, d["var"]["name"])
+                let vt = d["var"]["type"]
+                if vt != nil {
+                    s["isConst"] = (vt["isConst"] and vt["pointers"] == 0) or (len(vt["constPtr"]) > 0 and cxLast(vt["constPtr"])) or d["isConstexpr"]
+                }
+                sc["syms"][d["var"]["name"]] = s
+                CXL_GLOBALS_IN_ORDER.push([d, sc])
+            }
+        } elif k == "UsingDirective" {
+            let s = cxLookup(d["name"], sc, false)
+            if s != nil and s["kind"] == "Namespace" {
+                sc["usings"].push(s["ns"])
+            }
+        } elif k == "UsingDecl" {
+            # using std::cout; using ns::f;  (resolved lazily at lookup)
+            let s = cxSym("None")
+            s["aliasDecl"] = d
+            s["aliasScope"] = sc
+            if !d["inheritingCtor"] {
+                sc["usingDecls"][cxLast(d["name"])] = s
+            }
+        }
+    }
+}
+
+fn cxCollectClass(d, sc, forcedName) {
+    let name = forcedName
+    if name == "" {
+        name = cxLast(d["name"])
+    }
+    if name == "" {
+        CXL_LOCAL_CLASS_COUNTER = CXL_LOCAL_CLASS_COUNTER + 1
+        name = "(anon" + cxI64Str(CXL_LOCAL_CLASS_COUNTER) + ")"
+    }
+    let c = nil
+    if name in sc["syms"] {
+        let it = sc["syms"][name]
+        if it["kind"] == "Type" and it["type"] != nil and it["type"]["k"] == "Class" and !it["type"]["cls"]["builtin"] {
+            c = it["type"]["cls"]
+        }
+    }
+    if c == nil {
+        c = cxNewClass()
+        c["name"] = name
+        c["qname"] = cxMangle(sc, name)
+        c["outer"] = sc
+        c["scope"] = cxNewScope(c["qname"], sc)
+        c["scope"]["cls"] = c
+        let s = cxSym("Type")
+        s["type"] = cxClassT(c)
+        sc["syms"][name] = s
+    }
+    if d["forwardOnly"] {
+        return nil
+    }
+    if CXL_PROG["cMode"] {
+        for m in d["members"] {
+            if m["k"] == "Func" {
+                let mn = "?"
+                if len(m["name"]) > 0 {
+                    mn = cxLast(m["name"])
+                }
+                cxFailU("field '" + mn + "' declared as a function", m["line"])
+            }
+        }
+    }
+    c["decl"] = d
+    c["isTemplate"] = d["isTemplate"]
+    if d["isTemplate"] {
+        for tp in d["templateParams"] {
+            let s = cxSym("Type")
+            s["type"] = tDyn()
+            c["scope"]["syms"][tp] = s
+        }
+    }
+    CXL_CLASS_ORDER.push(c)
+    # nested types and members' declarations
+    for m in d["members"] {
+        if m["k"] == "Class" and !m["forwardOnly"] {
+            cxCollectClass(m, c["scope"], "")
+        } elif m["k"] == "Enum" and !m["forwardOnly"] {
+            cxCollectEnum(m, c["scope"])
+        } elif m["k"] == "Alias" {
+            let s = cxSym("Type")
+            s["aliasDecl"] = m
+            s["aliasScope"] = c["scope"]
+            c["scope"]["syms"][m["name"][0]] = s
+        } elif m["k"] == "Func" and m["isFriend"] and m["body"] != nil {
+            # friend function defined in the class: a free function
+            CXL_FUNC_DECLS.push([m, sc])
+        }
+    }
+}
+
+fn cxCollectEnum(d, sc) {
+    let e = cxNewEnum()
+    let name = cxLast(d["name"])
+    if name == "" {
+        CXL_LOCAL_CLASS_COUNTER = CXL_LOCAL_CLASS_COUNTER + 1
+        name = "(anonenum" + cxI64Str(CXL_LOCAL_CLASS_COUNTER) + ")"
+    }
+    e["qname"] = cxMangle(sc, name)
+    e["scoped"] = d["scoped"]
+    let t = mkT("Enum", "")
+    t["en"] = e
+    t["name"] = e["qname"]
+    let es = cxNewScope(e["qname"], sc)
+    e["scope"] = es
+    let ts = cxSym("Type")
+    ts["type"] = t
+    ts["ns"] = es
+    if cxLast(d["name"]) != "" {
+        sc["syms"][name] = ts
+    }
+    let next = 0
+    for en in d["enumerators"] {
+        let v = next
+        if en[1] != nil {
+            v = cxEvalConst(en[1], es)
+        }
+        e["values"].push([en[0], v])
+        next = v + 1
+        let s = cxSym("Enumerator")
+        s["type"] = t
+        s["value"] = v
+        es["syms"][en[0]] = s
+        if !d["scoped"] {
+            sc["syms"][en[0]] = s
+        }
+    }
+}
+
+# ── lookup ──────────────────────────────────────────────────────────────────
+
+fn cxLookupIn(s, n, typesOnly) {
+    if n in s["syms"] {
+        let sym = s["syms"][n]
+        if !typesOnly or sym["kind"] == "Type" or sym["kind"] == "Namespace" {
+            if sym["kind"] == "Type" and sym["aliasDecl"] != nil and sym["type"] == nil {
+                let ad = sym["aliasDecl"]
+                sym["aliasDecl"] = nil
+                sym["type"] = cxResolveType(ad["aliased"], sym["aliasScope"])
+            }
+            return sym
+        }
+    }
+    # class scope: members of base classes
+    if s["cls"] != nil {
+        for b in s["cls"]["bases"] {
+            if b["scope"] != nil {
+                let r = cxLookupIn(b["scope"], n, typesOnly)
+                if r != nil {
+                    return r
+                }
+            }
+        }
+    }
+    if n in s["usingDecls"] {
+        let u = s["usingDecls"][n]
+        if u["kind"] == "None" and u["aliasDecl"] != nil {
+            let ad = u["aliasDecl"]
+            u["aliasDecl"] = nil
+            let target = cxLookup(ad["name"], u["aliasScope"], typesOnly)
+            if target != nil {
+                cxSymAssign(u, target)
+            }
+        }
+        if u["kind"] != "None" {
+            return u
+        }
+    }
+    return nil
+}
+
+fn cxLookupUnqualified(n, sc, typesOnly) {
+    let s = sc
+    while s != nil {
+        let r = cxLookupIn(s, n, typesOnly)
+        if r != nil {
+            return r
+        }
+        for u in s["usings"] {
+            let r2 = cxLookupIn(u, n, typesOnly)
+            if r2 != nil {
+                return r2
+            }
+        }
+        s = s["parent"]
+    }
+    return nil
+}
+
+fn cxLookup(name, sc, typesOnly) {
+    if len(name) == 0 {
+        return nil
+    }
+    if len(name) == 1 {
+        return cxLookupUnqualified(name[0], sc, typesOnly)
+    }
+    let s = cxLookupUnqualified(name[0], sc, false)
+    let i = 1
+    while s != nil and i < len(name) {
+        let inScope = nil
+        if s["kind"] == "Namespace" {
+            inScope = s["ns"]
+        } elif s["kind"] == "Type" and s["type"] != nil and s["type"]["k"] == "Class" and s["type"]["cls"] != nil {
+            inScope = s["type"]["cls"]["scope"]
+        } elif s["kind"] == "Type" and s["type"] != nil and s["type"]["k"] == "Enum" {
+            if s["ns"] != nil {
+                inScope = s["ns"]
+            } elif s["type"]["en"] != nil {
+                inScope = s["type"]["en"]["scope"]
+            }
+        }
+        if inScope == nil {
+            return nil
+        }
+        let next = cxLookupIn(inScope, name[i], typesOnly and i + 1 == len(name))
+        if next == nil and inScope["id"] == CXL_STD["id"] {
+            return nil
+        }
+        s = next
+        i = i + 1
+    }
+    return s
+}
+
+# ── types from syntax ───────────────────────────────────────────────────────
+
+fn cxIntT(name, u) {
+    let t = mkT("Int", name)
+    t["isUnsigned"] = u
+    return t
+}
+
+# a type argument of the last name component, resolved
+fn cxTarg(tn, i, sc) {
+    let ta = cxLast(tn["targs"])
+    if i >= len(ta) or ta[i]["type"] == nil {
+        return tDyn()
+    }
+    return cxResolveType(ta[i]["type"], sc)
+}
+
+let CX_STD_DYN_TYPES = cxSetOf(["mt19937", "mt19937_64", "random_device", "uniform_int_distribution",
+                                "uniform_real_distribution", "FILE", "any", "bitset", "reference_wrapper", "less",
+                                "greater", "hash", "numeric_limits"])
+
+# res: {"ok": bool}
+fn cxBuiltinType(tn, sc, res) {
+    res["ok"] = true
+    let n = tn["name"].slice(0)
+    let isStdQual = len(n) > 0 and n[0] == "std"
+    if isStdQual {
+        n = n.slice(1)
+    }
+    if len(n) != 1 {
+        # std::vector<int>::iterator, std::string::size_type, Cls::type
+        if len(n) == 2 and (n[1] == "iterator" or n[1] == "const_iterator" or n[1] == "reverse_iterator") {
+            let inner = cxTypeNameCopy(tn)
+            inner["name"] = tn["name"].slice(0, len(tn["name"]) - 1)
+            inner["targs"] = tn["targs"].slice(0, len(tn["targs"]) - 1)
+            inner["pointers"] = 0
+            inner["ref"] = false
+            inner["rref"] = false
+            inner["arrayDims"] = []
+            let it = mkT("Iter", "")
+            it["a"].push(cxResolveType(inner, sc))
+            return it
+        }
+        if len(n) == 2 and (n[1] == "size_type" or n[1] == "difference_type") {
+            return tSize()
+        }
+        if len(n) == 2 and (n[1] == "value_type" or n[1] == "mapped_type" or n[1] == "key_type") {
+            let inner = cxTypeNameCopy(tn)
+            inner["name"] = tn["name"].slice(0, len(tn["name"]) - 1)
+            inner["targs"] = tn["targs"].slice(0, len(tn["targs"]) - 1)
+            let ct = cxResolveType(inner, sc)
+            if ct["k"] == "Map" {
+                if n[1] == "mapped_type" {
+                    return ct["a"][1]
+                }
+                if n[1] == "key_type" {
+                    return ct["a"][0]
+                }
+                let p = mkT("Pair", "")
+                p["a"] = ct["a"]
+                return p
+            }
+            return cxElemType(ct)
+        }
+        res["ok"] = false
+        return nil
+    }
+    let w = n[0]
+    if w == "va_list" or w == "__builtin_va_list" {
+        return mkT("Dyn", "va_list")
+    }
+    # built-in arithmetic
+    if w == "void" {
+        return tVoid()
+    }
+    if w == "bool" {
+        return tBool()
+    }
+    if w == "char" or w == "signed char" or w == "wchar_t" or w == "char8_t" or w == "char16_t" or w == "char32_t" {
+        return mkT("Char", w)
+    }
+    if w == "unsigned char" or w == "uint8_t" or w == "byte" {
+        let t = mkT("Char", "unsigned char")
+        t["isUnsigned"] = true
+        return t
+    }
+    if w == "int8_t" {
+        return mkT("Char", "signed char")
+    }
+    if w == "short" or w == "int" or w == "long" or w == "int16_t" or w == "int32_t" or w == "intptr_t" or w == "ptrdiff_t" or w == "ssize_t" {
+        if w == "int32_t" {
+            return cxIntT("int", false)
+        }
+        return cxIntT(w, false)
+    }
+    if w == "long long" or w == "int64_t" or w == "intmax_t" or w == "streamsize" or w == "time_t" or w == "clock_t" {
+        return cxIntT("long long", false)
+    }
+    if w == "unsigned short" or w == "uint16_t" {
+        return cxIntT("unsigned short", true)
+    }
+    if w == "unsigned int" or w == "unsigned" or w == "uint32_t" {
+        return cxIntT("unsigned int", true)
+    }
+    if w == "unsigned long" {
+        return cxIntT("unsigned long", true)
+    }
+    if w == "unsigned long long" or w == "uint64_t" or w == "size_t" or w == "uintptr_t" or w == "uintmax_t" {
+        return cxIntT("unsigned long long", true)
+    }
+    if w == "float" {
+        return mkT("Float", "float")
+    }
+    if w == "double" or w == "long double" {
+        return tDouble()
+    }
+    if w == "auto" {
+        return tDyn()
+    }
+    # library types (std:: optional -- `using namespace std` is common)
+    let userShadow = false
+    if !isStdQual {
+        let s = cxLookupUnqualified(w, sc, true)
+        if s != nil and s["kind"] == "Type" and !(sc != nil and sc["id"] == CXL_STD["id"]) {
+            # a user type of the same name wins
+            if s["type"] != nil or s["aliasDecl"] != nil {
+                userShadow = true
+            }
+        }
+    }
+    if userShadow {
+        res["ok"] = false
+        return nil
+    }
+    let vis = sc
+    if vis == nil {
+        vis = CXL_GLOBAL
+    }
+    if !isStdQual and !CXL_PROG["cMode"] and w != "FILE" and w != "nullptr_t" and !cxStdVisible(w, vis) {
+        # std's, but no `using namespace std` / `using std::...` here
+        res["ok"] = false
+        return nil
+    }
+    if w == "string" or w == "wstring" or w == "string_view" {
+        return tStr()
+    }
+    if w == "vector" or w == "deque" or w == "list" or w == "forward_list" or w == "stack" or w == "queue" or w == "priority_queue" or w == "initializer_list" or w == "valarray" {
+        let kind = w
+        if w == "initializer_list" or w == "valarray" {
+            kind = "vector"
+        }
+        let t = mkT("Vector", kind)
+        t["a"].push(cxTarg(tn, 0, sc))
+        if w == "priority_queue" {
+            let ta = cxLast(tn["targs"])
+            # priority_queue<T, Container, Compare>: remember a greater<> comparator
+            if len(ta) >= 3 and ta[2]["type"] != nil and len(ta[2]["type"]["name"]) > 0 and cxLast(ta[2]["type"]["name"]) == "greater" {
+                t["multi"] = true
+            }
+        }
+        return t
+    }
+    if w == "array" {
+        let t = mkT("Array", "array")
+        t["a"].push(cxTarg(tn, 0, sc))
+        let ta = cxLast(tn["targs"])
+        if len(ta) > 1 and ta[1]["expr"] != nil {
+            t["n"] = cxEvalConst(ta[1]["expr"], sc)
+        }
+        return t
+    }
+    if w == "map" or w == "unordered_map" or w == "multimap" or w == "unordered_multimap" {
+        let t = mkT("Map", w)
+        t["sorted"] = w == "map" or w == "multimap"
+        t["multi"] = sFind(w, "multi", 0) >= 0
+        let k0 = cxTarg(tn, 0, sc)
+        let k1 = cxTarg(tn, 1, sc)
+        t["a"] = [k0, k1]
+        return t
+    }
+    if w == "set" or w == "unordered_set" or w == "multiset" or w == "unordered_multiset" {
+        let t = mkT("Set", w)
+        t["sorted"] = w == "set" or w == "multiset"
+        t["multi"] = sFind(w, "multi", 0) >= 0
+        t["a"] = [cxTarg(tn, 0, sc)]
+        return t
+    }
+    if w == "pair" {
+        let t = mkT("Pair", "")
+        let k0 = cxTarg(tn, 0, sc)
+        let k1 = cxTarg(tn, 1, sc)
+        t["a"] = [k0, k1]
+        return t
+    }
+    if w == "tuple" {
+        let t = mkT("Tuple", "")
+        let i = 0
+        while i < len(cxLast(tn["targs"])) {
+            t["a"].push(cxTarg(tn, i, sc))
+            i = i + 1
+        }
+        return t
+    }
+    if w == "optional" {
+        let t = mkT("Optional", "")
+        t["a"] = [cxTarg(tn, 0, sc)]
+        return t
+    }
+    if w == "variant" {
+        let t = mkT("Variant", "")
+        let i = 0
+        while i < len(cxLast(tn["targs"])) {
+            t["a"].push(cxTarg(tn, i, sc))
+            i = i + 1
+        }
+        return t
+    }
+    if w == "monostate" {
+        return mkT("Monostate", "")
+    }
+    if w == "nullopt_t" {
+        return mkT("Nullopt", "")
+    }
+    if w == "nullptr_t" {
+        return mkT("Nullptr", "")
+    }
+    if w == "unique_ptr" or w == "shared_ptr" or w == "weak_ptr" {
+        let t = mkT("UPtr", w)
+        t["a"] = [cxTarg(tn, 0, sc)]
+        return t
+    }
+    if w == "function" {
+        let t = mkT("Func", "")
+        let ta = cxLast(tn["targs"])
+        if len(ta) > 0 and ta[0]["type"] != nil and ta[0]["type"]["isFunction"] {
+            if ta[0]["type"]["ret"] != nil {
+                t["a"].push(cxResolveType(ta[0]["type"]["ret"], sc))
+            } else {
+                t["a"].push(tVoid())
+            }
+            for p in ta[0]["type"]["params"] {
+                t["a"].push(cxResolveType(p, sc))
+            }
+        } else {
+            t["a"].push(tDyn())
+        }
+        return t
+    }
+    if w == "ostream" or w == "istream" or w == "iostream" or w == "ostringstream" or w == "istringstream" or w == "stringstream" or w == "ifstream" or w == "ofstream" or w == "fstream" {
+        return mkT("Stream", w)
+    }
+    if w in CXL_BUILTIN_EXC {
+        return cxClassT(CXL_BUILTIN_EXC[w])
+    }
+    if w in CX_STD_DYN_TYPES {
+        return mkT("Dyn", w)
+    }
+    res["ok"] = false
+    return nil
+}
+
+let CX_KNOWN_STD = cxSetOf(["regex", "smatch", "cmatch", "thread", "mutex", "lock_guard", "unique_lock",
+                            "condition_variable", "atomic", "future", "promise", "complex", "chrono", "duration",
+                            "time_point", "steady_clock", "system_clock", "high_resolution_clock", "filesystem",
+                            "path", "span", "ranges", "locale", "wostream", "wistream", "basic_string",
+                            "allocator", "ratio", "type_info", "type_index", "jthread", "barrier", "latch",
+                            "semaphore", "counting_semaphore", "binary_semaphore", "default_random_engine",
+                            "minstd_rand", "normal_distribution", "bernoulli_distribution",
+                            "discrete_distribution", "seed_seq", "va_list", "jmp_buf", "fpos_t", "div_t",
+                            "ldiv_t", "tm", "wint_t", "mbstate_t"])
+
+fn cxResolveType(tn, sc) {
+    if tn == nil {
+        return tDyn()
+    }
+    if tn["isFunction"] {
+        let f = mkT("Func", "")
+        if tn["ret"] != nil {
+            f["a"].push(cxResolveType(tn["ret"], sc))
+        } else {
+            f["a"].push(tVoid())
+        }
+        for p in tn["params"] {
+            f["a"].push(cxResolveType(p, sc))
+        }
+        # function pointers are just functions here
+        let t = f
+        let i = len(tn["arrayDims"]) - 1
+        while i >= 0 {
+            let a = mkT("Array", "carray")
+            a["a"].push(t)
+            if tn["arrayDims"][i] != nil {
+                a["n"] = cxEvalConst(tn["arrayDims"][i], sc)
+            } else {
+                a["n"] = -1
+            }
+            t = a
+            i = i - 1
+        }
+        return t
+    }
+    let base = nil
+    # user types first when unqualified or user-qualified
+    let s = nil
+    if len(tn["name"]) == 1 and tn["name"][0] in CXL_LOCAL_TYPES {
+        base = CXL_LOCAL_TYPES[tn["name"][0]]
+    } elif !(len(tn["name"]) >= 1 and tn["name"][0] == "std") {
+        s = cxLookup(tn["name"], sc, true)
+    }
+    if base != nil {
+        let keep = true
+    } elif s != nil and s["kind"] == "Type" and s["type"] != nil {
+        base = s["type"]
+        if base["k"] == "Class" and base["cls"] != nil and base["cls"]["isTemplate"] and len(tn["targs"]) > 0 and len(cxLast(tn["targs"])) > 0 {
+            base = cxInstantiateClass(base["cls"], cxLast(tn["targs"]), sc)
+        }
+    } else {
+        let res = {"ok": false}
+        base = cxBuiltinType(tn, sc, res)
+        if !res["ok"] {
+            if s != nil and s["kind"] == "Type" and s["type"] == nil {
+                base = tDyn()
+            } elif CXL_STRICT and s == nil {
+                # A type C/C++ has never heard of (`let x = 1;`) is a compile
+                # error; a real library type outside the subset is reported as
+                # such rather than run with guessed semantics.
+                let last = ""
+                if len(tn["name"]) > 0 {
+                    last = cxLast(tn["name"])
+                }
+                let full = tn["name"].join("::")
+                if last in CX_KNOWN_STD {
+                    cxFailU("unsupported: '" + full + "' is not supported by Quantum's C/C++ front-end", CXL_LINE)
+                }
+                if len(tn["name"]) >= 2 and tn["name"][0] == "std" {
+                    cxFailU("unknown std member '" + last + "'", CXL_LINE)
+                }
+                cxFailU("unknown type '" + full + "'", CXL_LINE)
+            } else {
+                base = tDyn()
+            }
+        }
+    }
+    let t = base
+    # a decayed array parameter's rows: T (*x)[M]
+    let i = len(tn["pointeeDims"]) - 1
+    while i >= 0 {
+        let n = -1
+        if tn["pointeeDims"][i] != nil {
+            n = cxEvalConst(tn["pointeeDims"][i], sc)
+        }
+        if t["k"] == "Char" and i + 1 == len(tn["pointeeDims"]) {
+            t = tBuf(n)
+        } else {
+            let a = mkT("Array", "carray")
+            a["a"].push(t)
+            a["n"] = n
+            t = a
+        }
+        i = i - 1
+    }
+    let k = 0
+    while k < tn["pointers"] {
+        if t["k"] == "Char" and k == 0 {
+            t = tCStr()
+        } else {
+            let p = mkT("Ptr", "")
+            p["a"].push(t)
+            t = p
+        }
+        k = k + 1
+    }
+    # arrays: T x[N][M] -> array<array<T,M>,N>; char x[N][M]: N char buffers
+    let j = len(tn["arrayDims"]) - 1
+    while j >= 0 {
+        let n = -1
+        if tn["arrayDims"][j] != nil {
+            n = cxEvalConst(tn["arrayDims"][j], sc)
+        }
+        if t["k"] == "Char" and j + 1 == len(tn["arrayDims"]) {
+            t = tBuf(n)
+        } else {
+            let a = mkT("Array", "carray")
+            a["a"].push(t)
+            a["n"] = n
+            t = a
+        }
+        j = j - 1
+    }
+    return t
+}
+
+fn cxEvalConst(e, sc) {
+    if e == nil {
+        return 0
+    }
+    let k = e["k"]
+    if k == "Int" or k == "Char" or k == "Float" or k == "Bool" {
+        return cxTrunc(e["num"])
+    }
+    if k == "Name" {
+        let s = cxLookup(e["name"], sc, false)
+        if s != nil and s["kind"] == "Enumerator" {
+            return s["value"]
+        }
+        if s != nil and s["kind"] == "Var" {
+            # constexpr / const integral globals
+            for g in CXL_GLOBALS_IN_ORDER {
+                if cxMangle(g[1], g[0]["var"]["name"]) == s["global"] and len(g[0]["var"]["args"]) > 0 {
+                    return cxEvalConst(g[0]["var"]["args"][0], g[1])
+                }
+            }
+        }
+        if len(e["name"]) == 2 and e["name"][0] == "std" and e["name"][1] == "npos" {
+            return -1
+        }
+        return 0
+    }
+    if k == "Unary" {
+        let v = cxEvalConst(e["kids"][0], sc)
+        if e["op"] == "-" {
+            return -v
+        }
+        if e["op"] == "~" {
+            return ~v
+        }
+        if e["op"] == "!" {
+            return cxBool01(v == 0)
+        }
+        return v
+    }
+    if k == "Binary" {
+        let a = cxEvalConst(e["kids"][0], sc)
+        let b = cxEvalConst(e["kids"][1], sc)
+        let op = e["op"]
+        if op == "+" {
+            return a + b
+        }
+        if op == "-" {
+            return a - b
+        }
+        if op == "*" {
+            return a * b
+        }
+        if op == "/" {
+            if b != 0 {
+                return cxTrunc(a / b)
+            }
+            return 0
+        }
+        if op == "%" {
+            if b != 0 {
+                return cxIMod(a, b)
+            }
+            return 0
+        }
+        if op == "<<" {
+            return a << b
+        }
+        if op == ">>" {
+            return a >> b
+        }
+        if op == "&" {
+            return a & b
+        }
+        if op == "|" {
+            return a | b
+        }
+        if op == "^" {
+            return a ^ b
+        }
+        if op == "<" {
+            return cxBool01(a < b)
+        }
+        if op == ">" {
+            return cxBool01(a > b)
+        }
+        if op == "<=" {
+            return cxBool01(a <= b)
+        }
+        if op == ">=" {
+            return cxBool01(a >= b)
+        }
+        if op == "==" {
+            return cxBool01(a == b)
+        }
+        if op == "!=" {
+            return cxBool01(a != b)
+        }
+        if op == "&&" {
+            return cxBool01(a != 0 and b != 0)
+        }
+        if op == "||" {
+            return cxBool01(a != 0 or b != 0)
+        }
+        return 0
+    }
+    if k == "Cond" {
+        if cxEvalConst(e["kids"][0], sc) != 0 {
+            return cxEvalConst(e["kids"][1], sc)
+        }
+        return cxEvalConst(e["kids"][2], sc)
+    }
+    if k == "Cast" or k == "Construct" {
+        if len(e["kids"]) == 0 {
+            return 0
+        }
+        return cxEvalConst(e["kids"][0], sc)
+    }
+    if k == "SizeofT" {
+        let t = cxResolveType(e["type"], sc)
+        if t["k"] == "Char" or t["k"] == "Bool" {
+            return 1
+        }
+        if t["k"] == "Int" {
+            if sFind(t["name"], "long long", 0) >= 0 {
+                return 8
+            }
+            if sFind(t["name"], "short", 0) >= 0 {
+                return 2
+            }
+            return 4
+        }
+        if t["k"] == "Float" {
+            if t["name"] == "float" {
+                return 4
+            }
+            return 8
+        }
+        return 8
+    }
+    return 0
+}
+
+# ── classes and functions: resolution ───────────────────────────────────────
+
+fn cxResolveClass(c) {
+    if c["resolved"] or c["resolving"] or c["decl"] == nil {
+        return nil
+    }
+    c["resolving"] = true
+    let d = c["decl"]
+    CXL_LINE = d["line"]
+    for bt in d["bases"] {
+        let b = cxResolveType(bt, c["outer"])
+        if b["k"] == "Class" and b["cls"] != nil {
+            cxResolveClass(b["cls"])
+            c["bases"].push(b["cls"])
+        }
+    }
+    let slot = 1
+    c["isUnion"] = d["isUnion"]
+    for fr in d["friendNames"] {
+        c["friends"][fr] = true
+    }
+    let unionSlot = -1
+    if len(c["bases"]) > 0 {
+        slot = c["bases"][0]["nslots"]
+        c["polymorphic"] = c["bases"][0]["polymorphic"]
+        c["aggregate"] = false
+        let i = 1
+        while i < len(c["bases"]) {
+            slot = slot + c["bases"][i]["nslots"] - 1
+            i = i + 1
+        }
+    }
+    for m in d["members"] {
+        CXL_LINE = m["line"]
+        if m["k"] == "Var" {
+            let f = cxNewField()
+            f["name"] = m["var"]["name"]
+            f["type"] = cxResolveType(m["var"]["type"], c["scope"])
+            f["init"] = m["var"]
+            f["hasInit"] = m["var"]["init"] != "None"
+            f["decl"] = m
+            f["access"] = m["access"]
+            let vt = m["var"]["type"]
+            f["isConst"] = vt != nil and vt["isConst"] and vt["pointers"] == 0 and !vt["ref"]
+            if m["isStatic"] {
+                f["isStatic"] = true
+                f["global"] = c["qname"] + "::" + f["name"]
+                let s = cxSym("Var")
+                s["type"] = f["type"]
+                s["global"] = f["global"]
+                c["scope"]["syms"][f["name"]] = s
+            } elif c["isUnion"] {
+                # a union's members are one value, read as any of them
+                if unionSlot < 0 {
+                    unionSlot = slot
+                    slot = slot + 1
+                }
+                f["slot"] = unionSlot
+            } else {
+                f["slot"] = slot
+                slot = slot + 1
+            }
+            c["fields"].push(f)
+        } elif m["k"] == "Func" {
+            if m["isFriend"] {
+                continue
+            }
+            let f = cxNewFunc()
+            f["name"] = cxLast(m["name"])
+            f["decl"] = m
+            f["cls"] = c
+            f["isStatic"] = m["isStatic"]
+            f["isVirtual"] = m["isVirtual"]
+            f["isConst"] = m["isConst"]
+            f["isCtor"] = m["isCtor"]
+            f["isDtor"] = m["isDtor"]
+            if f["isDtor"] {
+                c["dtor"] = f
+            }
+            f["isPure"] = m["isPure"]
+            f["access"] = m["access"]
+            f["isTemplate"] = m["isTemplate"]
+            f["scope"] = c["scope"]
+            f["tu"] = m["tu"]
+            if m["body"] != nil {
+                f["def"] = m
+            }
+            if f["isVirtual"] {
+                c["polymorphic"] = true
+            }
+            if f["isCtor"] {
+                if !m["isDeleted"] {
+                    c["ctors"].push(f)
+                    c["hasUserCtor"] = true
+                    c["aggregate"] = false
+                }
+            } elif f["name"].startsWith("operator ") {
+                c["convOps"].push(f)
+            }
+            if !f["isCtor"] and !f["isDtor"] {
+                c["methods"].push(f)
+            }
+            CXL_ALL_FUNCS.push(f)
+        } elif m["k"] == "UsingDecl" and m["inheritingCtor"] {
+            for b in c["bases"] {
+                if b["name"] == cxLast(m["name"]) {
+                    c["inheritCtorsFrom"].push(b)
+                }
+            }
+            c["aggregate"] = false
+            c["hasUserCtor"] = true
+        }
+    }
+    if c["polymorphic"] {
+        c["aggregate"] = false
+    }
+    c["nslots"] = slot
+    c["resolved"] = true
+    c["resolving"] = false
+}
+
+fn cxResolveFunc(f) {
+    let d = f["decl"]
+    let sc = f["scope"]
+    if f["isTemplate"] and d != nil {
+        for tp in d["templateParams"] {
+            # template parameters live in a scope of their own
+            if !(tp in sc["syms"]) {
+                let s = cxSym("Type")
+                s["type"] = tDyn()
+                sc["syms"][tp] = s
+            }
+        }
+    }
+    CXL_LINE = d["line"]
+    if d["ret"] != nil {
+        f["ret"] = cxResolveType(d["ret"], sc)
+    } else {
+        f["ret"] = tVoid()
+    }
+    f["retRef"] = d["ret"] != nil and d["ret"]["ref"] and !d["ret"]["isConst"] and !isObjectRep(f["ret"])
+    f["variadic"] = d["variadic"]
+    f["params"] = []
+    f["paramRef"] = []
+    f["paramConstRef"] = []
+    f["defaults"] = []
+    for p in d["params"] {
+        let pt = cxResolveType(p["type"], sc)
+        f["params"].push(pt)
+        f["paramRef"].push((p["type"]["ref"] or p["type"]["rref"]) and !p["type"]["isConst"])
+        f["paramConstRef"].push(p["type"]["ref"] and p["type"]["isConst"])
+        f["defaults"].push(p["def"])
+    }
+}
+
+# ── run ─────────────────────────────────────────────────────────────────────
+
+fn cxSigKey(f) {
+    let k = f["name"] + "("
+    let i = 0
+    while i < len(f["params"]) {
+        if i > 0 {
+            k = k + ","
+        }
+        k = k + cxTypeStr(f["params"][i])
+        if f["paramRef"][i] {
+            k = k + "&"
+        }
+        i = i + 1
+    }
+    if f["isConst"] {
+        return k + ")c"
+    }
+    return k + ")"
+}
+
+# A class template used with its arguments (Matrix<int>): a class of its own,
+# collected again from the template's declaration with the parameters bound
+# (and `Matrix` inside it naming this instance). Each phase cxRun() has
+# already passed is applied to it here; the later ones reach it in its loops.
+fn cxInstantiateClass(tc, targs, sc) {
+    let d = tc["decl"]
+    if d == nil or len(d["templateParams"]) != len(targs) {
+        return cxClassT(tc)
+    }
+    let binds = []
+    let key = tc["qname"] + "<"
+    let i = 0
+    while i < len(targs) {
+        let s = cxSym("None")
+        if targs[i]["type"] != nil {
+            let t = cxResolveType(targs[i]["type"], sc)
+            if t == nil or t["k"] == "Dyn" or (t["k"] == "Class" and t["cls"] != nil and t["cls"]["isTemplate"]) {
+                return cxClassT(tc)
+            }
+            s["kind"] = "Type"
+            s["type"] = t
+            if i > 0 {
+                key = key + ","
+            }
+            key = key + cxTypeStr(t)
+        } elif targs[i]["expr"] != nil {
+            s["kind"] = "Enumerator"
+            s["type"] = tInt()
+            s["value"] = cxEvalConst(targs[i]["expr"], sc)
+            if i > 0 {
+                key = key + ","
+            }
+            key = key + cxI64Str(s["value"])
+        } else {
+            return cxClassT(tc)
+        }
+        binds.push(s)
+        i = i + 1
+    }
+    key = key + ">"
+    if key in CXL_CLASS_INSTANCES {
+        return cxClassT(CXL_CLASS_INSTANCES[key])
+    }
+    let uniq = tc["name"] + key.slice(len(tc["qname"]))
+    let outer = tc["outer"]
+    if outer == nil {
+        outer = CXL_GLOBAL
+    }
+    let friendsBefore = len(CXL_FUNC_DECLS)
+    cxCollectClass(d, outer, uniq)
+    # its friends are made below, for this instance
+    CXL_FUNC_DECLS = CXL_FUNC_DECLS.slice(0, friendsBefore)
+    let sym = cxLookupIn(outer, uniq, true)
+    if sym == nil or sym["type"] == nil or sym["type"]["cls"] == nil {
+        return cxClassT(tc)
+    }
+    let c = sym["type"]["cls"]
+    CXL_CLASS_INSTANCES[key] = c
+    CXL_INSTANCE_OF[str(c["id"])] = tc
+    c["name"] = tc["name"]
+    c["isTemplate"] = false
+    i = 0
+    while i < len(binds) {
+        c["scope"]["syms"][d["templateParams"][i]] = binds[i]
+        i = i + 1
+    }
+    let self = cxSym("Type")
+    self["type"] = cxClassT(c)
+    c["scope"]["syms"][tc["name"]] = self
+    let savedLine = CXL_LINE
+    if CXL_PHASE >= 1 {
+        cxResolveClass(c)
+    }
+    # friend functions defined in the class: free functions of this instance
+    for m in d["members"] {
+        if m["k"] == "Func" and m["isFriend"] and m["body"] != nil and len(m["name"]) > 0 {
+            let f = cxNewFunc()
+            f["name"] = cxLast(m["name"])
+            f["decl"] = m
+            f["def"] = m
+            f["scope"] = c["scope"]
+            f["tu"] = m["tu"]
+            cxResolveFunc(f)
+            let fs = cxSymRef(outer, f["name"])
+            if fs["kind"] != "None" and fs["kind"] != "Funcs" {
+                continue
+            }
+            fs["kind"] = "Funcs"
+            f["mangled"] = cxMangle(outer, f["name"]) + "@" + uniq
+            fs["funcs"].push(f)
+            CXL_ALL_FUNCS.push(f)
+        }
+    }
+    if CXL_PHASE >= 2 {
+        for f in c["methods"] {
+            cxResolveFunc(f)
+        }
+        for f in c["ctors"] {
+            cxResolveFunc(f)
+        }
+        if c["dtor"] != nil {
+            cxResolveFunc(c["dtor"])
+        }
+    }
+    if CXL_PHASE >= 3 {
+        cxCopyTemplateDefs(c)
+    }
+    if CXL_PHASE >= 4 {
+        cxMangleMethods(c)
+    }
+    if CXL_PHASE >= 5 {
+        let savedFn = CXL_FN
+        let savedPre = CXL_PRE
+        let savedHoist = CXL_CAN_HOIST
+        cxLowerClass(c)
+        CXL_FN = savedFn
+        CXL_PRE = savedPre
+        CXL_CAN_HOIST = savedHoist
+    }
+    CXL_LINE = savedLine
+    return cxClassT(c)
+}
+
+# members the template defines outside its class (template<class T> void S<T>::f() {...})
+fn cxCopyTemplateDefs(c) {
+    let key = str(c["id"])
+    if !(key in CXL_INSTANCE_OF) {
+        return nil
+    }
+    let tc = CXL_INSTANCE_OF[key]
+    for f in c["methods"] {
+        if f["def"] == nil {
+            for g in tc["methods"] {
+                if cxSameEntity(g["decl"], f["decl"]) and g["def"] != nil {
+                    f["def"] = g["def"]
+                }
+            }
+        }
+    }
+    for f in c["ctors"] {
+        if f["def"] == nil {
+            for g in tc["ctors"] {
+                if cxSameEntity(g["decl"], f["decl"]) and g["def"] != nil {
+                    f["def"] = g["def"]
+                }
+            }
+        }
+    }
+    if c["dtor"] != nil and c["dtor"]["def"] == nil and tc["dtor"] != nil {
+        c["dtor"]["def"] = tc["dtor"]["def"]
+    }
+}
+
+fn cxMangleMethods(c) {
+    let count = {}
+    for f in c["methods"] {
+        let n = 1
+        if f["name"] in count {
+            n = count[f["name"]] + 1
+        }
+        count[f["name"]] = n
+        f["mangled"] = c["qname"] + "::" + f["name"]
+        if n > 1 {
+            f["mangled"] = f["mangled"] + "#" + cxI64Str(n)
+        }
+        f["vkey"] = f["name"] + "/" + cxI64Str(len(f["params"]))
+        # methods overriding a base virtual are virtual too
+        let b = nil
+        if len(c["bases"]) > 0 {
+            b = c["bases"][0]
+        }
+        while b != nil and !f["isVirtual"] {
+            for bm in b["methods"] {
+                if bm["isVirtual"] and bm["vkey"] == f["vkey"] {
+                    f["isVirtual"] = true
+                }
+            }
+            if len(b["bases"]) > 0 {
+                b = b["bases"][0]
+            } else {
+                b = nil
+            }
+        }
+        if f["isVirtual"] {
+            c["polymorphic"] = true
+        }
+        let s = cxSymRef(c["scope"], f["name"])
+        s["kind"] = "Funcs"
+        s["funcs"].push(f)
+    }
+    let n = 0
+    for f in c["ctors"] {
+        n = n + 1
+        f["mangled"] = c["qname"] + "::" + c["name"]
+        if n > 1 {
+            f["mangled"] = f["mangled"] + "#" + cxI64Str(n)
+        }
+    }
+}
+
+fn cxFindDefault(f) {
+    let i = 0
+    while i < len(f["defaults"]) {
+        i = i + 1
+    }
+}
+
+fn cxRun() {
+    cxCollect(CXL_PROG["decls"], CXL_GLOBAL)
+    CXL_PHASE = 1
+    let i = 0
+    while i < len(CXL_CLASS_ORDER) {
+        cxResolveClass(CXL_CLASS_ORDER[i])
+        i = i + 1
+    }
+    i = 0
+    while i < len(CXL_CLASS_ORDER) {
+        for f in CXL_CLASS_ORDER[i]["methods"].slice(0) {
+            cxResolveFunc(f)
+        }
+        i = i + 1
+    }
+    i = 0
+    while i < len(CXL_CLASS_ORDER) {
+        for f in CXL_CLASS_ORDER[i]["ctors"].slice(0) {
+            cxResolveFunc(f)
+        }
+        if CXL_CLASS_ORDER[i]["dtor"] != nil {
+            cxResolveFunc(CXL_CLASS_ORDER[i]["dtor"])
+        }
+        i = i + 1
+    }
+    CXL_PHASE = 2
+
+    # free functions and out-of-class member definitions
+    i = 0
+    while i < len(CXL_FUNC_DECLS) {
+        let fd = CXL_FUNC_DECLS[i]
+        i = i + 1
+        let d = fd[0]
+        let sc = fd[1]
+        CXL_LINE = d["line"]
+        let skipRest = false
+        if len(d["name"]) > 1 {
+            # Cls::f / ns::f / Outer::Inner::f
+            let owner = d["name"].slice(0, len(d["name"]) - 1)
+            let os = cxLookup(owner, sc, false)
+            if os != nil and os["kind"] == "Type" and os["type"] != nil and os["type"]["k"] == "Class" {
+                let c = os["type"]["cls"]
+                let probe = cxNewFunc()
+                probe["name"] = cxLast(d["name"])
+                probe["decl"] = d
+                probe["scope"] = c["scope"]
+                probe["cls"] = c
+                probe["isConst"] = d["isConst"]
+                probe["isTemplate"] = d["isTemplate"]
+                cxResolveFunc(probe)
+                let key = cxSigKey(probe)
+                let match = nil
+                let list = c["methods"]
+                if d["isCtor"] {
+                    list = c["ctors"]
+                }
+                for m in list {
+                    if m["name"] == probe["name"] and cxSigKey(m) == key {
+                        match = m
+                    }
+                }
+                if match == nil {
+                    for m in list {
+                        if m["name"] == probe["name"] and len(m["params"]) == len(probe["params"]) and m["def"] == nil {
+                            match = m
+                        }
+                    }
+                }
+                if match == nil and d["isDtor"] {
+                    # Cls::~Cls() { ... } defined outside the class
+                    if c["dtor"] != nil {
+                        c["dtor"]["def"] = d
+                        c["dtor"]["tu"] = d["tu"]
+                    }
+                    continue
+                }
+                if match == nil {
+                    cxFailU("definition of " + c["qname"] + "::" + probe["name"] + " matches no declaration", d["line"])
+                }
+                match["def"] = d
+                match["tu"] = d["tu"]
+                continue
+            }
+            if os != nil and os["kind"] == "Namespace" {
+                sc = os["ns"]
+            } else {
+                cxFailU("unknown scope for " + cxLast(d["name"]), d["line"])
+            }
+        }
+        let f = cxNewFunc()
+        f["name"] = cxLast(d["name"])
+        f["decl"] = d
+        f["scope"] = sc
+        f["isTemplate"] = d["isTemplate"]
+        f["tu"] = d["tu"]
+        cxResolveFunc(f)
+        let key = cxSigKey(f)
+        let sym = cxSymRef(sc, f["name"])
+        if sym["kind"] != "Funcs" and sym["kind"] != "None" {
+            if sym["kind"] == "Type" {
+                continue
+            }
+        }
+        sym["kind"] = "Funcs"
+        let existing = nil
+        for g in sym["funcs"] {
+            if cxSigKey(g) == key {
+                existing = g
+            }
+        }
+        if existing == nil and CXL_PROG["cMode"] and len(sym["funcs"]) > 0 {
+            cxFailU("conflicting types for '" + f["name"] + "'", d["line"])
+        }
+        if existing != nil {
+            if d["body"] != nil {
+                existing["def"] = d
+                existing["tu"] = d["tu"]
+            }
+            # later declarations may add default arguments
+            let k = 0
+            while k < len(existing["defaults"]) and k < len(f["defaults"]) {
+                if existing["defaults"][k] == nil and f["defaults"][k] != nil {
+                    existing["defaults"][k] = f["defaults"][k]
+                }
+                k = k + 1
+            }
+            continue
+        }
+        if d["body"] != nil {
+            f["def"] = d
+        }
+        f["mangled"] = cxMangle(sc, f["name"])
+        if len(sym["funcs"]) > 0 {
+            f["mangled"] = f["mangled"] + "#" + cxI64Str(len(sym["funcs"]) + 1)
+        }
+        sym["funcs"].push(f)
+        CXL_ALL_FUNCS.push(f)
+    }
+
+    # class template instances made so far get the template's out-of-class members
+    CXL_PHASE = 3
+    let instKeys = Object.keys(CXL_CLASS_INSTANCES)
+    instKeys.sort()
+    for ik in instKeys {
+        cxCopyTemplateDefs(CXL_CLASS_INSTANCES[ik])
+    }
+
+    # method names: Cls::m, overloads numbered
+    i = 0
+    while i < len(CXL_CLASS_ORDER) {
+        cxMangleMethods(CXL_CLASS_ORDER[i])
+        i = i + 1
+    }
+    CXL_PHASE = 4
+
+    # global variables' types, before any function body refers to them
+    for g in CXL_GLOBALS_IN_ORDER {
+        let d = g[0]
+        let sc = g[1]
+        if len(d["name"]) > 1 {
+            continue
+        }
+        CXL_LINE = d["line"]
+        let s = cxSymRef(sc, d["var"]["name"])
+        let t = cxResolveType(d["var"]["type"], sc)
+        if isCBuf(t) and t["n"] < 0 {
+            t["n"] = cxBufInitSize(d["var"]["args"], d["var"]["init"] == "Brace")
+        }
+        if t["k"] == "Array" and t["n"] < 0 and len(d["var"]["args"]) > 0 {
+            t["n"] = cxArrayInitSize(t, d["var"]["args"], d["var"]["init"] == "Brace")
+        }
+        if t["k"] == "Dyn" and cxIsAutoType(d["var"]["type"]) and len(d["var"]["args"]) > 0 {
+            let ctx = cxNewFnCtx()
+            ctx["scope"] = sc
+            CXL_FN = ctx
+            cxPushScope()
+            try {
+                t = cxProbeType(d["var"]["args"][0])
+            } catch (e) {
+                if !cxIsUnsupported(e) {
+                    raise e
+                }
+            }
+            cxPopScope()
+            CXL_FN = nil
+        }
+        s["type"] = t
+    }
+
+    # Lower: classes (ctors, methods), free functions. Lowering can add entries
+    # (classes declared inside function bodies): index loops.
+    CXL_PHASE = 5
+    i = 0
+    while i < len(CXL_CLASS_ORDER) {
+        let c = CXL_CLASS_ORDER[i]
+        i = i + 1
+        if !c["isTemplate"] {
+            cxLowerClass(c)
+            continue
+        }
+        # a class template once, with dynamic parameters (for uses that can't
+        # be instantiated): what can't be lowered without its types is left out
+        let savedFn = CXL_FN
+        let savedPre = CXL_PRE
+        let savedHoist = CXL_CAN_HOIST
+        try {
+            cxLowerClass(c)
+        } catch (e) {
+            if !cxIsUnsupported(e) {
+                raise e
+            }
+            CXL_FN = savedFn
+            CXL_PRE = savedPre
+            CXL_CAN_HOIST = savedHoist
+        }
+    }
+    i = 0
+    while i < len(CXL_ALL_FUNCS) {
+        let f = CXL_ALL_FUNCS[i]
+        i = i + 1
+        if f["cls"] == nil and f["def"] != nil and !f["lowered"] {
+            if !f["isTemplate"] {
+                cxLowerFunction(f)
+                continue
+            }
+            # a function template's dynamic version (for calls that can't be
+            # instantiated): if it can't be lowered without its types, a stub
+            let savedPre = CXL_PRE
+            let savedHoist = CXL_CAN_HOIST
+            let savedFn = CXL_FN
+            try {
+                cxLowerFunction(f)
+            } catch (e) {
+                if !cxIsUnsupported(e) {
+                    raise e
+                }
+                CXL_PRE = savedPre
+                CXL_CAN_HOIST = savedHoist
+                CXL_FN = savedFn
+                let ps = []
+                let k = 0
+                while k < len(f["def"]["params"]) {
+                    ps.push("__arg" + cxI64Str(k))
+                    k = k + 1
+                }
+                let dl = f["def"]["line"]
+                let body = [qRaise(qStr("template " + f["name"] + " needs its template arguments: " + e["msg"], dl), dl)]
+                CXL_TOP_FNS.push(qFunc(f["mangled"], ps, qBlock(body, dl), dl))
+            }
+        }
+    }
+
+    cxEmitDescriptors()
+    cxEmitGlobals()
+
+    let undefIds = Object.keys(CXL_CALLED_UNDEFINED)
+    if len(undefIds) > 0 {
+        # C++ would stop at link time: say which definitions are missing
+        let fs = []
+        for k in undefIds {
+            fs.push(CXL_CALLED_UNDEFINED[k])
+        }
+        fs = cxSortById(fs)
+        let msg = ""
+        let n = 0
+        for f in fs {
+            if n == 3 {
+                msg = msg + ", ..."
+                break
+            }
+            n = n + 1
+            let name = ""
+            if f["cls"] != nil {
+                name = f["cls"]["qname"] + "::" + f["name"]
+            } else {
+                name = cxMangle(f["scope"], f["name"])
+            }
+            if msg != "" {
+                msg = msg + ", "
+            }
+            msg = msg + "'" + name + "'"
+        }
+        let le = cxUnsupported("undefined reference to " + msg + ". The definition was not found: for a header x.h, quantum compiles the x.cpp next to it, or src/x.cpp under the project folder (the one holding CMakeLists.txt, Makefile, package.json or .git).", "", 0)
+        le["link"] = true
+        raise le
+    }
+
+    # main
+    let prog = []
+    for f in CXL_TOP_FNS {
+        prog.push(f)
+    }
+    prog.push(qExprStmt(qCallN("__cpp_runtime__", [], 0), 0))
+    for p in CXL_PLAN_INITS {
+        prog.push(p)
+    }
+    for s in CXL_TOP_INIT {
+        prog.push(s)
+    }
+    let mainSym = cxLookupIn(CXL_GLOBAL, "main", false)
+    if mainSym != nil and mainSym["kind"] == "Funcs" and len(mainSym["funcs"]) > 0 {
+        let m = mainSym["funcs"][0]
+        let args = []
+        if len(m["params"]) >= 2 {
+            args.push(qCallN("__cpp_argc__", [], 0))
+            # char** argv: a pointer to the first of the argument strings
+            if m["params"][1]["k"] == "Ptr" {
+                args.push(qArr([qCallN("__cpp_argv__", [], 0), qNum(0, 0)], 0))
+            } else {
+                args.push(qCallN("__cpp_argv__", [], 0))
+            }
+        }
+        # try { __rc = main(...) } catch (e) { __cpp_terminate__(e) }  __cpp_exit__(__rc)
+        prog.push(qVar("__cpp_rc", qNum(0, 0), 0))
+        let tryBody = [qExprStmt(qAssign(qId("__cpp_rc", 0), qCallN(m["mangled"], args, 0), 0), 0)]
+        let hb = [qExprStmt(qCallN("__cpp_terminate__", [qId("__cpp_uncaught", 0)], 0), 0)]
+        prog.push(qTry(qBlock(tryBody, 0), "__cpp_uncaught", qBlock(hb, 0), 0))
+        prog.push(qExprStmt(qCallN("__cpp_exit__", [qId("__cpp_rc", 0)], 0), 0))
+    }
+    return qBlock(prog, 0)
+}
+
+# entities in creation order
+fn cxSortById(xs) {
+    let byId = {}
+    let ids = []
+    for x in xs {
+        byId[str(x["id"])] = x
+        ids.push(x["id"])
+    }
+    ids.sort()
+    let out = []
+    for id in ids {
+        out.push(byId[str(id)])
+    }
+    return out
+}
+
+# ── plans (copy recipes) and default values ─────────────────────────────────
+
+fn cxSubPlan(x) {
+    if needsCopy(x) {
+        return cxPlanFor(x)
+    }
+    return qNum(0, 0)
+}
+
+fn cxPlanFill(k, slots) {
+    for b in k["bases"] {
+        cxPlanFill(b, slots)
+    }
+    let first = true
+    for f in k["fields"] {
+        if !f["isStatic"] and f["slot"] < len(slots) and (first or !k["isUnion"]) {
+            slots[f["slot"]] = cxSubPlan(f["type"])
+            first = false
+        }
+    }
+}
+
+fn cxPlanFor(t) {
+    if !needsCopy(t) {
+        return qNum(0, CXL_LINE)
+    }
+    let key = cxTypeStr(t)
+    if key in CXL_PLANS {
+        return qId(CXL_PLANS[key], CXL_LINE)
+    }
+    CXL_PLAN_COUNT = CXL_PLAN_COUNT + 1
+    let name = "__cpp_plan" + cxI64Str(CXL_PLAN_COUNT)
+    CXL_PLANS[key] = name
+    let parts = []
+    let k = t["k"]
+    if k == "Vector" or k == "Array" {
+        parts.push(qNum(1, 0))
+        if len(t["a"]) == 0 {
+            parts.push(cxSubPlan(tDyn()))
+        } else {
+            parts.push(cxSubPlan(t["a"][0]))
+        }
+    } elif k == "Map" {
+        parts.push(qNum(2, 0))
+        parts.push(cxSubPlan(t["a"][0]))
+        parts.push(cxSubPlan(t["a"][1]))
+    } elif k == "Set" {
+        parts.push(qNum(7, 0))
+    } elif k == "Optional" {
+        parts.push(qNum(4, 0))
+        parts.push(cxSubPlan(t["a"][0]))
+    } elif k == "Variant" {
+        parts.push(qNum(5, 0))
+        let alts = []
+        for a in t["a"] {
+            alts.push(cxSubPlan(a))
+        }
+        parts.push(qArr(alts, 0))
+    } elif k == "Pair" or k == "Tuple" {
+        parts.push(qNum(6, 0))
+        let el = []
+        for a in t["a"] {
+            el.push(cxSubPlan(a))
+        }
+        parts.push(qArr(el, 0))
+    } elif k == "Class" {
+        # the slots may refer back to this plan (a class holding vector<Self>)
+        CXL_PLAN_INITS.push(qVar(name, qArr([], 0), 0))
+        let c = t["cls"]
+        let slots = []
+        let s = 0
+        while s < c["nslots"] {
+            slots.push(qNum(0, 0))
+            s = s + 1
+        }
+        cxPlanFill(c, slots)
+        let args = [qId(name, 0), qNum(3, 0), qArr(slots, 0)]
+        CXL_PLAN_INITS.push(qExprStmt(qCallN("__cpp_plan_set__", args, 0), 0))
+        return qId(name, CXL_LINE)
+    } else {
+        return qNum(0, CXL_LINE)
+    }
+    CXL_PLAN_INITS.push(qVar(name, qArr(parts, 0), 0))
+    return qId(name, CXL_LINE)
+}
+
+fn cxDefaultValue(t, line) {
+    let k = t["k"]
+    if k == "Int" or k == "Char" or k == "Float" or k == "Enum" {
+        return qNum(0, line)
+    }
+    if k == "Bool" {
+        return qBool(false, line)
+    }
+    if k == "Str" {
+        return qStr("", line)
+    }
+    if k == "Vector" {
+        return qArr([], line)
+    }
+    if k == "Array" {
+        if t["n"] <= 0 {
+            return qArr([], line)
+        }
+        let el = t["a"][0]
+        let args = [qNum(t["n"], line)]
+        args.push(cxDefaultValue(el, line))
+        args.push(cxPlanFor(el))
+        return qCallN("__cpp_fill__", args, line)
+    }
+    if k == "Map" or k == "Set" {
+        return qCallN("__cpp_dict__", [], line)
+    }
+    if k == "Pair" or k == "Tuple" {
+        let el = []
+        for a in t["a"] {
+            el.push(cxDefaultValue(a, line))
+        }
+        return qArr(el, line)
+    }
+    if k == "Variant" {
+        let el = [qNum(0, line)]
+        if len(t["a"]) == 0 or t["a"][0]["k"] == "Monostate" {
+            el.push(qNil(line))
+        } else {
+            el.push(cxDefaultValue(t["a"][0], line))
+        }
+        return qArr(el, line)
+    }
+    if k == "Class" {
+        return cxCtorCall(t["cls"], [], false, line, nil)
+    }
+    if k == "Stream" {
+        return qCallN("__cpp_stream_new__", [qStr(t["name"], line)], line)
+    }
+    return qNil(line)
+}
+
+# ── function lowering ───────────────────────────────────────────────────────
+
+fn cxFindLocal(n) {
+    let f = CXL_FN
+    while f != nil {
+        let i = len(f["scopes"]) - 1
+        while i >= 0 {
+            let sc = f["scopes"][i]
+            if n in sc {
+                return sc[n]
+            }
+            i = i - 1
+        }
+        f = f["parent"]
+    }
+    return nil
+}
+
+# unique Quantum names per function (closures see their parents' locals)
+fn cxDeclareLocal(n, t) {
+    let root = CXL_FN
+    while root["parent"] != nil {
+        root = root["parent"]
+    }
+    let c = 1
+    if n in root["nameCount"] {
+        c = root["nameCount"][n] + 1
+    }
+    root["nameCount"][n] = c
+    let qn = n
+    if c != 1 {
+        qn = n + "#" + cxI64Str(c)
+    }
+    let l = cxNewLocal()
+    l["q"] = qn
+    l["t"] = t
+    l["name"] = n
+    # char buffers: in a cell a char* can point into
+    l["boxed"] = (qn in root["boxed"]) or isCBuf(t)
+    cxLast(CXL_FN["scopes"])[n] = l
+    return l
+}
+
+fn cxPushScope() {
+    CXL_FN["scopes"].push({})
+    CXL_FN["owned"].push([])
+}
+
+fn cxPopScope() {
+    CXL_FN["scopes"].pop()
+    if len(CXL_FN["owned"]) > 0 {
+        CXL_FN["owned"].pop()
+    }
+}
+
+# ── object lifetimes ────────────────────────────────────────────────────────
+# A class needs destruction when it (or a base / member) has a destructor
+# with a body, or owns smart pointers / containers of such objects. Locals
+# that own something are destroyed when their scope ends (also on return /
+# break / continue), in reverse order of declaration; `delete` dispatches on
+# the object's dynamic class (its descriptor's "#dtor").
+
+fn cxNeedsDtor(c) {
+    if c == nil or c["builtin"] {
+        return false
+    }
+    let key = str(c["id"])
+    if key in CXL_DTOR_MEMO {
+        return CXL_DTOR_MEMO[key] > 0
+    }
+    # a class holding vector<Self> is settled by its other members
+    CXL_DTOR_MEMO[key] = 0
+    let need = c["dtor"] != nil and c["dtor"]["def"] != nil and c["dtor"]["def"]["body"] != nil and len(c["dtor"]["def"]["body"]["body"]) > 0
+    for b in c["bases"] {
+        need = need or cxNeedsDtor(b)
+    }
+    for f in c["fields"] {
+        if !f["isStatic"] and f["type"] != nil {
+            need = need or cxOwnsResource(f["type"])
+        }
+    }
+    if need {
+        CXL_DTOR_MEMO[key] = 1
+    } else {
+        CXL_DTOR_MEMO[key] = 0
+    }
+    return need
+}
+
+fn cxOwnsResource(t) {
+    if t == nil {
+        return false
+    }
+    let k = t["k"]
+    if k == "Class" {
+        return t["cls"] != nil and cxNeedsDtor(t["cls"])
+    }
+    if k == "UPtr" {
+        if t["name"] == "shared_ptr" {
+            return true
+        }
+        return t["name"] == "unique_ptr" and len(t["a"]) > 0 and t["a"][0] != nil and (t["a"][0]["k"] != "Class" or cxNeedsDtor(t["a"][0]["cls"]))
+    }
+    if k == "Vector" or k == "Array" {
+        return len(t["a"]) > 0 and cxOwnsResource(t["a"][0])
+    }
+    return false
+}
+
+fn cxDestroyValue(t, v, line) {
+    if t["k"] == "UPtr" and t["name"] == "shared_ptr" {
+        return qCallN("__cpp_sp_release__", [v], line)
+    }
+    if t["k"] == "Vector" or t["k"] == "Array" {
+        # elements: a vector's in order, an array's last first
+        return qCallN("__cpp_destroy_each__", [v, qBool(t["k"] == "Array", line)], line)
+    }
+    return qCallN("__cpp_delete__", [v], line)
+}
+
+fn cxAnyOwned(fromDepth) {
+    let i = fromDepth
+    while i < len(CXL_FN["owned"]) {
+        if len(CXL_FN["owned"][i]) > 0 {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn cxEmitDestroy(fromDepth, out, except) {
+    let i = len(CXL_FN["owned"]) - 1
+    while i >= fromDepth {
+        let owned = CXL_FN["owned"][i]
+        let j = len(owned) - 1
+        while j >= 0 {
+            let l = owned[j]
+            j = j - 1
+            if l["q"] == except {
+                continue
+            }
+            let x = cxLocalXV(l)
+            x["constLv"] = false
+            out.push(qExprStmt(cxDestroyValue(l["t"], cxRead(x), CXL_LINE), CXL_LINE))
+        }
+        i = i - 1
+    }
+}
+
+fn cxLoopCtx() {
+    let l = cxNewLoop()
+    l["scopeDepth"] = len(CXL_FN["scopes"])
+    return l
+}
+
+fn cxUserCopyCtor(c) {
+    for f in c["ctors"] {
+        if len(f["params"]) == 1 and f["params"][0]["k"] == "Class" and cxSameEntity(f["params"][0]["cls"], c) and f["def"] != nil and !(len(f["def"]["params"]) == 1 and f["def"]["params"][0]["type"] != nil and f["def"]["params"][0]["type"]["rref"]) {
+            return f
+        }
+    }
+    return nil
+}
+
+fn cxLowerFunction(f) {
+    if f["lowered"] or f["def"] == nil {
+        return nil
+    }
+    f["lowered"] = true
+    let params = []
+    let body = cxLowerFunctionBody(f, params)
+    CXL_TOP_FNS.push(qFunc(f["mangled"], params, body, f["def"]["line"]))
+}
+
+fn cxFindMemInit(d, name) {
+    let found = nil
+    for mi in d["inits"] {
+        if mi["name"] == name {
+            found = mi
+        }
+    }
+    return found
+}
+
+fn cxLowerFunctionBody(f, params) {
+    let savedCur = CXL_CUR_FN
+    CXL_CUR_FN = f
+    try {
+        let r = cxLowerFunctionBodyInner(f, params)
+        CXL_CUR_FN = savedCur
+        return r
+    } catch (e) {
+        CXL_CUR_FN = savedCur
+        raise e
+    }
+}
+
+fn cxLowerFunctionBodyInner(f, params) {
+    let d = f["def"]
+    let boxed = {}
+    let attempt = 0
+    while attempt < 4 {
+        attempt = attempt + 1
+        let ctx = cxNewFnCtx()
+        ctx["ret"] = f["ret"]
+        ctx["retRef"] = f["retRef"]
+        ctx["retIsRef"] = d["ret"] != nil and (d["ret"]["ref"] or d["ret"]["rref"])
+        ctx["cls"] = f["cls"]
+        ctx["hasThis"] = f["cls"] != nil and !f["isStatic"]
+        let bcopy = {}
+        for bk in Object.keys(boxed) {
+            bcopy[bk] = true
+        }
+        ctx["boxed"] = bcopy
+        ctx["scope"] = f["scope"]
+        let saved = CXL_FN
+        CXL_FN = ctx
+        cxPushScope()
+        while len(params) > 0 {
+            params.pop()
+        }
+        let stmts = []
+        if ctx["hasThis"] {
+            params.push("__this")
+        }
+        let i = 0
+        while i < len(d["params"]) {
+            let n = d["params"][i]["name"]
+            if n == "" {
+                n = "__arg" + cxI64Str(i)
+            }
+            let pt = tDyn()
+            if i < len(f["params"]) {
+                pt = f["params"][i]
+            }
+            let l = cxDeclareLocal(n, pt)
+            let ptn = d["params"][i]["type"]
+            if ptn != nil {
+                l["isConst"] = ptn["isConst"] and ptn["pointers"] == 0
+            }
+            let isRef = i < len(f["paramRef"]) and f["paramRef"][i]
+            let isCRef = i < len(f["paramConstRef"]) and f["paramConstRef"][i]
+            if !isRef and !isCRef and !(ptn != nil and (ptn["ref"] or ptn["rref"])) and cxOwnsResource(pt) {
+                cxLast(CXL_FN["owned"]).push(cxLocalCopy(l))
+            }
+            if isRef and !isObjectRep(pt) {
+                l["refSlot"] = true
+                l["boxed"] = false
+            }
+            params.push(l["q"])
+            if l["boxed"] {
+                stmts.push(qExprStmt(qAssign(qId(l["q"], d["line"]), qArr([qId(l["q"], d["line"])], d["line"]), d["line"]), d["line"]))
+            }
+            i = i + 1
+        }
+        if f["variadic"] and !f["isTemplate"] {
+            params.push("*__va")
+        }
+        if f["isCtor"] {
+            # base / member initialization, then the body
+            let c = f["cls"]
+            let delegated = false
+            for mi in d["inits"] {
+                if mi["name"] == c["name"] {
+                    let args = mi["args"].slice(0)
+                    stmts.push(qExprStmt(cxCtorCall(c, args, mi["braced"], d["line"], qId("__this", d["line"])), d["line"]))
+                    delegated = true
+                }
+            }
+            if !delegated {
+                for b in c["bases"] {
+                    let found = cxFindMemInit(d, b["name"])
+                    let args = []
+                    let braced = false
+                    if found != nil {
+                        args = found["args"].slice(0)
+                        braced = found["braced"]
+                    }
+                    stmts.push(qExprStmt(cxCtorCall(b, args, braced, d["line"], qId("__this", d["line"])), d["line"]))
+                }
+                for fld in c["fields"] {
+                    if fld["isStatic"] {
+                        continue
+                    }
+                    let found = cxFindMemInit(d, fld["name"])
+                    let pre = []
+                    let savedPre = CXL_PRE
+                    CXL_PRE = pre
+                    CXL_CAN_HOIST = true
+                    let value = nil
+                    CXL_LINE = d["line"]
+                    if found != nil {
+                        let args = found["args"].slice(0)
+                        value = cxRead(cxMakeObjectFrom(fld["type"], args, found["braced"], d["line"]))
+                    } elif fld["hasInit"] {
+                        let args = fld["init"]["args"].slice(0)
+                        value = cxRead(cxMakeObjectFrom(fld["type"], args, fld["init"]["init"] == "Brace", d["line"]))
+                    } else {
+                        value = cxDefaultValue(fld["type"], d["line"])
+                    }
+                    CXL_PRE = savedPre
+                    for p in pre {
+                        stmts.push(p)
+                    }
+                    stmts.push(qExprStmt(qAssign(qIndex(qId("__this", d["line"]), qNum(fld["slot"], d["line"]), d["line"]), value, d["line"]), d["line"]))
+                }
+            }
+        }
+        if d["body"] != nil {
+            for s in d["body"]["body"] {
+                let ls = cxLowerStmt(s)
+                if ls != nil {
+                    stmts.push(ls)
+                }
+            }
+        }
+        cxEmitDestroy(0, stmts, "")
+        if f["isCtor"] {
+            stmts.push(qRet(qId("__this", d["line"]), d["line"]))
+        }
+        cxPopScope()
+        CXL_FN = saved
+        let more = false
+        let wants = Object.keys(ctx["wantBox"])
+        wants.sort()
+        for w in wants {
+            if !(w in boxed) {
+                boxed[w] = true
+                more = true
+            }
+        }
+        if !more {
+            return qBlock(stmts, d["line"])
+        }
+    }
+    cxFailU("could not settle which variables need storage cells", d["line"])
+}
+
+fn cxLowerClass(c) {
+    if c["lowered"] or c["builtin"] or c["decl"] == nil {
+        return nil
+    }
+    c["lowered"] = true
+    let ln = c["decl"]["line"]
+    # implicit default construction: bases, then fields with their initializers
+    let ctx = cxNewFnCtx()
+    ctx["cls"] = c
+    ctx["hasThis"] = true
+    ctx["scope"] = c["scope"]
+    let saved = CXL_FN
+    CXL_FN = ctx
+    cxPushScope()
+    let stmts = []
+    for b in c["bases"] {
+        stmts.push(qExprStmt(cxCtorCall(b, [], false, ln, qId("__this", ln)), ln))
+    }
+    let unionDone = false
+    for fld in c["fields"] {
+        if fld["isStatic"] or (c["isUnion"] and unionDone) {
+            continue
+        }
+        unionDone = true
+        let pre = []
+        let savedPre = CXL_PRE
+        CXL_PRE = pre
+        CXL_CAN_HOIST = true
+        if fld["init"]["line"] != 0 {
+            CXL_LINE = fld["init"]["line"]
+        } else {
+            CXL_LINE = ln
+        }
+        let value = nil
+        if fld["hasInit"] {
+            let args = fld["init"]["args"].slice(0)
+            let x = cxMakeObjectFrom(fld["type"], args, fld["init"]["init"] == "Brace", CXL_LINE)
+            value = cxRead(x)
+        } else {
+            value = cxDefaultValue(fld["type"], ln)
+        }
+        CXL_PRE = savedPre
+        for p in pre {
+            stmts.push(p)
+        }
+        stmts.push(qExprStmt(qAssign(qIndex(qId("__this", ln), qNum(fld["slot"], ln), ln), value, ln), ln))
+    }
+    stmts.push(qRet(qId("__this", ln), ln))
+    cxPopScope()
+    CXL_FN = saved
+    CXL_TOP_FNS.push(qFunc(cxDefaultCtorFn(c), ["__this"], qBlock(stmts, ln), ln))
+    # aggregate initialization: fields in order (missing ones get their
+    # defaults at the call site)
+    let ps = ["__this"]
+    let ast = []
+    let i = 0
+    for fld in c["fields"] {
+        if fld["isStatic"] or (c["isUnion"] and i > 0) {
+            continue
+        }
+        let p = "__f" + cxI64Str(i)
+        i = i + 1
+        ps.push(p)
+        ast.push(qExprStmt(qAssign(qIndex(qId("__this", ln), qNum(fld["slot"], ln), ln), qId(p, ln), ln), ln))
+    }
+    ast.push(qRet(qId("__this", ln), ln))
+    CXL_TOP_FNS.push(qFunc(cxAggFn(c), ps, qBlock(ast, ln), ln))
+    for f in c["ctors"] {
+        if f["def"] != nil or f["decl"]["isDefault"] {
+            if f["def"] == nil {
+                # T() = default: the implicit default construction
+                let ps2 = ["__this"]
+                let st = [qRet(qCallN(cxDefaultCtorFn(c), [qId("__this", ln)], ln), ln)]
+                let k = 0
+                while k < len(f["params"]) {
+                    ps2.push("__a" + cxI64Str(k))
+                    k = k + 1
+                }
+                CXL_TOP_FNS.push(qFunc(f["mangled"], ps2, qBlock(st, ln), ln))
+                f["lowered"] = true
+                continue
+            }
+            cxLowerFunction(f)
+        }
+    }
+    for f in c["methods"] {
+        if f["def"] != nil and !f["isTemplate"] {
+            cxLowerFunction(f)
+        }
+    }
+    for f in c["methods"] {
+        if f["def"] != nil and f["isTemplate"] {
+            cxLowerFunction(f)
+        }
+    }
+    if cxNeedsDtor(c) {
+        let st = []
+        if c["dtor"] != nil and c["dtor"]["def"] != nil {
+            c["dtor"]["mangled"] = c["qname"] + "::~" + c["name"]
+            cxLowerFunction(c["dtor"])
+            st.push(qExprStmt(qCallN(c["dtor"]["mangled"], [qId("__this", ln)], ln), ln))
+        }
+        let k = len(c["fields"]) - 1
+        while k >= 0 {
+            let f = c["fields"][k]
+            k = k - 1
+            if !f["isStatic"] and f["type"] != nil and cxOwnsResource(f["type"]) {
+                st.push(qExprStmt(cxDestroyValue(f["type"], qIndex(qId("__this", ln), qNum(f["slot"], ln), ln), ln), ln))
+            }
+            if c["isUnion"] {
+                break
+            }
+        }
+        let b = len(c["bases"]) - 1
+        while b >= 0 {
+            if cxNeedsDtor(c["bases"][b]) {
+                st.push(qExprStmt(qCallN(cxDtorFn(c["bases"][b]), [qId("__this", ln)], ln), ln))
+            }
+            b = b - 1
+        }
+        CXL_TOP_FNS.push(qFunc(cxDtorFn(c), ["__this"], qBlock(st, ln), ln))
+    }
+}
+
+fn cxAddBaseNames(k, bases, ln) {
+    bases.push(qStr(k["qname"], ln))
+    for b in k["bases"] {
+        cxAddBaseNames(b, bases, ln)
+    }
+}
+
+fn cxEmitDescriptors() {
+    for c in CXL_CLASS_ORDER {
+        if c["builtin"] {
+            continue
+        }
+        let ln = 0
+        if c["decl"] != nil {
+            ln = c["decl"]["line"]
+        }
+        let bases = []
+        cxAddBaseNames(c, bases, ln)
+        let args = [qStr(c["qname"], ln), qArr(bases, ln)]
+        if len(c["bases"]) == 0 {
+            args.push(qNil(ln))
+        } else {
+            args.push(qId(cxDesc(c["bases"][0]), ln))
+        }
+        CXL_TOP_INIT.push(qVar(cxDesc(c), qCallN("__cpp_class__", args, ln), ln))
+        if cxNeedsDtor(c) {
+            CXL_TOP_INIT.push(qExprStmt(qCallN("__cpp_vt_set__", [qId(cxDesc(c), ln), qStr("#dtor", ln), qId(cxDtorFn(c), ln)], ln), ln))
+        }
+        # virtual table: own methods override the base's entries
+        for f in c["methods"] {
+            if f["isVirtual"] and f["def"] != nil and !f["isPure"] {
+                CXL_TOP_INIT.push(qExprStmt(qCallN("__cpp_vt_set__", [qId(cxDesc(c), ln), qStr(f["vkey"], ln), qId(f["mangled"], ln)], ln), ln))
+            }
+        }
+    }
+}
+
+fn cxEmitGlobals() {
+    for g in CXL_GLOBALS_IN_ORDER {
+        let d = g[0]
+        let sc = g[1]
+        CXL_LINE = d["line"]
+        let ctx = cxNewFnCtx()
+        ctx["scope"] = sc
+        let saved = CXL_FN
+        CXL_FN = ctx
+        cxPushScope()
+        let pre = []
+        let savedPre = CXL_PRE
+        CXL_PRE = pre
+        CXL_CAN_HOIST = true
+        let gname = ""
+        let t = nil
+        if len(d["name"]) > 1 {
+            let owner = d["name"].slice(0, len(d["name"]) - 1)
+            let os = cxLookup(owner, sc, false)
+            if os == nil or os["kind"] != "Type" or os["type"] == nil or os["type"]["k"] != "Class" {
+                cxFailU("unknown class for " + cxLast(d["name"]), d["line"])
+            }
+            let c = os["type"]["cls"]
+            ctx["cls"] = c
+            ctx["scope"] = c["scope"]
+            let fs = cxLookupIn(c["scope"], cxLast(d["name"]), false)
+            if fs == nil or fs["kind"] != "Var" {
+                cxFailU("unknown static member " + cxLast(d["name"]), d["line"])
+            }
+            gname = fs["global"]
+            t = fs["type"]
+        } else {
+            let s = cxSymRef(sc, d["var"]["name"])
+            if s["type"] != nil {
+                t = s["type"]
+            } else {
+                t = cxResolveType(d["var"]["type"], sc)
+            }
+            gname = s["global"]
+        }
+        let args = d["var"]["args"].slice(0)
+        let value = nil
+        if d["var"]["init"] == "None" {
+            value = cxDefaultValue(t, d["line"])
+        } else {
+            let x = cxMakeObjectFrom(t, args, d["var"]["init"] == "Brace", d["line"])
+            value = cxCopyOf(x, d["line"])
+        }
+        CXL_PRE = savedPre
+        for p in pre {
+            CXL_TOP_INIT.push(p)
+        }
+        if isCBuf(t) {
+            value = qArr([value], d["line"])
+        }
+        CXL_TOP_INIT.push(qVar(gname, value, d["line"]))
+        cxPopScope()
+        CXL_FN = saved
+    }
+    # static data members declared in a class without an out-of-class definition
+    for c in CXL_CLASS_ORDER {
+        for f in c["fields"] {
+            if !f["isStatic"] {
+                continue
+            }
+            let defined = false
+            for g in CXL_GLOBALS_IN_ORDER {
+                if len(g[0]["name"]) > 1 and cxLast(g[0]["name"]) == f["name"] {
+                    defined = true
+                }
+            }
+            if defined {
+                continue
+            }
+            let ctx = cxNewFnCtx()
+            ctx["cls"] = c
+            ctx["scope"] = c["scope"]
+            let saved = CXL_FN
+            CXL_FN = ctx
+            cxPushScope()
+            let pre = []
+            let savedPre = CXL_PRE
+            CXL_PRE = pre
+            CXL_CAN_HOIST = true
+            let value = nil
+            if f["hasInit"] {
+                let args = f["init"]["args"].slice(0)
+                value = cxCopyOf(cxMakeObjectFrom(f["type"], args, f["init"]["init"] == "Brace", f["init"]["line"]), f["init"]["line"])
+            } else {
+                value = cxDefaultValue(f["type"], 0)
+            }
+            if isCBuf(f["type"]) {
+                value = qArr([value], 0)
+            }
+            CXL_PRE = savedPre
+            for p in pre {
+                CXL_TOP_INIT.push(p)
+            }
+            # initialized before the other globals may use it
+            CXL_TOP_INIT.insert(0, qVar(f["global"], value, 0))
+            cxPopScope()
+            CXL_FN = saved
+        }
+    }
+}

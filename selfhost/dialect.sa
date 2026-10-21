@@ -1,0 +1,44 @@
+# The dialect router, written in Quantum: a port of src/dialect/Dialect.cpp.
+# Applies whichever source-to-source passes a file's extension calls for:
+#   .c/.cpp/.sa  the C++ project-structure pass (dialect_cpp.sa)
+#   .rb          the Ruby dialect, strict (the whole file is Ruby)
+#   .sa          the Ruby dialect, mixed (only unambiguous Ruby converts)
+# and appends the call of a C/C++ program's main().
+# @use "./dialect_cpp.sa"
+# @use "./dialect_ruby_main.sa"
+
+let DL_MAIN_WITH_PARAMS_RE = "(^|\\n)[ \\t]*(static[ \\t]+)?(int|auto)[ \\t]+main[ \\t]*\\([ \\t]*(int|const|unsigned)\\b"
+
+# `int main(int argc, char** argv)` gets the command line
+fn dlMainCall(source) {
+    if reTest(source, DL_MAIN_WITH_PARAMS_RE) {
+        return "main(len(sys.argv), sys.argv)"
+    }
+    return "main()"
+}
+
+fn applyDialect(source, path) {
+    let ext = fileExtLower(path)
+    # a UTF-8 byte-order mark would sit in front of the first line's code
+    if len(source) >= 3 and ord(source[0]) == 239 and ord(source[1]) == 187 and ord(source[2]) == 191 {
+        source = source.slice(3)
+    }
+    let cppProject = false
+    if ext == ".c" or ext == ".cpp" or ext == ".sa" {
+        let r = applyCppDialect(source, path)
+        source = r[0]
+        cppProject = r[1]
+    }
+    if ext == ".rb" {
+        source = applyRubyDialect(source, true)
+    } else if ext == ".sa" {
+        source = applyRubyDialect(source, false)
+    }
+    # __cpp_runtime__() switches the VM to C/C++ arithmetic rules first
+    if (ext == ".c" or ext == ".cpp") and definesMainFunction(source) {
+        source = source + "\n__cpp_runtime__()\n" + dlMainCall(source) + "\n"
+    } else if ext == ".sa" and cppProject and definesCStyleMain(source) {
+        source = source + "\n__cpp_runtime__()\n" + dlMainCall(source) + "\n"
+    }
+    return source
+}

@@ -1,0 +1,1205 @@
+# Statement lowering of the typed C/C++ front-end: the statements part of
+# src/cpp/CppLower.cpp.
+# @use "./lower.sa"
+
+fn cxWithPre(stmt, pre) {
+    if len(pre) == 0 {
+        return stmt
+    }
+    let ln = CXL_LINE
+    if stmt != nil {
+        ln = stmt["line"]
+        pre.push(stmt)
+    }
+    return qBlock(pre, ln)
+}
+
+fn cxLowerBlock(body, newScope) {
+    if newScope {
+        cxPushScope()
+    }
+    let out = []
+    for s in body {
+        if s["k"] == "Decl" {
+            cxLowerDecl(s, out)
+            continue
+        }
+        if s["k"] == "Block" and s["isStatic"] {
+            # declarations that don't open a scope (struct X {...} x;)
+            for x in s["body"] {
+                if x["k"] == "Decl" {
+                    cxLowerDecl(x, out)
+                } else {
+                    let ls = cxLowerStmt(x)
+                    if ls != nil {
+                        out.push(ls)
+                    }
+                }
+            }
+            continue
+        }
+        let ls = cxLowerStmt(s)
+        if ls != nil {
+            out.push(ls)
+        }
+    }
+    if newScope {
+        cxEmitDestroy(len(CXL_FN["scopes"]) - 1, out, "")
+        cxPopScope()
+    }
+    let ln = CXL_LINE
+    if len(body) > 0 {
+        ln = body[0]["line"]
+    }
+    return qBlock(out, ln)
+}
+
+fn cxLowerDecl(s, out) {
+    for v in s["decls"] {
+        let savedTemps = CXL_TEMPS_TRACKED
+        if s["isStatic"] {
+            CXL_TEMPS_TRACKED = -1
+        } else {
+            CXL_TEMPS_TRACKED = 0
+        }
+        let one = []
+        cxLowerVar(v, s["isStatic"], one)
+        if CXL_TEMPS_TRACKED > 0 {
+            # the declaration's other temporaries end with it (the variables stay in scope)
+            let mark = cxTempName()
+            out.push(qVar(mark, qCallN("__cpp_temps_mark__", [], s["line"]), s["line"]))
+            for x in one {
+                out.push(x)
+            }
+            out.push(qExprStmt(qCallN("__cpp_temps_end__", [qId(mark, s["line"])], s["line"]), s["line"]))
+        } else {
+            for x in one {
+                out.push(x)
+            }
+        }
+        CXL_TEMPS_TRACKED = savedTemps
+    }
+}
+
+fn cxAliasXV(t, lk) {
+    let a = cxXV()
+    a["t"] = t
+    a["lk"] = lk
+    return a
+}
+
+fn cxLowerVar(v, isStatic, out) {
+    CXL_LINE = v["line"]
+    let pre = []
+    let savedPre = CXL_PRE
+    CXL_PRE = pre
+    CXL_CAN_HOIST = true
+    let ln = v["line"]
+    let tn = v["type"]
+    let t = cxResolveType(tn, CXL_FN["scope"])
+    let args = v["args"].slice(0)
+    if cxIsAutoType(tn) and tn["pointers"] > 0 and len(args) > 0 {
+        t = tDyn()
+    }
+    if isCBuf(t) and t["n"] < 0 {
+        t["n"] = cxBufInitSize(args, v["init"] == "Brace")
+    }
+    if t["k"] == "Array" and t["n"] < 0 and len(args) > 0 {
+        t["n"] = cxArrayInitSize(t, args, v["init"] == "Brace")
+    }
+    if v["name"] != "" and len(CXL_FN["scopes"]) > 0 and v["name"] in cxLast(CXL_FN["scopes"]) {
+        if CXL_PROG["cMode"] {
+            cxFailU("redefinition of '" + v["name"] + "'", ln)
+        }
+        cxFailU("redeclaration of '" + cxDiagType(t) + " " + v["name"] + "'", ln)
+    }
+    let constVar = (tn["isConst"] and tn["pointers"] == 0) or (len(tn["constPtr"]) > 0 and cxLast(tn["constPtr"]))
+
+    # structured binding: auto [a, b] = e;  auto& [k, v] = e;
+    if len(v["bindings"]) > 0 {
+        if len(args) == 0 {
+            cxFailU("structured binding without initializer", ln)
+        }
+        let src = cxLowerExpr(args[0])
+        let st = src["t"]
+        let byRef = tn["ref"] or tn["rref"]
+        let tmp = cxTempName()
+        let init = nil
+        if byRef {
+            init = cxRead(src)
+        } else {
+            init = cxCopyOf(src, ln)
+        }
+        CXL_PRE = savedPre
+        for p in pre {
+            out.push(p)
+        }
+        out.push(qVar(tmp, init, ln))
+        let i = 0
+        while i < len(v["bindings"]) {
+            let et = tDyn()
+            if (st["k"] == "Pair" or st["k"] == "Tuple" or st["k"] == "Array") and i < len(st["a"]) {
+                et = st["a"][i]
+            } elif st["k"] == "Array" and len(st["a"]) > 0 {
+                et = st["a"][0]
+            } elif st["k"] == "Class" and st["cls"] != nil {
+                let k = 0
+                for f in st["cls"]["fields"] {
+                    if !f["isStatic"] {
+                        if k == i {
+                            et = f["type"]
+                        }
+                        k = k + 1
+                    }
+                }
+            }
+            let key = i
+            if st["k"] == "Class" and st["cls"] != nil {
+                let k = 0
+                for f in st["cls"]["fields"] {
+                    if !f["isStatic"] {
+                        if k == i {
+                            key = f["slot"]
+                        }
+                        k = k + 1
+                    }
+                }
+            }
+            let l = cxDeclareLocal(v["bindings"][i], et)
+            l["alias"] = true
+            let a = cxAliasXV(et, "Idx")
+            a["obj"] = qId(tmp, ln)
+            a["key"] = qNum(key, ln)
+            l["aliasOf"] = a
+            i = i + 1
+        }
+        return nil
+    }
+
+    if t["k"] == "Dyn" and cxIsAutoType(tn) {
+        # auto: the initializer's type
+        if len(args) == 0 {
+            cxFailU("auto without initializer", ln)
+        }
+        if v["init"] == "Brace" and len(args) != 1 {
+            let il = mkT("Vector", "vector")
+            il["a"].push(tDyn())
+            t = il
+        }
+    }
+
+    # static local: a global initialized once
+    if isStatic {
+        CXL_STATIC_COUNTER = CXL_STATIC_COUNTER + 1
+        let g = "__static" + cxI64Str(CXL_STATIC_COUNTER) + "_" + v["name"]
+        let guard = g + "#init"
+        let x = nil
+        if v["init"] == "None" {
+            x = cxMkXV(cxDefaultValue(t, ln), t, true)
+        } else {
+            x = cxMakeObjectFrom(t, args, v["init"] == "Brace", ln)
+        }
+        if t["k"] == "Dyn" {
+            t = x["t"]
+        }
+        let value = cxCopyOf(x, ln)
+        let thenStmts = []
+        for p in pre {
+            thenStmts.push(p)
+        }
+        if isCBuf(t) {
+            value = qArr([value], ln)
+        }
+        thenStmts.push(qExprStmt(qAssign(qId(g, ln), value, ln), ln))
+        thenStmts.push(qExprStmt(qAssign(qId(guard, ln), qBool(true, ln), ln), ln))
+        CXL_PRE = savedPre
+        # the guard and the value are globals, initialized on first execution
+        CXL_TOP_INIT.insert(0, qVar(guard, qBool(false, ln), ln))
+        CXL_TOP_INIT.insert(0, qVar(g, qNil(ln), ln))
+        out.push(qIfs(qUn("!", qId(guard, ln), ln), qBlock(thenStmts, ln), nil, ln))
+        let l = cxDeclareLocal(v["name"], t)
+        l["isConst"] = constVar
+        l["alias"] = true
+        let a = cxAliasXV(t, "Var")
+        a["var"] = g
+        if isCBuf(t) {
+            a["lk"] = "Idx"
+            a["obj"] = qId(g, ln)
+            a["key"] = qNum(0, ln)
+        }
+        l["aliasOf"] = a
+        return nil
+    }
+
+    # references: T& r = lvalue
+    if tn["ref"] or tn["rref"] {
+        if len(args) == 0 {
+            cxFailU("reference without initializer", ln)
+        }
+        let x = cxLowerExpr(args[0])
+        if t["k"] == "Dyn" {
+            t = x["t"]
+        }
+        if isObjectRep(t) or x["t"]["k"] == "Dyn" or tn["isConst"] or x["lk"] == "RV" {
+            # objects are held by reference already; const T& of a scalar: its value
+            let value = nil
+            if isObjectRep(t) {
+                value = cxRead(x)
+            } else {
+                value = cxRead(cxConvert(x, t, ln, true))
+            }
+            CXL_PRE = savedPre
+            for p in pre {
+                out.push(p)
+            }
+            let l = cxDeclareLocal(v["name"], t)
+            l["isConst"] = constVar
+            if l["boxed"] {
+                value = qArr([value], ln)
+            }
+            out.push(qVar(l["q"], value, ln))
+            return nil
+        }
+        # a modifiable alias of a scalar lvalue: re-evaluable parts
+        let a = cxAliasXV(t, x["lk"])
+        a["var"] = x["var"]
+        if x["lk"] == "Idx" {
+            a["obj"] = cxSimple(x["obj"], ln)
+            a["key"] = cxSimple(x["key"], ln)
+        } elif x["lk"] == "StrCh" {
+            a["base"] = x["base"]
+            a["key"] = cxSimple(x["key"], ln)
+        }
+        CXL_PRE = savedPre
+        for p in pre {
+            out.push(p)
+        }
+        let l = cxDeclareLocal(v["name"], t)
+        l["isConst"] = constVar
+        l["alias"] = true
+        l["aliasOf"] = a
+        return nil
+    }
+
+    if t["k"] == "Func" and !cxIsAutoType(tn) and v["init"] != "None" {
+        # std::function<...> f = [&](...) { ... f(...) ... }: the name is in
+        # scope in its own initializer, so a recursive lambda can call it
+        for p in pre {
+            out.push(p)
+        }
+        while len(pre) > 0 {
+            pre.pop()
+        }
+        let l0 = cxDeclareLocal(v["name"], t)
+        l0["isConst"] = constVar
+        if l0["boxed"] {
+            out.push(qVar(l0["q"], qArr([qNil(ln)], ln), ln))
+        } else {
+            out.push(qVar(l0["q"], qNil(ln), ln))
+        }
+        let x = cxMakeObjectFrom(t, args, v["init"] == "Brace", ln)
+        let value = cxCopyOf(x, ln)
+        CXL_PRE = savedPre
+        for p in pre {
+            out.push(p)
+        }
+        let target = cxLocalXV(cxFindLocal(v["name"]))
+        target["constLv"] = false
+        out.push(qExprStmt(cxStore(target, value, ln), ln))
+        return nil
+    }
+    let value = nil
+    if v["init"] == "None" {
+        value = cxDefaultValue(t, ln)
+    } else {
+        let x = cxMakeObjectFrom(t, args, v["init"] == "Brace", ln)
+        cxUntrackTemp(x)
+        if t["k"] == "Dyn" {
+            t = x["t"]
+        }
+        value = cxCopyOf(x, ln)
+    }
+    CXL_PRE = savedPre
+    for p in pre {
+        out.push(p)
+    }
+    let l = cxDeclareLocal(v["name"], t)
+    l["isConst"] = constVar
+    if l["boxed"] {
+        value = qArr([value], ln)
+    }
+    out.push(qVar(l["q"], value, ln))
+    if len(CXL_FN["owned"]) > 0 and cxOwnsResource(t) {
+        # destroyed when the scope ends
+        cxLast(CXL_FN["owned"]).push(cxLocalCopy(l))
+    }
+}
+
+fn cxLowerStmt(s) {
+    let savedTemps = CXL_TEMPS_TRACKED
+    let savedMark = CXL_TEMPS_MARK
+    let tracks = s["k"] == "Expr" or s["k"] == "Return"
+    if tracks {
+        CXL_TEMPS_TRACKED = 0
+        CXL_TEMPS_MARK = cxTempName()
+    } else {
+        CXL_TEMPS_TRACKED = -1
+        CXL_TEMPS_MARK = ""
+    }
+    let r = cxLowerStmtInner(s)
+    if tracks and CXL_TEMPS_TRACKED > 0 {
+        if s["k"] == "Return" {
+            # the return ends them itself, before returning
+            r = qBlock([qVar(CXL_TEMPS_MARK, qCallN("__cpp_temps_mark__", [], s["line"]), s["line"]), r], s["line"])
+        } else {
+            r = cxEndTemps(r, CXL_TEMPS_MARK, s["line"])
+        }
+    }
+    CXL_TEMPS_TRACKED = savedTemps
+    CXL_TEMPS_MARK = savedMark
+    return r
+}
+
+fn cxNameExpr(name, ln) {
+    let e = cxExpr("Name", ln)
+    e["name"] = [name]
+    return e
+}
+
+fn cxLowerStmtInner(s) {
+    CXL_LINE = s["line"]
+    let ln = s["line"]
+    let pre = []
+    let savedPre = CXL_PRE
+    CXL_PRE = pre
+    CXL_CAN_HOIST = true
+    let out = nil
+    let k = s["k"]
+    if k == "Empty" {
+        let skip = true
+    } elif k == "Expr" {
+        if s["expr"]["k"] == "Throw" {
+            let e = s["expr"]
+            if len(e["kids"]) == 0 {
+                if len(CXL_FN["excVars"]) == 0 {
+                    cxFailU("throw; outside a handler", ln)
+                }
+                out = qRaise(qId(cxLast(CXL_FN["excVars"]), ln), ln)
+            } else {
+                let x = cxLowerExpr(e["kids"][0])
+                cxUntrackTemp(x)
+                let val = nil
+                if x["t"]["k"] == "Class" {
+                    val = cxCopyOf(x, ln)
+                } else {
+                    let tname = cxTypeStr(x["t"])
+                    if x["t"]["k"] == "CStr" {
+                        tname = "const char*"
+                    }
+                    let a = [qStr(tname, ln)]
+                    a.push(cxRead(x))
+                    val = qCallN("__cpp_boxexc__", a, ln)
+                }
+                out = qRaise(val, ln)
+            }
+        } else {
+            # postfix ++/-- as a statement: no old value needed
+            let e = s["expr"]
+            if e["k"] == "Postfix" {
+                let pe = cxExprCopy(e)
+                pe["k"] = "Unary"
+                e = pe
+            }
+            let x = cxLowerExpr(e)
+            out = qExprStmt(cxRead(x), ln)
+        }
+    } elif k == "Decl" {
+        let decls = []
+        CXL_PRE = savedPre
+        cxLowerDecl(s, decls)
+        return qBlock(decls, ln)
+    } elif k == "Block" {
+        CXL_PRE = savedPre
+        return cxLowerBlock(s["body"], !s["isStatic"])
+    } elif k == "If" {
+        CXL_PRE = savedPre
+        return cxLowerIf(s)
+    } elif k == "While" {
+        CXL_PRE = savedPre
+        cxPushScope()
+        CXL_FN["loops"].push(cxLoopCtx())
+        let loop = nil
+        if s["condDecl"] != nil {
+            # while (T x = e) body  ->  while (true) { T x = e; if (!x) break; body }
+            let inner = []
+            cxPushScope()
+            cxLowerDecl(s["condDecl"], inner)
+            let dv = s["condDecl"]["decls"][0]
+            let cx = cxLowerExpr(cxNameExpr(dv["name"], ln))
+            inner.push(qIfs(qUn("!", cxToBool(cx, ln), ln), qBrk(ln), nil, ln))
+            inner.push(cxLowerStmt(s["then"]))
+            cxPopScope()
+            loop = qWhiles(qBool(true, ln), qBlock(inner, ln), nil, ln)
+        } else {
+            let cpre = []
+            CXL_PRE = cpre
+            CXL_CAN_HOIST = false
+            let c = cxLowerExpr(s["expr"])
+            let cond = cxToBool(c, ln)
+            CXL_PRE = savedPre
+            let body = cxLowerStmt(s["then"])
+            loop = qWhiles(cond, body, nil, ln)
+        }
+        CXL_FN["loops"].pop()
+        cxPopScope()
+        return loop
+    } elif k == "Do" {
+        CXL_PRE = savedPre
+        CXL_FN["loops"].push(cxLoopCtx())
+        let body = cxLowerStmt(s["then"])
+        let cpre = []
+        CXL_PRE = cpre
+        CXL_CAN_HOIST = false
+        let c = cxLowerExpr(s["expr"])
+        let cond = cxToBool(c, ln)
+        CXL_PRE = savedPre
+        CXL_FN["loops"].pop()
+        let post = qIfs(qUn("!", cond, ln), qBrk(ln), nil, ln)
+        return qWhiles(qBool(true, ln), body, post, ln)
+    } elif k == "For" {
+        CXL_PRE = savedPre
+        return cxLowerFor(s)
+    } elif k == "RangeFor" {
+        CXL_PRE = savedPre
+        return cxLowerRangeFor(s)
+    } elif k == "Switch" {
+        CXL_PRE = savedPre
+        return cxLowerSwitch(s)
+    } elif k == "Break" {
+        let loops = CXL_FN["loops"]
+        if len(loops) > 0 and cxAnyOwned(cxLast(loops)["scopeDepth"]) {
+            let st = []
+            cxEmitDestroy(cxLast(loops)["scopeDepth"], st, "")
+            st.push(qBrk(ln))
+            out = qBlock(st, ln)
+        } else {
+            out = qBrk(ln)
+        }
+    } elif k == "Continue" {
+        # inside a switch (a one-pass loop here), `continue` belongs to the loop around it
+        let loops = CXL_FN["loops"]
+        let depth = len(loops) - 1
+        if depth >= 0 and loops[depth]["isSwitch"] {
+            let i = depth
+            while i >= 0 and loops[i]["isSwitch"] {
+                if loops[i]["contFlag"] == "" {
+                    loops[i]["contFlag"] = cxTempName()
+                }
+                i = i - 1
+            }
+            let st = [qExprStmt(qAssign(qId(loops[depth]["contFlag"], ln), qBool(true, ln), ln), ln), qBrk(ln)]
+            out = qBlock(st, ln)
+        } elif len(loops) > 0 and cxAnyOwned(cxLast(loops)["scopeDepth"]) {
+            let st = []
+            cxEmitDestroy(cxLast(loops)["scopeDepth"], st, "")
+            st.push(qCont(ln))
+            out = qBlock(st, ln)
+        } else {
+            out = qCont(ln)
+        }
+    } elif k == "Return" {
+        out = cxLowerReturn(s, ln)
+    } elif k == "Try" {
+        CXL_PRE = savedPre
+        return cxLowerTry(s)
+    } elif k == "Case" or k == "Default" {
+        cxFailU("case label outside a switch", ln)
+    } elif k == "LocalClass" {
+        CXL_PRE = savedPre
+        if s["local"] != nil {
+            cxLocalClass(s["local"])
+        }
+        return nil
+    }
+    CXL_PRE = savedPre
+    return cxWithPre(out, pre)
+}
+
+fn cxLowerReturn(s, ln) {
+    let fn1 = CXL_FN
+    if s["expr"] == nil {
+        if !fn1["isLambda"] and fn1["ret"] != nil and fn1["ret"]["k"] != "Void" and fn1["ret"]["k"] != "Dyn" {
+            if CXL_PROG["cMode"] {
+                cxFailU("'return' with no value, in function returning non-void", ln)
+            }
+            cxFailU("return-statement with no value, in function returning '" + cxDiagType(fn1["ret"]) + "' [-fpermissive]", ln)
+        }
+        if cxAnyOwned(0) {
+            let st = []
+            cxEmitDestroy(0, st, "")
+            st.push(qRet(nil, ln))
+            return qBlock(st, ln)
+        }
+        return qRet(nil, ln)
+    }
+    let rt = fn1["ret"]
+    if fn1["isLambda"] and fn1["ret"]["k"] == "Dyn" {
+        rt = tDyn()
+    }
+    let x = nil
+    if s["expr"]["k"] == "InitList" and rt["k"] != "Dyn" {
+        let kids = s["expr"]["kids"].slice(0)
+        x = cxListInit(rt, kids, ln)
+    } else {
+        x = cxLowerExpr(s["expr"])
+    }
+    cxUntrackTemp(x)
+    if fn1["isLambda"] and fn1["deducedRet"] == nil {
+        fn1["deducedRet"] = x["t"]
+    }
+    if !fn1["isLambda"] and fn1["ret"] != nil and fn1["ret"]["k"] == "Void" and x["t"]["k"] != "Void" and x["t"]["k"] != "Dyn" {
+        if CXL_PROG["cMode"] {
+            cxFailU("'return' with a value, in function returning void", ln)
+        }
+        cxFailU("return-statement with a value, in function returning 'void' [-fpermissive]", ln)
+    }
+    if fn1["retRef"] {
+        # returns T& of a scalar: a Ref to the lvalue
+        let r = cxAddressOf(x, ln)
+        return qRet(cxRead(r), ln)
+    }
+    if rt["k"] != "Dyn" and rt["k"] != "Void" {
+        x = cxConvert(x, rt, ln, true)
+    }
+    # returning a local by value moves it; members / references are copied
+    let isLocal = false
+    if x["lk"] == "Var" {
+        for sc in fn1["scopes"] {
+            for kk in Object.keys(sc) {
+                let l = sc[kk]
+                if l["q"] == x["var"] and !l["alias"] {
+                    isLocal = true
+                }
+            }
+        }
+    }
+    let returnedLocal = ""
+    if isLocal {
+        returnedLocal = x["var"]
+    }
+    let val = nil
+    if isLocal or fn1["retIsRef"] {
+        val = cxRead(x)
+    } else {
+        val = cxCopyOf(x, ln)
+    }
+    if cxAnyOwned(0) or CXL_TEMPS_TRACKED > 0 {
+        let tmp = cxTempName()
+        let st = [qVar(tmp, val, ln)]
+        if CXL_TEMPS_TRACKED > 0 {
+            st.push(qExprStmt(qCallN("__cpp_temps_end__", [qId(CXL_TEMPS_MARK, ln)], ln), ln))
+        }
+        cxEmitDestroy(0, st, returnedLocal)
+        st.push(qRet(qId(tmp, ln), ln))
+        return qBlock(st, ln)
+    }
+    return qRet(val, ln)
+}
+
+fn cxLowerInit(s, outer) {
+    if s["init"] != nil {
+        if s["init"]["k"] == "Decl" {
+            cxLowerDecl(s["init"], outer)
+        } else {
+            let x = cxLowerStmt(s["init"])
+            if x != nil {
+                outer.push(x)
+            }
+        }
+    }
+}
+
+fn cxLowerIf(s) {
+    let ln = s["line"]
+    cxPushScope()
+    let outer = []
+    cxLowerInit(s, outer)
+    let pre = []
+    let savedPre = CXL_PRE
+    CXL_PRE = pre
+    CXL_CAN_HOIST = true
+    let cond = nil
+    if s["condDecl"] != nil {
+        cxLowerDecl(s["condDecl"], outer)
+        let dv = s["condDecl"]["decls"][0]
+        cond = cxToBool(cxLowerExpr(cxNameExpr(dv["name"], ln)), ln)
+    } else {
+        cond = cxToBool(cxLowerExpr(s["expr"]), ln)
+    }
+    CXL_PRE = savedPre
+    for p in pre {
+        outer.push(p)
+    }
+    let thenS = cxLowerStmt(s["then"])
+    let els = nil
+    if s["els"] != nil {
+        els = cxLowerStmt(s["els"])
+    }
+    if thenS == nil {
+        thenS = qBlock([], ln)
+    }
+    outer.push(qIfs(cond, thenS, els, ln))
+    cxPopScope()
+    if len(outer) == 1 {
+        return outer[0]
+    }
+    return qBlock(outer, ln)
+}
+
+fn cxLowerFor(s) {
+    let ln = s["line"]
+    cxPushScope()
+    let outer = []
+    cxLowerInit(s, outer)
+    let cpre = []
+    let savedPre = CXL_PRE
+    CXL_PRE = cpre
+    CXL_CAN_HOIST = false
+    let cond = nil
+    if s["cond2"] != nil {
+        cond = cxToBool(cxLowerExpr(s["cond2"]), ln)
+    } else {
+        cond = qBool(true, ln)
+    }
+    let step = nil
+    if s["step"] != nil {
+        let st = s["step"]
+        if st["k"] == "Postfix" {
+            let pe = cxExprCopy(st)
+            pe["k"] = "Unary"
+            st = pe
+        }
+        let x = cxLowerExpr(st)
+        step = qExprStmt(cxRead(x), ln)
+    }
+    CXL_PRE = savedPre
+    CXL_FN["loops"].push(cxLoopCtx())
+    let body = cxLowerStmt(s["then"])
+    CXL_FN["loops"].pop()
+    if body == nil {
+        body = qBlock([], ln)
+    }
+    outer.push(qWhiles(cond, body, step, ln))
+    cxEmitDestroy(len(CXL_FN["scopes"]) - 1, outer, "")
+    cxPopScope()
+    return qBlock(outer, ln)
+}
+
+fn cxLowerRangeFor(s) {
+    let ln = s["line"]
+    cxPushScope()
+    let outer = []
+    let pre = []
+    let savedPre = CXL_PRE
+    CXL_PRE = pre
+    CXL_CAN_HOIST = true
+    let v = s["decls"][0]
+    let tn = v["type"]
+    let declT = cxResolveType(tn, CXL_FN["scope"])
+    let c = nil
+    let ct = nil
+    if s["expr"]["k"] == "InitList" {
+        let kids = s["expr"]["kids"].slice(0)
+        let lt = mkT("Vector", "vector")
+        let first = nil
+        if len(kids) == 0 {
+            first = cxMkXV(qNil(ln), tDyn(), true)
+        } else {
+            first = cxLowerExpr(kids[0])
+        }
+        if first["t"]["k"] == "CStr" {
+            lt["a"].push(tCStr())
+        } else {
+            lt["a"].push(first["t"])
+        }
+        c = cxListInit(lt, kids, ln)
+        ct = lt
+    } else {
+        c = cxLowerExpr(s["expr"])
+        ct = c["t"]
+    }
+    let cn = cxTempName()
+    let inName = cxTempName()
+    let strLv = ct["k"] == "Str" and c["lk"] != "RV"
+    let strBase = nil
+    let init = nil
+    if strLv {
+        strBase = cxXV()
+        strBase["t"] = ct
+        strBase["lk"] = c["lk"]
+        strBase["var"] = c["var"]
+        if c["lk"] == "Idx" {
+            strBase["obj"] = cxSimple(qClone(c["obj"]), ln)
+            strBase["key"] = cxSimple(qClone(c["key"]), ln)
+        }
+        init = cxRead(c)
+    } elif ct["k"] == "Map" or ct["k"] == "Set" {
+        let a = [cxRead(c), qBool(ct["sorted"], ln)]
+        if ct["k"] == "Map" {
+            init = qCallN("__cpp_map_items__", a, ln)
+        } else {
+            init = qCallN("__cpp_set_items__", a, ln)
+        }
+    } else {
+        init = cxRead(c)
+    }
+    CXL_PRE = savedPre
+    for p in pre {
+        outer.push(p)
+    }
+    outer.push(qVar(cn, init, ln))
+    outer.push(qVar(inName, qNum(0, ln), ln))
+    let et = nil
+    if ct["k"] == "Map" {
+        et = mkT("Pair", "")
+        et["a"] = ct["a"]
+    } elif ct["k"] == "Str" {
+        et = tChar()
+    } else {
+        et = cxElemType(ct)
+    }
+    if declT["k"] == "Dyn" {
+        declT = et
+    }
+    # the element as an lvalue
+    let elem = cxXV()
+    elem["t"] = et
+    if ct["k"] == "Str" {
+        if strLv {
+            elem["lk"] = "StrCh"
+            elem["base"] = strBase
+            elem["key"] = qId(inName, ln)
+        } else {
+            elem["lk"] = "RV"
+        }
+        elem["v"] = qCallN("__cpp_str_at__", [qId(cn, ln), qId(inName, ln)], ln)
+    } else {
+        elem["lk"] = "Idx"
+        elem["obj"] = qId(cn, ln)
+        elem["key"] = qId(inName, ln)
+    }
+    cxPushScope()
+    let body = []
+    let bpre = []
+    CXL_PRE = bpre
+    CXL_CAN_HOIST = true
+    let byRef = tn["ref"] or tn["rref"]
+    if len(v["bindings"]) > 0 {
+        let en = cxTempName()
+        body.push(qVar(en, cxRead(elem), ln))
+        let i = 0
+        while i < len(v["bindings"]) {
+            let bt = tDyn()
+            if (et["k"] == "Pair" or et["k"] == "Tuple") and i < len(et["a"]) {
+                bt = et["a"][i]
+            }
+            let key = i
+            if et["k"] == "Class" and et["cls"] != nil {
+                let k = 0
+                for f in et["cls"]["fields"] {
+                    if !f["isStatic"] {
+                        if k == i {
+                            key = f["slot"]
+                            bt = f["type"]
+                        }
+                        k = k + 1
+                    }
+                }
+            }
+            let l = cxDeclareLocal(v["bindings"][i], bt)
+            if byRef {
+                l["alias"] = true
+                let a = cxAliasXV(bt, "Idx")
+                a["obj"] = qId(en, ln)
+                a["key"] = qNum(key, ln)
+                l["aliasOf"] = a
+            } else {
+                let x = cxAliasXV(bt, "Idx")
+                x["obj"] = qId(en, ln)
+                x["key"] = qNum(key, ln)
+                body.push(qVar(l["q"], cxCopyOf(x, ln), ln))
+            }
+            i = i + 1
+        }
+    } elif byRef and !isObjectRep(declT) and elem["lk"] != "RV" and !tn["isConst"] {
+        let l = cxDeclareLocal(v["name"], declT)
+        l["alias"] = true
+        l["aliasOf"] = elem
+    } else {
+        let l = cxDeclareLocal(v["name"], declT)
+        let x = cxXV()
+        x["t"] = elem["t"]
+        if elem["lk"] == "StrCh" {
+            x["lk"] = "RV"
+        } else {
+            x["lk"] = elem["lk"]
+        }
+        if elem["lk"] == "StrCh" or ct["k"] == "Str" {
+            x["v"] = qClone(elem["v"])
+        }
+        x["obj"] = qClone(elem["obj"])
+        x["key"] = qClone(elem["key"])
+        x = cxConvert(x, declT, ln, true)
+        let val = nil
+        if byRef {
+            val = cxRead(x)
+        } else {
+            val = cxCopyOf(x, ln)
+        }
+        if l["boxed"] {
+            val = qArr([val], ln)
+        }
+        body.push(qVar(l["q"], val, ln))
+    }
+    CXL_PRE = savedPre
+    for p in bpre {
+        body.insert(0, p)
+    }
+    CXL_FN["loops"].push(cxLoopCtx())
+    let b = cxLowerStmt(s["then"])
+    if b != nil {
+        body.push(b)
+    }
+    CXL_FN["loops"].pop()
+    cxPopScope()
+    let cond = qBin("<", qId(inName, ln), qCallN("__cpp_size__", [qId(cn, ln)], ln), ln)
+    let step = qExprStmt(qAssign(qId(inName, ln), qBin("+", qId(inName, ln), qNum(1, ln), ln), ln), ln)
+    outer.push(qWhiles(cond, qBlock(body, ln), step, ln))
+    cxPopScope()
+    return qBlock(outer, ln)
+}
+
+fn cxLowerSwitch(s) {
+    let ln = s["line"]
+    cxPushScope()
+    let outer = []
+    cxLowerInit(s, outer)
+    let pre = []
+    let savedPre = CXL_PRE
+    CXL_PRE = pre
+    CXL_CAN_HOIST = true
+    let v = cxLowerExpr(s["expr"])
+    let sv = cxTempName()
+    let st = cxTempName()
+    let val = cxRead(v)
+    # sections: statements between labels
+    let secs = []
+    for x in s["body"] {
+        if x["k"] == "Case" or x["k"] == "Default" {
+            if len(secs) == 0 or len(cxLast(secs)["stmts"]) > 0 {
+                secs.push({"labels": [], "isDefault": false, "stmts": []})
+            }
+            if x["k"] == "Case" {
+                cxLast(secs)["labels"].push(x["expr"])
+            } else {
+                cxLast(secs)["isDefault"] = true
+            }
+            continue
+        }
+        if len(secs) == 0 {
+            secs.push({"labels": [], "isDefault": false, "stmts": []})
+        }
+        cxLast(secs)["stmts"].push(x)
+    }
+    # __st = (sv == a) ? 0 : (sv == b) ? 1 : ... : default / N
+    let defIdx = len(secs)
+    let i = 0
+    while i < len(secs) {
+        if secs[i]["isDefault"] {
+            defIdx = i
+        }
+        i = i + 1
+    }
+    let sel = qNum(defIdx, ln)
+    i = len(secs) - 1
+    while i >= 0 {
+        let j = len(secs[i]["labels"]) - 1
+        while j >= 0 {
+            let lv = cxLowerExpr(secs[i]["labels"][j])
+            sel = qTernary(qBin("==", qId(sv, ln), cxRead(lv), ln), qNum(i, ln), sel, ln)
+            j = j - 1
+        }
+        i = i - 1
+    }
+    CXL_PRE = savedPre
+    for p in pre {
+        outer.push(p)
+    }
+    outer.push(qVar(sv, val, ln))
+    outer.push(qVar(st, sel, ln))
+    let lc = cxNewLoop()
+    lc["isSwitch"] = true
+    lc["scopeDepth"] = len(CXL_FN["scopes"])
+    CXL_FN["loops"].push(lc)
+    let body = []
+    # one scope for the whole switch body, as in C++
+    cxPushScope()
+    i = 0
+    while i < len(secs) {
+        let sb = []
+        for x in secs[i]["stmts"] {
+            if x["k"] == "Decl" {
+                # declarations stay visible to later sections
+                cxLowerDecl(x, body)
+                continue
+            }
+            let ls = cxLowerStmt(x)
+            if ls != nil {
+                sb.push(ls)
+            }
+        }
+        body.push(qIfs(qBin("<=", qId(st, ln), qNum(i, ln), ln), qBlock(sb, ln), nil, ln))
+        i = i + 1
+    }
+    cxPopScope()
+    body.push(qBrk(ln))
+    let flag = cxLast(CXL_FN["loops"])["contFlag"]
+    CXL_FN["loops"].pop()
+    if flag != "" {
+        outer.push(qVar(flag, qBool(false, ln), ln))
+    }
+    outer.push(qWhiles(qBool(true, ln), qBlock(body, ln), nil, ln))
+    if flag != "" {
+        # `continue` inside the switch: continue the enclosing loop (or the
+        # enclosing switch's loop, which re-dispatches the flag)
+        let loops = CXL_FN["loops"]
+        let outerIsSwitch = len(loops) > 0 and cxLast(loops)["isSwitch"]
+        let act = nil
+        if outerIsSwitch {
+            if cxLast(loops)["contFlag"] == "" {
+                cxLast(loops)["contFlag"] = cxTempName()
+            }
+            act = qBlock([qExprStmt(qAssign(qId(cxLast(loops)["contFlag"], ln), qBool(true, ln), ln), ln), qBrk(ln)], ln)
+        } else {
+            act = qCont(ln)
+        }
+        outer.push(qIfs(qId(flag, ln), act, nil, ln))
+    }
+    cxPopScope()
+    return qBlock(outer, ln)
+}
+
+# The VM unwinds a caught exception's stack to its depth at the try, while the
+# compiler numbers the handler's locals after every local declared in the try
+# body: those are declared before the try instead (`var x = e` inside becomes
+# `x = e`), so the slots agree however far the body got.
+fn cxHoistTryLocals(n, names) {
+    let k = n["k"]
+    if k == "Block" {
+        for st in n["statements"] {
+            if st != nil {
+                cxHoistTryLocals(st, names)
+            }
+        }
+        return nil
+    }
+    if k == "VarDecl" {
+        let name = n["name"]
+        names.push(name)
+        let init = n["initializer"]
+        if init == nil {
+            init = qNil(n["line"])
+        }
+        let ln = n["line"]
+        # the node becomes an expression statement in place
+        for key in Object.keys(n) {
+            n[key] = nil
+        }
+        let repl = qExprStmt(qAssign(qId(name, ln), init, ln), ln)
+        cxReplaceNode(n, repl)
+        return nil
+    }
+    if k == "If" {
+        if n["thenBranch"] != nil {
+            cxHoistTryLocals(n["thenBranch"], names)
+        }
+        if n["elseBranch"] != nil {
+            cxHoistTryLocals(n["elseBranch"], names)
+        }
+        return nil
+    }
+    if k == "While" {
+        if n["body"] != nil {
+            cxHoistTryLocals(n["body"], names)
+        }
+        if n["post"] != nil {
+            cxHoistTryLocals(n["post"], names)
+        }
+        return nil
+    }
+    if k == "Try" {
+        if n["body"] != nil {
+            cxHoistTryLocals(n["body"], names)
+        }
+        for h in n["handlers"] {
+            if h["body"] != nil {
+                cxHoistTryLocals(h["body"], names)
+            }
+        }
+    }
+}
+
+# turns node n into a copy of repl (keeping n's identity)
+fn cxReplaceNode(n, repl) {
+    let fresh = {}
+    for key in Object.keys(repl) {
+        fresh[key] = repl[key]
+    }
+    for key in Object.keys(n) {
+        if !(key in fresh) {
+            fresh[key] = nil
+        }
+    }
+    for key in Object.keys(fresh) {
+        n[key] = fresh[key]
+    }
+}
+
+fn cxLowerTry(s) {
+    let ln = s["line"]
+    let body = cxLowerStmt(s["then"])
+    let hoisted = []
+    if body != nil {
+        cxHoistTryLocals(body, hoisted)
+    }
+    let ex = cxTempName()
+    # if-chain over the catch clauses; no match -> rethrow
+    let chain = qRaise(qId(ex, ln), ln)
+    let i = len(s["catches"]) - 1
+    while i >= 0 {
+        let c = s["catches"][i]
+        i = i - 1
+        cxPushScope()
+        CXL_FN["excVars"].push(ex)
+        let hbody = []
+        let cond = nil
+        if c["type"] == nil {
+            cond = qBool(true, ln)
+        } else {
+            let ct = cxResolveType(c["type"], CXL_FN["scope"])
+            let tname = ""
+            if ct["k"] == "Class" and ct["cls"] != nil {
+                tname = ct["cls"]["qname"]
+            } elif ct["k"] == "CStr" {
+                tname = "const char*"
+            } else {
+                tname = cxTypeStr(ct)
+            }
+            cond = qCallN("__cpp_isa__", [qId(ex, ln), qStr(tname, ln)], ln)
+            if c["name"] != "" {
+                let l = cxDeclareLocal(c["name"], ct)
+                let val = nil
+                if ct["k"] == "Class" {
+                    val = qId(ex, ln)
+                } else {
+                    val = qIndex(qId(ex, ln), qNum(1, ln), ln)
+                }
+                if l["boxed"] {
+                    val = qArr([val], ln)
+                }
+                hbody.push(qVar(l["q"], val, ln))
+            }
+        }
+        let b = cxLowerStmt(c["body"])
+        if b != nil {
+            hbody.push(b)
+        }
+        CXL_FN["excVars"].pop()
+        cxPopScope()
+        chain = qIfs(cond, qBlock(hbody, ln), chain, ln)
+    }
+    let ts = qTry(body, ex, qBlock([chain], ln), ln)
+    if len(hoisted) == 0 {
+        return ts
+    }
+    let out = []
+    for n in hoisted {
+        out.push(qVar(n, qNil(ln), ln))
+    }
+    out.push(ts)
+    return qBlock(out, ln)
+}
+
+# A class / enum / alias declared inside a function: hoisted to the namespace
+# level under a unique name, visible from this block.
+fn cxLocalClass(d) {
+    if d["k"] == "Class" {
+        CXL_LOCAL_CLASS_COUNTER = CXL_LOCAL_CLASS_COUNTER + 1
+        let uniq = cxLast(d["name"]) + "#local" + cxI64Str(CXL_LOCAL_CLASS_COUNTER)
+        let sc = CXL_FN["scope"]
+        cxCollectClass(d, sc, uniq)
+        let s = cxLookupIn(sc, uniq, true)
+        let c = s["type"]["cls"]
+        c["name"] = cxLast(d["name"])
+        cxResolveClass(c)
+        for f in c["methods"] {
+            cxResolveFunc(f)
+        }
+        for f in c["ctors"] {
+            cxResolveFunc(f)
+        }
+        let count = {}
+        for f in c["methods"] {
+            let n = 1
+            if f["name"] in count {
+                n = count[f["name"]] + 1
+            }
+            count[f["name"]] = n
+            f["mangled"] = c["qname"] + "::" + f["name"]
+            if n > 1 {
+                f["mangled"] = f["mangled"] + "#" + cxI64Str(n)
+            }
+            f["vkey"] = f["name"] + "/" + cxI64Str(len(f["params"]))
+            let ms = cxSymRef(c["scope"], f["name"])
+            ms["kind"] = "Funcs"
+            ms["funcs"].push(f)
+        }
+        let n = 0
+        for f in c["ctors"] {
+            n = n + 1
+            f["mangled"] = c["qname"] + "::" + c["name"]
+            if n > 1 {
+                f["mangled"] = f["mangled"] + "#" + cxI64Str(n)
+            }
+        }
+        # visible under its own name inside this function
+        let tkey = "#type:" + cxLast(d["name"])
+        let scope0 = cxLast(CXL_FN["scopes"])
+        if !(tkey in scope0) {
+            scope0[tkey] = cxNewLocal()
+        }
+        CXL_LOCAL_TYPES[cxLast(d["name"])] = s["type"]
+        let saved = CXL_FN
+        let savedPre = CXL_PRE
+        let savedHoist = CXL_CAN_HOIST
+        cxLowerClass(c)
+        CXL_FN = saved
+        CXL_PRE = savedPre
+        CXL_CAN_HOIST = savedHoist
+        return nil
+    }
+    if d["k"] == "Enum" {
+        cxCollectEnum(d, CXL_FN["scope"])
+        return nil
+    }
+    if d["k"] == "Alias" {
+        CXL_LOCAL_TYPES[d["name"][0]] = cxResolveType(d["aliased"], CXL_FN["scope"])
+        return nil
+    }
+    if d["k"] == "UsingDirective" {
+        let s = cxLookup(d["name"], CXL_FN["scope"], false)
+        if s != nil and s["kind"] == "Namespace" {
+            CXL_FN["scope"]["usings"].push(s["ns"])
+        }
+    }
+}

@@ -35,7 +35,7 @@ void runFile(const std::string &path, bool debug = false);
 int checkFile(const std::string &path);
 
 // Prints a ParseError with the code it points at. `written` is the file as
-// written, `compiled` the text after applyDialect(): when the dialect passes
+// written, `compiled` the text after the dialect passes (selfhost/dialect.sa): when the dialect passes
 // renumbered lines (a C++ program assembled from its #includes), the line is
 // reported where it sits in `written`, or flagged as coming from an include.
 void printParseError(std::ostream &os, const std::string &path, const std::string &written,
@@ -56,11 +56,11 @@ int runTestExamples(const std::string &dir);
 // marker line to stdout and returns 2; a clean run returns 0.
 int runSingleFileForTest(const std::string &path);
 
-// ─── Self-hosting support (selfhost/) ─────────────────────────────────────
-// --dump-tokens: the C++ lexer's tokens, one per line (type, line, col, value).
-int dumpTokens(const std::string &path);
-// --emit-qbc: compiles a program and writes its serialized bytecode.
-int emitBytecodeFile(const std::string &path, const std::string &outPath);
+// ─── Bytecode files (selfhost/) ──────────────────────────────────────────
+// --emit-qbc: compiles a program and writes its serialized bytecode (how
+// selfhost/compiler.qbc is rebuilt). --emit-qbc-raw skips the dialect passes
+// on the program (not its @use modules).
+int emitBytecodeFile(const std::string &path, const std::string &outPath, bool dialect = true);
 // --exec: runs a serialized bytecode file (args after it go to sys.argv).
 int execBytecodeFile(const std::string &path);
 

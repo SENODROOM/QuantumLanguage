@@ -197,34 +197,90 @@ fn lexTok(type, value, line, col) {
 }
 
 fn lexError(msg, line) {
-    raise "LexError: " + msg + " (line " + str(line) + ")"
+    raise {"kind": "LexError", "message": msg, "line": line, "col": 0}
+}
+
+# ── fast scanning: runs of characters are found with the VM's std::string
+# searches instead of one character at a time (positions: -1 = npos) ───────
+
+let LEX_NPOS = 18446744073709551615
+let LEX_IDENT_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+
+fn lexFind(s, sub, start) {
+    let r = __cpp_str_find__("find", s, sub, start)
+    if r >= LEX_NPOS {
+        return -1
+    }
+    return r
+}
+
+fn lexFindOf(s, chars, start) {
+    let r = __cpp_str_find__("find_first_of", s, chars, start)
+    if r >= LEX_NPOS {
+        return -1
+    }
+    return r
+}
+
+fn lexFindNot(s, chars, start) {
+    let r = __cpp_str_find__("find_first_not_of", s, chars, start)
+    if r >= LEX_NPOS {
+        return -1
+    }
+    return r
+}
+
+# moves to position `to`, keeping line and col as lexAdvance would
+fn lexJump(lx, to) {
+    let src = lx["src"]
+    let p = lx["pos"]
+    let lastNl = -1
+    let line = lx["line"]
+    while true {
+        let q = lexFind(src, "\n", p)
+        if q == -1 or q >= to {
+            break
+        }
+        line = line + 1
+        lastNl = q
+        p = q + 1
+    }
+    if lastNl == -1 {
+        lx["col"] = lx["col"] + (to - lx["pos"])
+    } else {
+        lx["col"] = to - lastNl
+    }
+    lx["line"] = line
+    lx["pos"] = to
 }
 
 fn lexSkipWhitespace(lx) {
-    while lexMore(lx) {
-        let c = lexCur(lx)
-        if c != " " and c != "\t" and c != "\r" {
-            break
-        }
-        lexAdvance(lx)
+    let p = lx["pos"]
+    let q = lexFindNot(lx["src"], " \t\r", p)
+    if q == -1 {
+        q = lx["n"]
     }
+    lx["col"] = lx["col"] + (q - p)
+    lx["pos"] = q
 }
 
 fn lexSkipComment(lx) {
-    while lexMore(lx) and lexCur(lx) != "\n" {
-        lexAdvance(lx)
+    let p = lx["pos"]
+    let q = lexFind(lx["src"], "\n", p)
+    if q == -1 {
+        q = lx["n"]
     }
+    lx["col"] = lx["col"] + (q - p)
+    lx["pos"] = q
 }
 
 fn lexSkipBlockComment(lx) {
     # '/*' is already consumed: skip until '*/' (unterminated: to the end)
-    while lexMore(lx) {
-        if lexCur(lx) == "*" and lexPeek(lx, 1) == "/" {
-            lexAdvance(lx)
-            lexAdvance(lx)
-            return nil
-        }
-        lexAdvance(lx)
+    let q = lexFind(lx["src"], "*/", lx["pos"])
+    if q == -1 {
+        lexJump(lx, lx["n"])
+    } else {
+        lexJump(lx, q + 2)
     }
 }
 
@@ -364,42 +420,44 @@ fn lexReadTemplateLiteral(lx, out, startLine, startCol) {
     }
 }
 
+let LEX_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", "'": "'", "\"": "\"", "0": chr(0)}
+
 fn lexReadString(lx, quote) {
     let startLine = lx["line"]
     let startCol = lx["col"]
     lexAdvance(lx)
-    let s = ""
-    while lexMore(lx) and lexCur(lx) != quote {
-        if lexCur(lx) == "\\" {
-            lexAdvance(lx)
-            let d = lexCur(lx)
-            if d == "n" {
-                s = s + "\n"
-            } else if d == "t" {
-                s = s + "\t"
-            } else if d == "r" {
-                s = s + "\r"
-            } else if d == "\\" {
-                s = s + "\\"
-            } else if d == "'" {
-                s = s + "'"
-            } else if d == "\"" {
-                s = s + "\""
-            } else if d == "0" {
-                s = s + chr(0)
-            } else {
-                s = s + d
-            }
-            lexAdvance(lx)
-        } else {
-            s = s + lexAdvance(lx)
+    let src = lx["src"]
+    let stops = quote + "\\"
+    let parts = []
+    while true {
+        let p = lx["pos"]
+        let q = lexFindOf(src, stops, p)
+        if q == -1 {
+            lexJump(lx, lx["n"])
+            lexError("Unterminated string literal", startLine)
         }
-    }
-    if !lexMore(lx) {
-        lexError("Unterminated string literal", startLine)
+        if q > p {
+            parts.push(src.slice(p, q))
+            lexJump(lx, q)
+        }
+        if src[q] == quote {
+            break
+        }
+        # an escape: \n \t \r \\ \' \" \0, else the character itself
+        lexAdvance(lx)
+        if !lexMore(lx) {
+            lexError("Unterminated string literal", startLine)
+        }
+        let d = lexCur(lx)
+        if d in LEX_ESCAPES {
+            parts.push(LEX_ESCAPES[d])
+        } else {
+            parts.push(d)
+        }
+        lexAdvance(lx)
     }
     lexAdvance(lx)
-    return lexTok(T_STRING, s, startLine, startCol)
+    return lexTok(T_STRING, parts.join(""), startLine, startCol)
 }
 
 fn lexAtTripleQuote(lx, quote) {
@@ -608,10 +666,14 @@ fn lexReadFString(lx, startLine, startCol) {
 fn lexReadIdentifierOrKeyword(lx) {
     let startLine = lx["line"]
     let startCol = lx["col"]
-    let id = ""
-    while lexMore(lx) and (lexIsAlnum(lexCur(lx)) or lexCur(lx) == "_") {
-        id = id + lexAdvance(lx)
+    let p = lx["pos"]
+    let q = lexFindNot(lx["src"], LEX_IDENT_CHARS, p)
+    if q == -1 {
+        q = lx["n"]
     }
+    let id = lx["src"].slice(p, q)
+    lx["col"] = lx["col"] + (q - p)
+    lx["pos"] = q
     # Raw string: r"..." / r'...'
     if (id == "r" or id == "R") and lexMore(lx) and (lexCur(lx) == "\"" or lexCur(lx) == "'") {
         let quote = lexCur(lx)
@@ -635,12 +697,12 @@ fn lexReadIdentifierOrKeyword(lx) {
         return lexReadFString(lx, startLine, startCol)
     }
     let type = T_IDENTIFIER
-    if LEX_KEYWORDS.has(id) {
+    if (id in LEX_KEYWORDS) {
         type = LEX_KEYWORDS[id]
     }
     # #define macros: substitute the replacement tokens
     let defs = lx["defines"]
-    if defs.has(id) {
+    if (id in defs) {
         let rep = defs[id]
         if len(rep) > 0 {
             if len(rep) == 1 {
@@ -707,7 +769,7 @@ fn lexReadDirective(lx) {
                     id = id + lexAdvance(lx)
                 }
                 let defs = lx["defines"]
-                if defs.has(id) {
+                if (id in defs) {
                     let rep = defs[id]
                     let k = 0
                     while k < len(rep) {
@@ -719,9 +781,7 @@ fn lexReadDirective(lx) {
                 }
             } else {
                 # operator / punctuation: the rest of the line is skipped
-                while lexMore(lx) and lexCur(lx) != "\n" and lexCur(lx) != "\r" {
-                    lexAdvance(lx)
-                }
+                lexSkipToLineEnd(lx)
                 break
             }
         }
@@ -729,9 +789,18 @@ fn lexReadDirective(lx) {
             lx["defines"][macroName] = replacement
         }
     }
-    while lexMore(lx) and lexCur(lx) != "\n" and lexCur(lx) != "\r" {
-        lexAdvance(lx)
+    lexSkipToLineEnd(lx)
+}
+
+# to the next "\n" or "\r" (not crossing a line)
+fn lexSkipToLineEnd(lx) {
+    let p = lx["pos"]
+    let q = lexFindOf(lx["src"], "\n\r", p)
+    if q == -1 {
+        q = lx["n"]
     }
+    lx["col"] = lx["col"] + (q - p)
+    lx["pos"] = q
 }
 
 fn lexPrevIsValue(raw, withNil) {
@@ -1042,30 +1111,34 @@ fn lexIndentPass(src, raw, lastLine) {
         indentOf.push(0)
         k = k + 1
     }
+    # each line's indentation: its leading spaces (1) and tabs (4)
     let curLine = 1
-    let curIndent = 0
-    let lineStart = true
-    let i = 0
     let n = len(src)
-    while i < n {
-        let ch = src[i]
-        if ch == "\n" {
-            indentOf[curLine] = curIndent
-            curLine = curLine + 1
-            curIndent = 0
-            lineStart = true
-        } else if lineStart {
-            if ch == " " {
-                curIndent = curIndent + 1
-            } else if ch == "\t" {
-                curIndent = curIndent + 4
-            } else {
-                lineStart = false
-            }
+    let p = 0
+    while true {
+        let stop = lexFindNot(src, " \t", p)
+        if stop == -1 {
+            stop = n
         }
-        i = i + 1
+        let w = 0
+        let k = p
+        while k < stop {
+            if src[k] == " " {
+                w = w + 1
+            } else {
+                w = w + 4
+            }
+            k = k + 1
+        }
+        indentOf[curLine] = w
+        let nl = lexFind(src, "\n", p)
+        if nl == -1 {
+            break
+        }
+        curLine = curLine + 1
+        p = nl + 1
     }
-    indentOf[curLine] = curIndent
+    let i = 0
 
     let tokens = []
     let stack = [0]

@@ -1,0 +1,2249 @@
+# Bytecode compiler, written in Quantum: a port of src/compiler/*.cpp.
+# A chunk is {"name", "code" ([op, operand, line] triples), "constants",
+# "params", "paramIsRef", "upvalueCount"}. Constants are numbers, strings,
+# arrays (upvalue descriptors), {"fn": chunk} for a function and
+# {"long": "<decimal>"} for a 64-bit integer.
+# @use "./ast.sa"
+
+# ── opcodes (the order of enum class Op in include/Opcode.h) ────────────────
+let OP_LOAD_CONST = 0
+let OP_LOAD_NIL = 1
+let OP_LOAD_TRUE = 2
+let OP_LOAD_FALSE = 3
+let OP_POP = 4
+let OP_DEFINE_GLOBAL = 5
+let OP_LOAD_GLOBAL = 6
+let OP_STORE_GLOBAL = 7
+let OP_DEFINE_LOCAL = 8
+let OP_LOAD_LOCAL = 9
+let OP_STORE_LOCAL = 10
+let OP_DEFINE_CONST = 11
+let OP_LOAD_UPVALUE = 12
+let OP_STORE_UPVALUE = 13
+let OP_CLOSE_UPVALUE = 14
+let OP_ADD = 15
+let OP_SUB = 16
+let OP_MUL = 17
+let OP_DIV = 18
+let OP_MOD = 19
+let OP_FLOOR_DIV = 20
+let OP_POW = 21
+let OP_NEG = 22
+let OP_BIT_AND = 23
+let OP_BIT_OR = 24
+let OP_BIT_XOR = 25
+let OP_BIT_NOT = 26
+let OP_LSHIFT = 27
+let OP_RSHIFT = 28
+let OP_EQ = 29
+let OP_NEQ = 30
+let OP_LT = 31
+let OP_LTE = 32
+let OP_GT = 33
+let OP_GTE = 34
+let OP_NOT = 35
+let OP_AND = 36
+let OP_OR = 37
+let OP_CONCAT = 38
+let OP_JUMP = 39
+let OP_JUMP_IF_FALSE = 40
+let OP_JUMP_IF_TRUE = 41
+let OP_LOOP = 42
+let OP_JUMP_ABSOLUTE = 43
+let OP_CALL = 44
+let OP_RETURN = 45
+let OP_RETURN_NIL = 46
+let OP_MAKE_FUNCTION = 47
+let OP_MAKE_CLOSURE = 48
+let OP_MAKE_ARRAY = 49
+let OP_MAKE_DICT = 50
+let OP_MAKE_TUPLE = 51
+let OP_GET_INDEX = 52
+let OP_SET_INDEX = 53
+let OP_GET_MEMBER = 54
+let OP_SET_MEMBER = 55
+let OP_GET_SUPER = 56
+let OP_FOR_ITER = 57
+let OP_MAKE_ITER = 58
+let OP_MAKE_CLASS = 59
+let OP_INHERIT = 60
+let OP_BIND_METHOD = 61
+let OP_INSTANCE_NEW = 62
+let OP_PUSH_HANDLER = 63
+let OP_POP_HANDLER = 64
+let OP_RAISE = 65
+let OP_RERAISE = 66
+let OP_ADDRESS_OF = 67
+let OP_DEREF = 68
+let OP_ARROW = 69
+let OP_PRINT = 70
+let OP_DUP = 71
+let OP_DUP_TWO = 72
+let OP_SET_INDEX_COMPOUND = 73
+let OP_SWAP = 74
+let OP_NOP = 75
+let OP_ARG_PASSED = 76
+let OP_KW_NAMES = 77
+let OP_J_BIN = 78
+let OP_J_UN = 79
+let OP_J_INVOKE = 80
+let OP_J_GETF = 81
+let OP_J_PUTF = 82
+let OP_J_ALOAD = 83
+let OP_J_ASTORE = 84
+let OP_J_INSTOF = 85
+let OP_J_CAST = 86
+
+let K_FIELD_INIT_PREFIX = "__fieldinit__:"
+let K_STATIC_PREFIX = "__static__:"
+let UNIT_SEP = chr(31)
+
+let CG_BINARY_OPS = {
+    "+": OP_ADD, "-": OP_SUB, "*": OP_MUL, "/": OP_DIV, "%": OP_MOD, "//": OP_FLOOR_DIV,
+    "**": OP_POW, "==": OP_EQ, "!=": OP_NEQ, "===": OP_EQ, "!==": OP_NEQ, "<": OP_LT,
+    "<=": OP_LTE, ">": OP_GT, ">=": OP_GTE, "&": OP_BIT_AND, "|": OP_BIT_OR, "^": OP_BIT_XOR,
+    "<<": OP_LSHIFT, ">>": OP_RSHIFT, "is": OP_EQ, "is not": OP_NEQ
+}
+
+let CG_COMPOUND_OPS = {
+    "+=": OP_ADD, "-=": OP_SUB, "*=": OP_MUL, "/=": OP_DIV, "%=": OP_MOD,
+    "&=": OP_BIT_AND, "|=": OP_BIT_OR, "^=": OP_BIT_XOR
+}
+
+let CG_FLOATING_FNS = {
+    "_double_": true, "_float_": true, "sqrt": true, "pow": true, "exp": true, "log": true,
+    "log10": true, "log2": true, "sin": true, "cos": true, "tan": true, "asin": true, "acos": true,
+    "atan": true, "atan2": true, "floor": true, "ceil": true, "round": true, "fabs": true,
+    "fmod": true, "hypot": true, "cbrt": true, "trunc": true, "stod": true, "stof": true, "atof": true
+}
+
+let CG_INTEGRAL_FNS = {
+    "_int_": true, "_long_": true, "_short_": true, "__c_int__": true, "stoi": true, "stol": true,
+    "stoll": true, "atoi": true, "atol": true
+}
+
+let CG_INT_TYPES = {
+    "int": true, "long": true, "short": true, "unsigned": true, "signed": true, "size_t": true,
+    "ssize_t": true, "ptrdiff_t": true, "int8_t": true, "int16_t": true, "int32_t": true,
+    "int64_t": true, "uint8_t": true, "uint16_t": true, "uint32_t": true, "uint64_t": true
+}
+
+# ── compiler state ───────────────────────────────────────────────────────────
+let CG_CUR = nil                 # current_
+let CG_PENDING_PTYPES = []       # pendingParamCTypes_
+let CG_GLOBAL_CTYPES = {}        # globalCTypes_
+let CG_FN_RET_CTYPES = {}        # fnReturnCTypes_
+let CG_CLASS_METHOD_CTYPES = {}  # classMethodCTypes_
+let CG_CLASS_FIELD_CTYPES = {}   # classFieldCTypes_
+let CG_CLASS_STACK = []          # classStack_
+let CG_LOOPS = []                # loops_
+
+fn cgNewChunk(name) {
+    return {"name": name, "code": [], "constants": [], "params": [], "paramIsRef": [], "upvalueCount": 0}
+}
+
+fn cgNewState(name, enclosing) {
+    return {"chunk": cgNewChunk(name), "locals": [], "upvalues": [], "scopeDepth": 0,
+            "enclosing": enclosing, "isFunction": false, "tryDepth": 0}
+}
+
+# (the C++ compiler threw std::runtime_error: reported as "[Fatal] msg")
+fn cgError(msg) {
+    raise {"kind": "Fatal", "message": msg, "line": 0, "col": 0}
+}
+
+# ── emit helpers ─────────────────────────────────────────────────────────────
+
+fn cgCode() {
+    return CG_CUR["chunk"]["code"]
+}
+
+fn emit(op, operand, line) {
+    let code = CG_CUR["chunk"]["code"]
+    code.push([op, operand, line])
+    return len(code) - 1
+}
+
+fn addConst(v) {
+    let consts = CG_CUR["chunk"]["constants"]
+    consts.push(v)
+    return len(consts) - 1
+}
+
+fn emitJump(op, line) {
+    return emit(op, 0, line)
+}
+
+fn patchAt(idx, operand) {
+    CG_CUR["chunk"]["code"][idx][1] = operand
+}
+
+# operand = offset from the instruction after the jump
+fn patchJump(idx) {
+    patchAt(idx, len(cgCode()) - idx - 1)
+}
+
+fn cgLastLocal() {
+    return len(CG_CUR["locals"]) - 1
+}
+
+# ── C/C++ static types ───────────────────────────────────────────────────────
+
+# Return types of free functions and methods, and field types, declared
+# anywhere in the program — calls may precede the definitions.
+fn collectCTypes(node) {
+    let k = node["k"]
+    if k == "Block" {
+        for st in node["statements"] {
+            if st != nil {
+                collectCTypes(st)
+            }
+        }
+    } else if k == "FunctionDecl" {
+        if node["cReturnType"] != "" {
+            CG_FN_RET_CTYPES[node["name"]] = node["cReturnType"]
+        }
+    } else if k == "Class" {
+        let name = node["name"]
+        if !(name in CG_CLASS_METHOD_CTYPES) {
+            CG_CLASS_METHOD_CTYPES[name] = {}
+        }
+        if !(name in CG_CLASS_FIELD_CTYPES) {
+            CG_CLASS_FIELD_CTYPES[name] = {}
+        }
+        let methods = CG_CLASS_METHOD_CTYPES[name]
+        let fields = CG_CLASS_FIELD_CTYPES[name]
+        for f in node["fields"] {
+            cgCollectMember(f, methods, fields)
+        }
+        for m in node["methods"] {
+            cgCollectMember(m, methods, fields)
+        }
+        # inherited members (a base class is declared before its subclasses)
+        let base = node["base"]
+        if base != "" {
+            if !(base in CG_CLASS_METHOD_CTYPES) {
+                CG_CLASS_METHOD_CTYPES[base] = {}
+            }
+            if !(base in CG_CLASS_FIELD_CTYPES) {
+                CG_CLASS_FIELD_CTYPES[base] = {}
+            }
+            let bm = CG_CLASS_METHOD_CTYPES[base]
+            for key in Object.keys(bm) {
+                if !(key in methods) {
+                    methods[key] = bm[key]
+                }
+            }
+            let bf = CG_CLASS_FIELD_CTYPES[base]
+            for key in Object.keys(bf) {
+                if !(key in fields) {
+                    fields[key] = bf[key]
+                }
+            }
+        }
+    }
+}
+
+fn cgCollectMember(m, methods, fields) {
+    if m == nil {
+        return nil
+    }
+    if m["k"] == "FunctionDecl" and m["cReturnType"] != "" {
+        methods[m["name"]] = m["cReturnType"]
+    } else if m["k"] == "VarDecl" and m["typeHint"] != "" {
+        fields[m["name"]] = m["typeHint"]
+    } else if m["k"] == "Class" {
+        collectCTypes(m)
+    }
+    return nil
+}
+
+fn declaredCType(name) {
+    let st = CG_CUR
+    while st != nil {
+        let locals = st["locals"]
+        let i = len(locals) - 1
+        while i >= 0 {
+            if locals[i]["name"] == name {
+                return locals[i]["cType"]
+            }
+            i = i - 1
+        }
+        st = st["enclosing"]
+    }
+    if len(CG_CLASS_STACK) > 0 {
+        let cls = CG_CLASS_STACK[len(CG_CLASS_STACK) - 1]
+        if cls in CG_CLASS_FIELD_CTYPES {
+            let c = CG_CLASS_FIELD_CTYPES[cls]
+            if name in c {
+                return c[name]
+            }
+        }
+    }
+    if name in CG_GLOBAL_CTYPES {
+        return CG_GLOBAL_CTYPES[name]
+    }
+    return ""
+}
+
+# 'f' a floating type, 'i' an integer type, "" anything else
+fn cTypeKind(t) {
+    let changed = true
+    while changed {
+        changed = false
+        for q in ["const ", "static ", "constexpr ", "volatile "] {
+            while t.startsWith(q) {
+                t = t.slice(len(q))
+                changed = true
+            }
+        }
+    }
+    if t.includes("*") or t.includes("[") {
+        return ""
+    }
+    if t == "double" or t == "float" or t == "long double" {
+        return "f"
+    }
+    if t in CG_INT_TYPES or t.startsWith("unsigned ") or t.startsWith("signed ") or t.startsWith("long ") or t.startsWith("short ") {
+        if t.includes("double") {
+            return "f"
+        }
+        return "i"
+    }
+    return ""
+}
+
+# drops trailing characters in `chars` (pointer / array / reference marks)
+fn cgTrimEnd(t, chars) {
+    while len(t) > 0 and chars.includes(t[len(t) - 1]) {
+        t = t.slice(0, len(t) - 1)
+    }
+    return t
+}
+
+# How `cin >> target` should extract: 1 a double, 2 an integer, 3 a char,
+# 0 by the target's current value.
+fn cinKind(target) {
+    let type = ""
+    let k = target["k"]
+    if k == "Ident" {
+        type = declaredCType(target["name"])
+    } else if (k == "Member" or k == "Arrow") and len(CG_CLASS_STACK) > 0 {
+        let obj = target["object"]
+        let member = target["member"]
+        if obj["k"] == "Ident" and (obj["name"] == "self" or obj["name"] == "this") {
+            let cls = CG_CLASS_STACK[len(CG_CLASS_STACK) - 1]
+            if cls in CG_CLASS_FIELD_CTYPES and member in CG_CLASS_FIELD_CTYPES[cls] {
+                type = CG_CLASS_FIELD_CTYPES[cls][member]
+            }
+        }
+    } else if k == "Index" and target["object"]["k"] == "Ident" {
+        type = cgTrimEnd(declaredCType(target["object"]["name"]), "*][")
+    }
+    if type.startsWith("const ") {
+        type = type.slice(6)
+    }
+    if type == "char" {
+        return 3
+    }
+    let kind = cTypeKind(type)
+    if kind == "f" {
+        return 1
+    }
+    if kind == "i" {
+        return 2
+    }
+    return 0
+}
+
+# the class a (pointer-)typed object expression refers to, if known
+fn cgClassOf(obj) {
+    if obj["k"] != "Ident" {
+        return ""
+    }
+    let n = obj["name"]
+    if n == "self" or n == "this" {
+        if len(CG_CLASS_STACK) == 0 {
+            return ""
+        }
+        return CG_CLASS_STACK[len(CG_CLASS_STACK) - 1]
+    }
+    return cgTrimEnd(declaredCType(n), "*&")
+}
+
+fn cgLookup(table, cls, name) {
+    if !(cls in table) {
+        return ""
+    }
+    let c = table[cls]
+    if name in c {
+        return c[name]
+    }
+    return ""
+}
+
+# 'f' = statically a C/C++ floating-point value, 'i' = an integer, "" = unknown
+fn numericKind(e) {
+    let k = e["k"]
+    if k == "Ident" {
+        return cTypeKind(declaredCType(e["name"]))
+    }
+    if k == "Number" {
+        let v = e["value"]
+        # finite (inf - inf and NaN - NaN are NaN) and fractional
+        if v - v == 0 and floor(v) != v {
+            return "f"
+        }
+        return ""
+    }
+    if k == "Binary" {
+        let op = e["op"]
+        if op != "+" and op != "-" and op != "*" and op != "/" and op != "%" {
+            return ""
+        }
+        let l = numericKind(e["left"])
+        let r = numericKind(e["right"])
+        if l == "f" or r == "f" {
+            if op == "%" {
+                return ""
+            }
+            return "f"
+        }
+        if l == "i" and r == "i" {
+            return "i"
+        }
+        return ""
+    }
+    if k == "Unary" {
+        if e["op"] == "-" or e["op"] == "+" {
+            return numericKind(e["operand"])
+        }
+        return ""
+    }
+    if k == "Ternary" {
+        let a = numericKind(e["thenExpr"])
+        let b = numericKind(e["elseExpr"])
+        if a == "f" or b == "f" {
+            return "f"
+        }
+        if a == "i" and b == "i" {
+            return "i"
+        }
+        return ""
+    }
+    if k == "Member" or k == "Arrow" {
+        return cTypeKind(cgLookup(CG_CLASS_FIELD_CTYPES, cgClassOf(e["object"]), e["member"]))
+    }
+    if k == "Index" and e["object"]["k"] == "Ident" {
+        return cTypeKind(cgTrimEnd(declaredCType(e["object"]["name"]), "*]["))
+    }
+    if k == "Call" {
+        let callee = e["callee"]
+        if callee["k"] == "Ident" {
+            let n = callee["name"]
+            if n in CG_FLOATING_FNS {
+                return "f"
+            }
+            if n in CG_INTEGRAL_FNS {
+                return "i"
+            }
+            if n in CG_FN_RET_CTYPES {
+                return cTypeKind(CG_FN_RET_CTYPES[n])
+            }
+            if len(CG_CLASS_STACK) > 0 {
+                return cTypeKind(cgLookup(CG_CLASS_METHOD_CTYPES, CG_CLASS_STACK[len(CG_CLASS_STACK) - 1], n))
+            }
+            return ""
+        }
+        if callee["k"] == "Member" or callee["k"] == "Arrow" {
+            return cTypeKind(cgLookup(CG_CLASS_METHOD_CTYPES, cgClassOf(callee["object"]), callee["member"]))
+        }
+    }
+    return ""
+}
+
+# GET_SUPER operand: "<class>\x1f<method>" inside a method of <class>
+fn superKey(method) {
+    if len(CG_CLASS_STACK) == 0 {
+        return method
+    }
+    return CG_CLASS_STACK[len(CG_CLASS_STACK) - 1] + UNIT_SEP + method
+}
+
+# ── scopes ───────────────────────────────────────────────────────────────────
+
+fn beginScope() {
+    CG_CUR["scopeDepth"] = CG_CUR["scopeDepth"] + 1
+}
+
+fn endScope(line) {
+    CG_CUR["scopeDepth"] = CG_CUR["scopeDepth"] - 1
+    let locals = CG_CUR["locals"]
+    while len(locals) > 0 and locals[len(locals) - 1]["depth"] > CG_CUR["scopeDepth"] {
+        if locals[len(locals) - 1]["isCaptured"] {
+            emit(OP_CLOSE_UPVALUE, 0, line)
+        } else {
+            emit(OP_POP, 0, line)
+        }
+        locals.pop()
+    }
+}
+
+fn resolveLocal(state, name) {
+    let locals = state["locals"]
+    let i = len(locals) - 1
+    while i >= 0 {
+        if locals[i]["name"] == name {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+fn addUpvalue(state, index, isLocal) {
+    let uvs = state["upvalues"]
+    let i = 0
+    while i < len(uvs) {
+        if uvs[i]["index"] == index and uvs[i]["isLocal"] == isLocal {
+            return i
+        }
+        i = i + 1
+    }
+    uvs.push({"isLocal": isLocal, "index": index})
+    state["chunk"]["upvalueCount"] = state["chunk"]["upvalueCount"] + 1
+    return len(uvs) - 1
+}
+
+fn resolveUpvalue(state, name) {
+    let enc = state["enclosing"]
+    if enc == nil {
+        return -1
+    }
+    let local = resolveLocal(enc, name)
+    if local != -1 {
+        enc["locals"][local]["isCaptured"] = true
+        return addUpvalue(state, local, true)
+    }
+    let uv = resolveUpvalue(enc, name)
+    if uv != -1 {
+        return addUpvalue(state, uv, false)
+    }
+    return -1
+}
+
+fn declareLocal(name, line) {
+    if CG_CUR["scopeDepth"] == 0 {
+        return nil
+    }
+    CG_CUR["locals"].push({"name": name, "depth": CG_CUR["scopeDepth"], "isCaptured": false, "cType": ""})
+    return nil
+}
+
+fn emitLoad(name, line) {
+    # "this" is an alias for "self" (slot 0 in all methods)
+    if name == "this" {
+        name = "self"
+    }
+    let local = resolveLocal(CG_CUR, name)
+    if local != -1 {
+        emit(OP_LOAD_LOCAL, local, line)
+        return nil
+    }
+    let uv = resolveUpvalue(CG_CUR, name)
+    if uv != -1 {
+        emit(OP_LOAD_UPVALUE, uv, line)
+        return nil
+    }
+    emit(OP_LOAD_GLOBAL, addConst(name), line)
+    return nil
+}
+
+fn emitStore(name, line) {
+    if name == "this" {
+        name = "self"
+    }
+    let local = resolveLocal(CG_CUR, name)
+    if local != -1 {
+        emit(OP_STORE_LOCAL, local, line)
+        return nil
+    }
+    let uv = resolveUpvalue(CG_CUR, name)
+    if uv != -1 {
+        emit(OP_STORE_UPVALUE, uv, line)
+        return nil
+    }
+    emit(OP_STORE_GLOBAL, addConst(name), line)
+    return nil
+}
+
+# ── loops ────────────────────────────────────────────────────────────────────
+
+fn beginLoop(startIp) {
+    CG_LOOPS.push({"breakJumps": [], "continueJumps": [], "loopStart": startIp,
+                   "scopeDepth": CG_CUR["scopeDepth"], "tryDepth": CG_CUR["tryDepth"]})
+}
+
+fn cgLoop() {
+    return CG_LOOPS[len(CG_LOOPS) - 1]
+}
+
+# leaving a loop body early discards the locals it pushed
+fn emitLoopExitPops(line) {
+    if len(CG_LOOPS) == 0 {
+        return nil
+    }
+    let depth = cgLoop()["scopeDepth"]
+    let locals = CG_CUR["locals"]
+    let i = len(locals) - 1
+    while i >= 0 and locals[i]["depth"] > depth {
+        if locals[i]["isCaptured"] {
+            emit(OP_CLOSE_UPVALUE, 0, line)
+        } else {
+            emit(OP_POP, 0, line)
+        }
+        i = i - 1
+    }
+    return nil
+}
+
+fn emitBreakOrContinue(line, listName) {
+    if len(CG_LOOPS) == 0 {
+        emit(OP_RETURN_NIL, 0, line)
+        return nil
+    }
+    emitLoopExitPops(line)
+    # leaving try bodies inside the loop: drop their handlers
+    let i = cgLoop()["tryDepth"]
+    while i < CG_CUR["tryDepth"] {
+        emit(OP_POP_HANDLER, 0, line)
+        i = i + 1
+    }
+    cgLoop()[listName].push(emitJump(OP_JUMP, line))
+    return nil
+}
+
+fn endLoop() {
+    let after = len(cgCode())
+    for idx in cgLoop()["breakJumps"] {
+        patchAt(idx, after - idx - 1)
+    }
+    CG_LOOPS.pop()
+}
+
+fn cgPatchContinues() {
+    for ci in cgLoop()["continueJumps"] {
+        patchAt(ci, len(cgCode()) - ci - 1)
+    }
+}
+
+# ── entry ────────────────────────────────────────────────────────────────────
+
+# Compiles a program (a Block) to its top-level chunk.
+fn compileProgram(root) {
+    CG_PENDING_PTYPES = []
+    CG_GLOBAL_CTYPES = {}
+    CG_FN_RET_CTYPES = {}
+    CG_CLASS_METHOD_CTYPES = {}
+    CG_CLASS_FIELD_CTYPES = {}
+    CG_CLASS_STACK = []
+    CG_LOOPS = []
+    let top = cgNewState("<script>", nil)
+    CG_CUR = top
+    collectCTypes(root)
+    if root["k"] == "Block" {
+        compileBlock(root)
+    } else {
+        compileNode(root)
+    }
+    emit(OP_RETURN_NIL, 0, 0)
+    return top["chunk"]
+}
+
+# ── statements ───────────────────────────────────────────────────────────────
+
+fn compileNode(node) {
+    let ln = node["line"]
+    let k = node["k"]
+    if k == "Block" {
+        compileBlock(node)
+    } else if k == "VarDecl" {
+        compileVarDecl(node, ln)
+    } else if k == "FunctionDecl" {
+        compileFunctionDecl(node, ln)
+    } else if k == "Class" {
+        compileClassDecl(node, ln)
+    } else if k == "If" {
+        compileIf(node, ln)
+    } else if k == "While" {
+        compileWhile(node, ln)
+    } else if k == "For" {
+        compileFor(node, ln)
+    } else if k == "Return" {
+        compileReturn(node, ln)
+    } else if k == "Print" {
+        compilePrint(node, ln)
+    } else if k == "Input" {
+        compileInput(node, ln)
+    } else if k == "Try" {
+        compileTry(node, ln)
+    } else if k == "Raise" {
+        compileRaise(node, ln)
+    } else if k == "Break" {
+        emitBreakOrContinue(ln, "breakJumps")
+    } else if k == "Continue" {
+        emitBreakOrContinue(ln, "continueJumps")
+    } else if k == "Import" {
+        compileImport(node, ln)
+    } else if k == "Global" {
+        # scoping only — read by compileFunction's local analysis
+    } else if k == "ExprStmt" {
+        compileExpr(node["expr"])
+        if node["expr"]["k"] != "Return" {
+            emit(OP_POP, 0, ln)
+        }
+    } else {
+        compileExpr(node)
+        emit(OP_POP, 0, ln)
+    }
+}
+
+fn compileBlock(b) {
+    if CG_CUR["scopeDepth"] > 0 {
+        # functions declared in a block are visible from its start
+        for stmt in b["statements"] {
+            if stmt["k"] != "FunctionDecl" {
+                continue
+            }
+            if resolveLocal(CG_CUR, stmt["name"]) != -1 {
+                continue
+            }
+            emit(OP_LOAD_NIL, 0, stmt["line"])
+            declareLocal(stmt["name"], stmt["line"])
+            emit(OP_DEFINE_LOCAL, cgLastLocal(), stmt["line"])
+        }
+    }
+    for stmt in b["statements"] {
+        compileNode(stmt)
+    }
+}
+
+fn cgIsIntegerTypeName(t) {
+    return t == "int" or t == "long" or t == "short" or t == "size_t" or t.startsWith("long ") or t.startsWith("unsigned") or t.startsWith("short ")
+}
+
+fn compileVarDecl(s, line) {
+    let t = s["typeHint"]
+    # C integer declarations truncate their initializer: `int mid = n / 2`
+    let cInteger = s["cTyped"] and !s["isPointer"] and !t.includes("[]") and cgIsIntegerTypeName(t)
+    let init = s["initializer"]
+    if init != nil and cInteger {
+        emit(OP_LOAD_GLOBAL, addConst("__c_int__"), line)
+        compileExpr(init)
+        emit(OP_CALL, 1, line)
+    } else if init != nil {
+        compileExpr(init)
+    } else if !s["isPointer"] and (t == "string" or t == "char") {
+        # C/C++ typed declarations default like value-initialisation
+        emit(OP_LOAD_CONST, addConst(""), line)
+    } else if !s["isPointer"] and t == "bool" {
+        emit(OP_LOAD_FALSE, 0, line)
+    } else if !s["isPointer"] and t != "" and !t.includes("[]") and (t.startsWith("int") or t == "float" or t == "double" or t.startsWith("long") or t == "short" or t.startsWith("unsigned") or t == "size_t") {
+        emit(OP_LOAD_CONST, addConst(0), line)
+    } else {
+        emit(OP_LOAD_NIL, 0, line)
+    }
+
+    let cType = t
+    if s["isPointer"] {
+        cType = t + "*"
+    }
+    if CG_CUR["scopeDepth"] == 0 {
+        if s["isConst"] {
+            emit(OP_DEFINE_CONST, addConst(s["name"]), line)
+        } else {
+            emit(OP_DEFINE_GLOBAL, addConst(s["name"]), line)
+        }
+        if t != "" {
+            CG_GLOBAL_CTYPES[s["name"]] = cType
+        }
+    } else {
+        declareLocal(s["name"], line)
+        CG_CUR["locals"][cgLastLocal()]["cType"] = cType
+        emit(OP_DEFINE_LOCAL, cgLastLocal(), line)
+    }
+}
+
+# LOAD_CONST of a compiled function, then MAKE_CLOSURE / MAKE_FUNCTION
+fn emitFunctionValue(fnChunk, line) {
+    emit(OP_LOAD_CONST, addConst({"fn": fnChunk}), line)
+    if fnChunk["upvalueCount"] > 0 {
+        emit(OP_MAKE_CLOSURE, 0, line)
+    } else {
+        emit(OP_MAKE_FUNCTION, 0, line)
+    }
+}
+
+fn compileFunctionDecl(s, line) {
+    CG_PENDING_PTYPES = s["cppParamTypes"].slice(0)
+    let fnChunk = compileFunction(s["name"], s["params"], s["paramIsRef"], s["defaultArgs"], s["body"], line, s["pythonScope"])
+    emitFunctionValue(fnChunk, line)
+    if CG_CUR["scopeDepth"] == 0 {
+        emit(OP_DEFINE_GLOBAL, addConst(s["name"]), line)
+    } else {
+        let existing = resolveLocal(CG_CUR, s["name"])
+        if existing != -1 and CG_CUR["locals"][existing]["depth"] == CG_CUR["scopeDepth"] {
+            emit(OP_STORE_LOCAL, existing, line)
+            emit(OP_POP, 0, line)
+        } else {
+            declareLocal(s["name"], line)
+            emit(OP_DEFINE_LOCAL, cgLastLocal(), line)
+        }
+    }
+}
+
+fn cgIsUpper(c) {
+    return c >= "A" and c <= "Z"
+}
+
+# a class body member that is not a method: a nested class, a field, or a
+# `Name = value` assignment. False for anything else.
+fn bindClassField(member) {
+    let mk = member["k"]
+    let mline = member["line"]
+    if mk == "Class" {
+        compileClassDecl(member, mline)
+        emitLoad(member["name"], mline)
+        emit(OP_BIND_METHOD, addConst(member["name"]), mline)
+        return true
+    }
+    if mk == "VarDecl" {
+        let init = member["initializer"]
+        if member["perInstance"] and init != nil {
+            # fn(self) { return <initializer> } — run for every new instance;
+            # the class keeps nil as the field's fallback value
+            let bodyNode = nBlock([nReturn(init, mline)], mline)
+            let fnChunk = compileFunction("<init " + member["name"] + ">", ["self"], [false], [], bodyNode, mline, false)
+            emit(OP_LOAD_NIL, 0, mline)
+            emit(OP_BIND_METHOD, addConst(member["name"]), mline)
+            emitFunctionValue(fnChunk, mline)
+            emit(OP_BIND_METHOD, addConst(K_FIELD_INIT_PREFIX + member["name"]), mline)
+            return true
+        }
+        let t = member["typeHint"]
+        let numeric = t == "double" or t == "float" or t == "size_t" or t.startsWith("int") or t.startsWith("long") or t.startsWith("short") or t.startsWith("unsigned") or t.startsWith("signed")
+        let isStatic = member["isStatic"]
+        if init != nil {
+            compileExpr(init)
+        } else if isStatic and !member["isPointer"] and t == "bool" {
+            emit(OP_LOAD_FALSE, 0, mline)
+        } else if isStatic and !member["isPointer"] and t == "string" {
+            emit(OP_LOAD_CONST, addConst(""), mline)
+        } else if isStatic and !member["isPointer"] and numeric {
+            emit(OP_LOAD_CONST, addConst(0), mline)
+        } else {
+            emit(OP_LOAD_NIL, 0, mline)
+        }
+        # a C++ `static` data member is shared by every instance
+        if isStatic {
+            emit(OP_BIND_METHOD, addConst(K_STATIC_PREFIX + member["name"]), mline)
+        } else {
+            emit(OP_BIND_METHOD, addConst(member["name"]), mline)
+        }
+        return true
+    }
+    if mk == "ExprStmt" and member["expr"] != nil and member["expr"]["k"] == "Assign" {
+        let assign = member["expr"]
+        if assign["target"]["k"] == "Ident" {
+            let targetName = assign["target"]["name"]
+            compileExpr(assign["value"])
+            if len(targetName) > 0 and cgIsUpper(targetName[0]) {
+                emit(OP_DUP, 0, mline)
+                emit(OP_DEFINE_GLOBAL, addConst(targetName), mline)
+            }
+            emit(OP_BIND_METHOD, addConst(targetName), mline)
+            return true
+        }
+    }
+    return false
+}
+
+fn compileClassDecl(s, line) {
+    emit(OP_LOAD_CONST, addConst(s["name"]), line)
+    emit(OP_MAKE_CLASS, 0, line)
+    if s["base"] != "" {
+        emitLoad(s["base"], line)
+        emit(OP_INHERIT, 0, line)
+    }
+    for field in s["fields"] {
+        bindClassField(field)
+    }
+    # static methods compile the same way; their `self` is the class itself
+    let all = []
+    for m in s["methods"] {
+        all.push([m, false])
+    }
+    for m in s["staticMethods"] {
+        all.push([m, true])
+    }
+    for entry in all {
+        let method = entry[0]
+        let isStaticMethod = entry[1]
+        if !isStaticMethod and bindClassField(method) {
+            continue
+        }
+        if method["k"] != "FunctionDecl" {
+            continue
+        }
+        let fd = method
+        let params = fd["params"]
+        let refs = fd["paramIsRef"]
+        # "self" is slot 0; defaults shift along with the parameters
+        let methodParams = ["self"]
+        let methodRefs = []
+        let methodDefaults = []
+        let startIndex = 0
+        if len(params) == 0 or (params[0] != "self" and params[0] != "this") {
+            methodRefs.push(false)
+            methodDefaults.push(nil)
+        } else {
+            methodRefs.push(len(refs) > 0 and refs[0])
+            startIndex = 1
+        }
+        let i = startIndex
+        while i < len(params) {
+            methodParams.push(params[i])
+            methodRefs.push(i < len(refs) and refs[i])
+            i = i + 1
+        }
+        for d in fd["defaultArgs"] {
+            methodDefaults.push(d)
+        }
+        # parameter C types line up with methodParams (after `self`)
+        CG_PENDING_PTYPES = [""]
+        let cpp = fd["cppParamTypes"]
+        i = startIndex
+        while i < len(cpp) {
+            CG_PENDING_PTYPES.push(cpp[i])
+            i = i + 1
+        }
+        CG_CLASS_STACK.push(s["name"])
+        let fnChunk = compileFunction(fd["name"], methodParams, methodRefs, methodDefaults, fd["body"], method["line"], fd["pythonScope"])
+        CG_CLASS_STACK.pop()
+        emitFunctionValue(fnChunk, method["line"])
+        if isStaticMethod {
+            emit(OP_BIND_METHOD, addConst(K_STATIC_PREFIX + fd["name"]), method["line"])
+        } else {
+            emit(OP_BIND_METHOD, addConst(fd["name"]), method["line"])
+        }
+    }
+    if CG_CUR["scopeDepth"] == 0 {
+        emit(OP_DEFINE_GLOBAL, addConst(s["name"]), line)
+    } else {
+        declareLocal(s["name"], line)
+        emit(OP_DEFINE_LOCAL, cgLastLocal(), line)
+    }
+}
+
+fn compileIf(s, line) {
+    compileExpr(s["condition"])
+    let thenJump = emitJump(OP_JUMP_IF_FALSE, line)
+    emit(OP_POP, 0, line)
+    beginScope()
+    compileNode(s["thenBranch"])
+    endScope(line)
+    let elseJump = emitJump(OP_JUMP, line)
+    patchJump(thenJump)
+    emit(OP_POP, 0, line)
+    if s["elseBranch"] != nil {
+        beginScope()
+        compileNode(s["elseBranch"])
+        endScope(line)
+    }
+    patchJump(elseJump)
+}
+
+fn compileWhile(s, line) {
+    let loopStart = len(cgCode())
+    beginLoop(loopStart)
+    compileExpr(s["condition"])
+    let exitJump = emitJump(OP_JUMP_IF_FALSE, line)
+    emit(OP_POP, 0, line)
+    beginScope()
+    compileNode(s["body"])
+    endScope(line)
+    cgPatchContinues()
+    if s["post"] != nil {
+        beginScope()
+        compileNode(s["post"])
+        endScope(line)
+    }
+    emit(OP_LOOP, len(cgCode()) - loopStart + 1, line)
+    patchJump(exitJump)
+    emit(OP_POP, 0, line)
+    endLoop()
+}
+
+fn cgIsSpace(c) {
+    return c == " " or c == "\t" or c == "\n" or c == "\r" or c == chr(11) or c == chr(12)
+}
+
+# A loop variable spelled as a pattern ("[k,v]", "[a,[b,c]]") unpacks the
+# local in `slot` into fresh locals.
+fn emitPatternLocals(slot, pattern, line) {
+    if len(pattern) < 2 or pattern[0] != "[" or pattern[len(pattern) - 1] != "]" {
+        return nil
+    }
+    let parts = []
+    let cur = ""
+    let depth = 0
+    let i = 1
+    while i + 1 < len(pattern) {
+        let ch = pattern[i]
+        if ch == "[" {
+            depth = depth + 1
+        } else if ch == "]" {
+            depth = depth - 1
+        }
+        if ch == "," and depth == 0 {
+            parts.push(cur)
+            cur = ""
+        } else if !cgIsSpace(ch) {
+            cur = cur + ch
+        }
+        i = i + 1
+    }
+    parts.push(cur)
+    i = 0
+    while i < len(parts) {
+        if parts[i] != "" {
+            emit(OP_LOAD_LOCAL, slot, line)
+            emit(OP_LOAD_CONST, addConst(i), line)
+            emit(OP_GET_INDEX, 0, line)
+            declareLocal(parts[i], line)
+            let partSlot = cgLastLocal()
+            emit(OP_DEFINE_LOCAL, partSlot, line)
+            emitPatternLocals(partSlot, parts[i], line)
+        }
+        i = i + 1
+    }
+    return nil
+}
+
+fn compileFor(s, line) {
+    # the iterator is a hidden local of an outer scope
+    compileExpr(s["iterable"])
+    emit(OP_MAKE_ITER, 0, line)
+    beginScope()
+    declareLocal("__iter__", line)
+    emit(OP_DEFINE_LOCAL, cgLastLocal(), line)
+
+    let loopStart = len(cgCode())
+    beginLoop(loopStart)
+    let exitJump = emitJump(OP_FOR_ITER, line)
+
+    # inner scope: the loop variable(s), popped each iteration
+    beginScope()
+    declareLocal(s["var"], line)
+    let varSlot = cgLastLocal()
+    emit(OP_DEFINE_LOCAL, varSlot, line)
+    if s["var2"] != "" {
+        emit(OP_LOAD_LOCAL, varSlot, line)
+        emit(OP_LOAD_CONST, addConst(1), line)
+        emit(OP_GET_INDEX, 0, line)
+        declareLocal(s["var2"], line)
+        let var2Slot = cgLastLocal()
+        emit(OP_DEFINE_LOCAL, var2Slot, line)
+        emit(OP_LOAD_LOCAL, varSlot, line)
+        emit(OP_LOAD_CONST, addConst(0), line)
+        emit(OP_GET_INDEX, 0, line)
+        emit(OP_STORE_LOCAL, varSlot, line)
+        emit(OP_POP, 0, line)
+        emitPatternLocals(var2Slot, s["var2"], line)
+    }
+    emitPatternLocals(varSlot, s["var"], line)
+
+    compileNode(s["body"])
+    endScope(line)
+    # `continue` lands after that cleanup (it discarded the body's locals itself)
+    cgPatchContinues()
+    emit(OP_LOOP, len(cgCode()) - loopStart + 1, line)
+    patchJump(exitJump)
+    # `break` lands before the outer scope ends, so the iterator pops once
+    endLoop()
+    endScope(line)
+}
+
+fn emitPopHandlers(line) {
+    let i = 0
+    while i < CG_CUR["tryDepth"] {
+        emit(OP_POP_HANDLER, 0, line)
+        i = i + 1
+    }
+}
+
+fn compileReturn(s, line) {
+    if s["value"] != nil {
+        compileExpr(s["value"])
+        emitPopHandlers(line)
+        emit(OP_RETURN, 0, line)
+    } else {
+        emitPopHandlers(line)
+        emit(OP_RETURN_NIL, 0, line)
+    }
+}
+
+fn compilePrint(s, line) {
+    for arg in s["args"] {
+        compileExpr(arg)
+    }
+    emit(OP_LOAD_CONST, addConst(s["sep"]), line)
+    emit(OP_LOAD_CONST, addConst(s["end"]), line)
+    emit(OP_PRINT, len(s["args"]), line)
+}
+
+fn compileInput(s, line) {
+    emit(OP_LOAD_GLOBAL, addConst("__input__"), line)
+    if s["prompt"] != nil {
+        compileExpr(s["prompt"])
+    } else {
+        emit(OP_LOAD_CONST, addConst(""), line)
+    }
+    emit(OP_CALL, 1, line)
+    if s["target"] != "" {
+        emitStore(s["target"], line)
+    }
+    emit(OP_POP, 0, line)
+}
+
+# imports left after module resolution name host-language libraries
+fn compileImport(s, line) {
+    for item in s["imports"] {
+        emit(OP_LOAD_GLOBAL, addConst("__import_bind__"), line)
+        emit(OP_LOAD_CONST, addConst(s["module"]), line)
+        emit(OP_LOAD_CONST, addConst(item["name"]), line)
+        emit(OP_LOAD_CONST, addConst(item["alias"]), line)
+        emit(OP_CALL, 3, line)
+        emit(OP_POP, 0, line)
+    }
+}
+
+fn compileTry(s, line) {
+    let localsBefore = len(CG_CUR["locals"])
+    let handlerJump = emitJump(OP_PUSH_HANDLER, line)
+    CG_CUR["tryDepth"] = CG_CUR["tryDepth"] + 1
+    if s["body"] != nil {
+        compileNode(s["body"])
+    }
+    CG_CUR["tryDepth"] = CG_CUR["tryDepth"] - 1
+    # Locals the body declared at this level (its statements open no scope)
+    # stay declared after it, but a raise cuts the stack back to its height
+    # at PUSH_HANDLER: the first handler re-creates their slots (as nil)
+    # under the exception value, so every later slot is where the code
+    # expects it.
+    let bodyLocals = len(CG_CUR["locals"]) - localsBefore
+    emit(OP_POP_HANDLER, 0, line)
+    let afterHandlers = emitJump(OP_JUMP, line)
+    patchJump(handlerJump)
+    let first = true
+    for h in s["handlers"] {
+        beginScope()
+        # alias = `as e`; errorType names the variable for `except (e)`
+        let varName = h["alias"]
+        if varName == "" {
+            varName = h["errorType"]
+        }
+        let pad = 0
+        if first {
+            pad = bodyLocals
+        }
+        first = false
+        if varName != "" {
+            let k = 0
+            while k < pad {
+                emit(OP_LOAD_NIL, 0, line)
+                emit(OP_SWAP, 0, line)
+                k = k + 1
+            }
+            declareLocal(varName, line)
+            emit(OP_DEFINE_LOCAL, cgLastLocal(), line)
+        } else {
+            emit(OP_POP, 0, line)
+            let k = 0
+            while k < pad {
+                emit(OP_LOAD_NIL, 0, line)
+                k = k + 1
+            }
+        }
+        if h["body"] != nil {
+            compileNode(h["body"])
+        }
+        endScope(line)
+    }
+    patchJump(afterHandlers)
+    if s["finallyBody"] != nil {
+        compileNode(s["finallyBody"])
+    }
+}
+
+fn compileRaise(s, line) {
+    if s["value"] != nil {
+        compileExpr(s["value"])
+    } else {
+        emit(OP_LOAD_NIL, 0, line)
+    }
+    emit(OP_RAISE, 0, line)
+}
+
+# ── expressions ──────────────────────────────────────────────────────────────
+
+fn compileExpr(node) {
+    let ln = node["line"]
+    let k = node["k"]
+    if k == "Number" or k == "String" {
+        emit(OP_LOAD_CONST, addConst(node["value"]), ln)
+    } else if k == "Bool" {
+        if node["value"] {
+            emit(OP_LOAD_TRUE, 0, ln)
+        } else {
+            emit(OP_LOAD_FALSE, 0, ln)
+        }
+    } else if k == "Nil" {
+        emit(OP_LOAD_NIL, 0, ln)
+    } else if k == "Ident" {
+        emitLoad(node["name"], ln)
+    } else if k == "Binary" {
+        compileBinary(node, ln)
+    } else if k == "Unary" {
+        compileUnary(node, ln)
+    } else if k == "Assign" {
+        compileAssign(node, ln)
+    } else if k == "Call" {
+        compileCall(node, ln)
+    } else if k == "Index" {
+        compileExpr(node["object"])
+        compileExpr(node["index"])
+        emit(OP_GET_INDEX, 0, ln)
+    } else if k == "Slice" {
+        compileSlice(node, ln)
+    } else if k == "Member" {
+        compileExpr(node["object"])
+        emit(OP_GET_MEMBER, addConst(node["member"]), ln)
+    } else if k == "Array" {
+        compileArray(node, ln)
+    } else if k == "Dict" {
+        compileDict(node, ln)
+    } else if k == "Tuple" {
+        for el in node["elements"] {
+            compileExpr(el)
+        }
+        emit(OP_MAKE_TUPLE, len(node["elements"]), ln)
+    } else if k == "Lambda" {
+        let noRef = []
+        for p in node["params"] {
+            noRef.push(false)
+        }
+        let fnChunk = compileFunction("lambda", node["params"], noRef, node["defaultArgs"], node["body"], ln, false)
+        emitFunctionValue(fnChunk, ln)
+    } else if k == "Ternary" {
+        compileTernary(node, ln)
+    } else if k == "ListComp" {
+        compileListComp(node, ln)
+    } else if k == "Super" {
+        # standalone super / super.method (a call is compileCall's)
+        emitLoad("self", ln)
+        if node["method"] != "" {
+            emit(OP_GET_SUPER, addConst(superKey(node["method"])), ln)
+        }
+    } else if k == "New" {
+        emitLoad(node["typeName"], ln)
+        for arg in node["args"] {
+            compileExpr(arg)
+        }
+        emit(OP_INSTANCE_NEW, len(node["args"]), ln)
+    } else if k == "AddressOf" {
+        compileExpr(node["operand"])
+        emit(OP_ADDRESS_OF, 0, ln)
+    } else if k == "Deref" {
+        compileExpr(node["operand"])
+        emit(OP_DEREF, 0, ln)
+    } else if k == "Arrow" {
+        compileExpr(node["object"])
+        emit(OP_ARROW, 0, ln)
+        emit(OP_GET_MEMBER, addConst(node["member"]), ln)
+    } else if k == "Return" {
+        compileReturn(node, ln)
+    } else if k == "Raise" {
+        # a raise expression never produces its value; the nil keeps the
+        # enclosing expression's stack shape balanced
+        compileRaise(node, ln)
+        emit(OP_LOAD_NIL, 0, ln)
+    } else {
+        cgError("Compiler: unhandled expression node")
+    }
+}
+
+fn compileBinary(e, line) {
+    let op = e["op"]
+    # `stream << x` with x a C/C++ double formats as a double
+    if op == "<<" and numericKind(e["right"]) == "f" {
+        emitLoad("__shl_float__", line)
+        compileExpr(e["left"])
+        compileExpr(e["right"])
+        emit(OP_CALL, 2, line)
+        return nil
+    }
+    if op == "and" or op == "&&" {
+        compileExpr(e["left"])
+        let sc = emitJump(OP_JUMP_IF_FALSE, line)
+        emit(OP_POP, 0, line)
+        compileExpr(e["right"])
+        patchJump(sc)
+        return nil
+    }
+    if op == "or" or op == "||" or op == "??" {
+        compileExpr(e["left"])
+        let sc = emitJump(OP_JUMP_IF_TRUE, line)
+        emit(OP_POP, 0, line)
+        compileExpr(e["right"])
+        patchJump(sc)
+        return nil
+    }
+    if op == "in" or op == "not in" {
+        emit(OP_LOAD_GLOBAL, addConst("__contains__"), line)
+        compileExpr(e["left"])
+        compileExpr(e["right"])
+        emit(OP_CALL, 2, line)
+        if op == "not in" {
+            emit(OP_NOT, 0, line)
+        }
+        return nil
+    }
+    compileExpr(e["left"])
+    compileExpr(e["right"])
+    if op in CG_BINARY_OPS {
+        emit(CG_BINARY_OPS[op], 0, line)
+    } else {
+        cgError("Compiler: unknown binary op '" + op + "'")
+    }
+    return nil
+}
+
+fn compileUnary(e, line) {
+    let op = e["op"]
+    compileExpr(e["operand"])
+    if op == "..." {
+        return nil
+    }
+    if op == "-" {
+        emit(OP_NEG, 0, line)
+    } else if op == "!" or op == "not" {
+        emit(OP_NOT, 0, line)
+    } else if op == "~" {
+        emit(OP_BIT_NOT, 0, line)
+    } else if op == "++" or op == "--" {
+        emit(OP_LOAD_CONST, addConst(1), line)
+        if op == "++" {
+            emit(OP_ADD, 0, line)
+        } else {
+            emit(OP_SUB, 0, line)
+        }
+        if e["operand"]["k"] == "Ident" {
+            emit(OP_DUP, 0, line)
+            emitStore(e["operand"]["name"], line)
+            emit(OP_POP, 0, line)
+        }
+    } else {
+        cgError("Compiler: unknown unary op '" + op + "'")
+    }
+    return nil
+}
+
+fn cgEmitCompound(normalizedOp, line) {
+    if normalizedOp in CG_COMPOUND_OPS {
+        emit(CG_COMPOUND_OPS[normalizedOp], 0, line)
+    }
+}
+
+fn cgPostOp(op) {
+    if op == "post+=" {
+        return OP_ADD
+    }
+    return OP_SUB
+}
+
+fn compileAssign(e, line) {
+    let op = e["op"]
+    let normalizedOp = op
+    if op == "post+=" {
+        normalizedOp = "+="
+    } else if op == "post-=" {
+        normalizedOp = "-="
+    } else if op == "kwarg" {
+        normalizedOp = "="
+    }
+    let compound = normalizedOp != "="
+    let isPost = op == "post+=" or op == "post-="
+    let target = e["target"]
+    let tk = target["k"]
+
+    if op == "unpack" and tk == "Tuple" {
+        compileExpr(e["value"])
+        let i = 0
+        for t in target["elements"] {
+            if t["k"] == "Ident" {
+                emit(OP_DUP, 0, line)
+                emit(OP_LOAD_CONST, addConst(i), line)
+                emit(OP_GET_INDEX, 0, line)
+                emitStore(t["name"], line)
+                emit(OP_POP, 0, line)
+            }
+            i = i + 1
+        }
+        return nil
+    }
+
+    if tk == "Ident" {
+        let name = target["name"]
+        if isPost {
+            emitLoad(name, line)
+            emit(OP_DUP, 0, line)
+            compileExpr(e["value"])
+            emit(cgPostOp(op), 0, line)
+            emitStore(name, line)
+            emit(OP_POP, 0, line)
+            return nil
+        }
+        if compound {
+            emitLoad(name, line)
+        }
+        compileExpr(e["value"])
+        if compound {
+            cgEmitCompound(normalizedOp, line)
+        }
+        # every store leaves the value on the stack: it is the expression's value
+        emitStore(name, line)
+        return nil
+    }
+
+    if tk == "Index" {
+        if compound {
+            compileExpr(target["object"])
+            compileExpr(target["index"])
+            emit(OP_DUP_TWO, 0, line)
+            emit(OP_GET_INDEX, 0, line)
+            compileExpr(e["value"])
+            cgEmitCompound(normalizedOp, line)
+            emit(OP_SET_INDEX_COMPOUND, 0, line)
+            return nil
+        }
+        # SET_INDEX expects: val (bottom), obj, key (top)
+        compileExpr(e["value"])
+        compileExpr(target["object"])
+        compileExpr(target["index"])
+        emit(OP_SET_INDEX, 0, line)
+        return nil
+    }
+
+    if tk == "Member" or tk == "Arrow" {
+        # `->` is the member case with an ARROW after the object
+        let arrow = tk == "Arrow"
+        let member = target["member"]
+        if isPost {
+            compileExpr(target["object"])
+            if arrow {
+                emit(OP_ARROW, 0, line)
+            }
+            emit(OP_GET_MEMBER, addConst(member), line)
+            emit(OP_DUP, 0, line)
+            compileExpr(e["value"])
+            emit(cgPostOp(op), 0, line)
+            compileExpr(target["object"])
+            if arrow {
+                emit(OP_ARROW, 0, line)
+            }
+            emit(OP_SWAP, 0, line)
+            emit(OP_SET_MEMBER, addConst(member), line)
+            emit(OP_POP, 0, line)
+            return nil
+        }
+        if compound {
+            compileExpr(target["object"])
+            if arrow {
+                emit(OP_ARROW, 0, line)
+            }
+            emit(OP_GET_MEMBER, addConst(member), line)
+            compileExpr(e["value"])
+            cgEmitCompound(normalizedOp, line)
+            emit(OP_DUP, 0, line)
+            compileExpr(target["object"])
+            if arrow {
+                emit(OP_ARROW, 0, line)
+            }
+            emit(OP_SWAP, 0, line)
+            emit(OP_SET_MEMBER, addConst(member), line)
+            emit(OP_POP, 0, line)
+            return nil
+        }
+        compileExpr(e["value"])
+        emit(OP_DUP, 0, line)
+        compileExpr(target["object"])
+        if arrow {
+            emit(OP_ARROW, 0, line)
+        }
+        emit(OP_SWAP, 0, line)
+        emit(OP_SET_MEMBER, addConst(member), line)
+        emit(OP_POP, 0, line)
+        return nil
+    }
+
+    # fallback: evaluate the right side and leave it on the stack
+    compileExpr(e["value"])
+    return nil
+}
+
+# ── calls ────────────────────────────────────────────────────────────────────
+
+# int32 truncation of a number literal's value
+fn cgTrunc(v) {
+    if v < 0 {
+        return -floor(-v)
+    }
+    return floor(v)
+}
+
+# Java front-end intrinsics: calls to __jx_*__ names compile to J_* opcodes.
+# False when the call is not one.
+fn compileJavaIntrinsic(e, line) {
+    let fname = e["callee"]["name"]
+    let a = e["args"]
+    let n = len(a)
+    let str0 = ""
+    if n > 0 and a[0]["k"] == "String" {
+        str0 = a[0]["value"]
+    }
+    let str1 = ""
+    if n > 1 and a[1]["k"] == "String" {
+        str1 = a[1]["value"]
+    }
+    let op0 = 0
+    if n > 0 and a[0]["k"] == "Number" {
+        op0 = cgTrunc(a[0]["value"])
+    }
+    if fname == "__jx_int__" {
+        emit(OP_LOAD_CONST, addConst({"long": str0}), line)
+        return true
+    }
+    if fname == "__jx_bin__" and n == 3 {
+        compileExpr(a[1])
+        compileExpr(a[2])
+        emit(OP_J_BIN, op0, line)
+        return true
+    }
+    if fname == "__jx_un__" and n == 2 {
+        compileExpr(a[1])
+        emit(OP_J_UN, op0, line)
+        return true
+    }
+    if fname == "__jx_inv__" and n >= 2 {
+        let desc = str0
+        if a[0]["k"] == "Array" {
+            desc = []
+            for el in a[0]["elements"] {
+                desc.push(el["value"])
+            }
+        }
+        let argc = n - 2
+        emit(OP_LOAD_NIL, 0, line)
+        let i = 1
+        while i < n {
+            compileExpr(a[i])
+            i = i + 1
+        }
+        emit(OP_J_INVOKE, (addConst(desc) << 8) | argc, line)
+        return true
+    }
+    if fname == "__jx_getf__" and n == 2 {
+        compileExpr(a[0])
+        emit(OP_J_GETF, addConst(str1), line)
+        return true
+    }
+    if fname == "__jx_putf__" and n == 3 {
+        compileExpr(a[0])
+        compileExpr(a[2])
+        emit(OP_J_PUTF, addConst(str1), line)
+        return true
+    }
+    if fname == "__jx_fupd__" and n == 3 {
+        compileExpr(a[0])
+        emit(OP_DUP, 0, line)
+        emit(OP_J_GETF, addConst(str1), line)
+        compileExpr(a[2])
+        emit(OP_J_PUTF, addConst(str1), line)
+        return true
+    }
+    if fname == "__jx_aload__" and n == 2 {
+        compileExpr(a[0])
+        compileExpr(a[1])
+        emit(OP_J_ALOAD, 0, line)
+        return true
+    }
+    if fname == "__jx_astore__" and n == 3 {
+        compileExpr(a[0])
+        compileExpr(a[1])
+        compileExpr(a[2])
+        emit(OP_J_ASTORE, 0, line)
+        return true
+    }
+    if fname == "__jx_aupd__" and n == 3 {
+        compileExpr(a[0])
+        compileExpr(a[1])
+        emit(OP_DUP_TWO, 0, line)
+        emit(OP_J_ALOAD, 0, line)
+        compileExpr(a[2])
+        emit(OP_J_ASTORE, 0, line)
+        return true
+    }
+    if fname == "__jx_old__" {
+        return true
+    }
+    if fname == "__jx_seq__" and n > 0 {
+        let i = 0
+        while i < n {
+            compileExpr(a[i])
+            if i + 1 < n {
+                emit(OP_POP, 0, line)
+            }
+            i = i + 1
+        }
+        return true
+    }
+    if (fname == "__jx_instof__" or fname == "__jx_cast__") and n == 2 {
+        compileExpr(a[0])
+        if fname == "__jx_cast__" {
+            emit(OP_J_CAST, addConst(str1), line)
+        } else {
+            emit(OP_J_INSTOF, addConst(str1), line)
+        }
+        return true
+    }
+    return false
+}
+
+# Emits the CALL, preceded by KW_NAMES when any argument is named.
+fn cgEmitCallWithNames(kwNames, argCount, line) {
+    let anyKw = false
+    for nm in kwNames {
+        if nm != "" {
+            anyKw = true
+        }
+    }
+    if anyKw and len(kwNames) == argCount {
+        emit(OP_KW_NAMES, addConst(kwNames.join(UNIT_SEP)), line)
+    }
+    emit(OP_CALL, argCount, line)
+}
+
+# Pushes one argument's value(s), recording keyword names in kwNames;
+# returns how many values it pushed.
+fn cgEmitArgValues(arg, kwNames) {
+    if arg["k"] == "Assign" {
+        let op = arg["op"]
+        let target = arg["target"]
+        if op == "kwarg" and target["k"] == "Ident" {
+            # Python f(key=value): just the value, bound by name
+            compileExpr(arg["value"])
+            kwNames.push(target["name"])
+            return 1
+        }
+        if op == "=" and target["k"] == "Ident" {
+            # f(name = value): the whole assignment, which leaves its value
+            compileExpr(arg)
+            kwNames.push(target["name"])
+            return 1
+        }
+        if op == "unpack" and target["k"] == "Tuple" {
+            let targets = target["elements"]
+            if len(targets) > 0 {
+                let i = 0
+                while i + 1 < len(targets) {
+                    compileExpr(targets[i])
+                    i = i + 1
+                }
+                compileExpr(arg["value"])
+                for t in targets {
+                    kwNames.push("")
+                }
+                return len(targets)
+            }
+        }
+    }
+    compileExpr(arg)
+    kwNames.push("")
+    return 1
+}
+
+# `f(*args)` forwarding a declared Python *args parameter (the parser reads
+# the `*` as a dereference)
+fn cgIsVarargSplat(arg) {
+    if arg["k"] != "Deref" or arg["operand"]["k"] != "Ident" {
+        return false
+    }
+    let starred = "*" + arg["operand"]["name"]
+    let st = CG_CUR
+    while st != nil {
+        for p in st["chunk"]["params"] {
+            if p == starred {
+                return true
+            }
+        }
+        st = st["enclosing"]
+    }
+    return false
+}
+
+fn compileCall(e, line) {
+    let callee = e["callee"]
+    let args = e["args"]
+    if callee["k"] == "Ident" and callee["name"].startsWith("__jx_") and compileJavaIntrinsic(e, line) {
+        return nil
+    }
+    # `cout << x` segment: tell __cout__ whether x is a double (1) or an integer (2)
+    if callee["k"] == "Ident" and callee["name"] == "__cout__" and len(args) > 0 and len(args) <= 2 {
+        let kind = numericKind(args[0])
+        if kind != "" {
+            if len(args) == 1 {
+                args.push(nString("", line))
+            }
+            if kind == "f" {
+                args.push(nNumber(1, line))
+            } else {
+                args.push(nNumber(2, line))
+            }
+        }
+    }
+    # `cin >> x`: extract as x's declared type
+    if callee["k"] == "Ident" and callee["name"] == "__cin__" and len(args) == 1 {
+        let kind = cinKind(args[0])
+        if kind != 0 {
+            args.push(nNumber(kind, line))
+        }
+    }
+    let kwNames = []
+
+    let hasSpread = false
+    for arg in args {
+        if cgIsVarargSplat(arg) {
+            hasSpread = true
+            break
+        }
+        if arg["k"] == "Unary" and (arg["op"] == "..." or arg["op"] == "**") {
+            hasSpread = true
+            break
+        }
+    }
+    if hasSpread {
+        emit(OP_LOAD_GLOBAL, addConst("__call_spread__"), line)
+        compileExpr(callee)
+        emit(OP_MAKE_ARRAY, 0, line)
+        for arg in args {
+            let isSplat = cgIsVarargSplat(arg)
+            let isSpread = isSplat or (arg["k"] == "Unary" and (arg["op"] == "..." or arg["op"] == "**"))
+            if isSpread {
+                emit(OP_LOAD_GLOBAL, addConst("__array_extend__"), line)
+            } else {
+                emit(OP_LOAD_GLOBAL, addConst("__listcomp_push__"), line)
+            }
+            emit(OP_SWAP, 0, line)
+            if isSplat {
+                compileExpr(arg["operand"])
+            } else if isSpread {
+                compileExpr(arg["operand"])
+            } else {
+                cgEmitArgValues(arg, kwNames)
+            }
+            emit(OP_CALL, 2, line)
+        }
+        emit(OP_CALL, 2, line)
+        return nil
+    }
+
+    # super(args)
+    if callee["k"] == "Super" and callee["method"] == "" {
+        emitLoad("self", line)
+        emit(OP_GET_SUPER, addConst(superKey("__init__")), line)
+        cgEmitArgsAndCall(args, kwNames, line)
+        return nil
+    }
+
+    if callee["k"] == "Member" {
+        let obj = callee["object"]
+        # super.method(args) / super().method(args)
+        if obj["k"] == "Super" or (obj["k"] == "Call" and obj["callee"]["k"] == "Super" and obj["callee"]["method"] == "") {
+            emitLoad("self", line)
+            emit(OP_GET_SUPER, addConst(superKey(callee["member"])), line)
+            cgEmitArgsAndCall(args, kwNames, line)
+            return nil
+        }
+        compileExpr(obj)
+        emit(OP_GET_MEMBER, addConst(callee["member"]), line)
+        cgEmitArgsAndCall(args, kwNames, line)
+        return nil
+    }
+    # obj->method(args): the member call with an ARROW on the receiver
+    if callee["k"] == "Arrow" {
+        compileExpr(callee["object"])
+        emit(OP_ARROW, 0, line)
+        emit(OP_GET_MEMBER, addConst(callee["member"]), line)
+        cgEmitArgsAndCall(args, kwNames, line)
+        return nil
+    }
+    # reverse(s.begin(), ...) / sort(...) on a std::string: s = __str_inplace__(s, ...)
+    if callee["k"] == "Ident" and len(args) >= 2 and args[0]["k"] == "Call" {
+        let fname = callee["name"]
+        let first = args[0]
+        let fc = first["callee"]
+        if (fname == "reverse" or fname == "sort" or fname == "stable_sort") and len(first["args"]) == 0 and fc["k"] == "Member" and fc["member"] == "begin" and fc["object"]["k"] == "Ident" {
+            let target = fc["object"]["name"]
+            emit(OP_LOAD_GLOBAL, addConst("__str_inplace__"), line)
+            emitLoad(target, line)
+            compileExpr(callee)
+            for arg in args {
+                compileExpr(arg)
+            }
+            emit(OP_CALL, len(args), line)
+            emit(OP_CALL, 2, line)
+            emitStore(target, line)
+            return nil
+        }
+    }
+    compileExpr(callee)
+    cgEmitArgsAndCall(args, kwNames, line)
+    return nil
+}
+
+fn cgEmitArgsAndCall(args, kwNames, line) {
+    let argCount = 0
+    for arg in args {
+        argCount = argCount + cgEmitArgValues(arg, kwNames)
+    }
+    cgEmitCallWithNames(kwNames, argCount, line)
+}
+
+fn compileSlice(e, line) {
+    emit(OP_LOAD_GLOBAL, addConst("__slice__"), line)
+    compileExpr(e["object"])
+    for part in [e["start"], e["stop"], e["step"]] {
+        if part != nil {
+            compileExpr(part)
+        } else {
+            emit(OP_LOAD_NIL, 0, line)
+        }
+    }
+    emit(OP_CALL, 4, line)
+}
+
+fn compileArray(e, line) {
+    let hasSpread = false
+    for el in e["elements"] {
+        if el["k"] == "Unary" and el["op"] == "..." {
+            hasSpread = true
+            break
+        }
+    }
+    if hasSpread {
+        emit(OP_MAKE_ARRAY, 0, line)
+        for el in e["elements"] {
+            let isSpread = el["k"] == "Unary" and el["op"] == "..."
+            if isSpread {
+                emit(OP_LOAD_GLOBAL, addConst("__array_extend__"), line)
+                emit(OP_SWAP, 0, line)
+                compileExpr(el["operand"])
+            } else {
+                emit(OP_LOAD_GLOBAL, addConst("__listcomp_push__"), line)
+                emit(OP_SWAP, 0, line)
+                compileExpr(el)
+            }
+            emit(OP_CALL, 2, line)
+        }
+        return nil
+    }
+    for el in e["elements"] {
+        compileExpr(el)
+    }
+    emit(OP_MAKE_ARRAY, len(e["elements"]), line)
+    return nil
+}
+
+fn compileDict(e, line) {
+    let hasSpread = false
+    for p in e["pairs"] {
+        if p[0] == nil {
+            hasSpread = true
+            break
+        }
+    }
+    if hasSpread {
+        emit(OP_MAKE_DICT, 0, line)
+        for p in e["pairs"] {
+            if p[0] == nil {
+                emit(OP_LOAD_GLOBAL, addConst("__dict_merge__"), line)
+                emit(OP_SWAP, 0, line)
+                compileExpr(p[1])
+                emit(OP_CALL, 2, line)
+                continue
+            }
+            emit(OP_LOAD_GLOBAL, addConst("__dict_set__"), line)
+            emit(OP_SWAP, 0, line)
+            compileExpr(p[0])
+            compileExpr(p[1])
+            emit(OP_CALL, 3, line)
+        }
+        return nil
+    }
+    for p in e["pairs"] {
+        compileExpr(p[0])
+        compileExpr(p[1])
+    }
+    emit(OP_MAKE_DICT, len(e["pairs"]), line)
+    return nil
+}
+
+fn compileTernary(e, line) {
+    compileExpr(e["condition"])
+    let elseJump = emitJump(OP_JUMP_IF_FALSE, line)
+    emit(OP_POP, 0, line)
+    compileExpr(e["thenExpr"])
+    let endJump = emitJump(OP_JUMP, line)
+    patchJump(elseJump)
+    emit(OP_POP, 0, line)
+    compileExpr(e["elseExpr"])
+    patchJump(endJump)
+}
+
+# The upvalue descriptors, packed as a function's last constant for MAKE_CLOSURE.
+fn cgFinishFunction(state) {
+    let result = state["chunk"]
+    result["upvalueCount"] = len(state["upvalues"])
+    let descs = []
+    for uv in state["upvalues"] {
+        if uv["isLocal"] {
+            descs.push([1, uv["index"]])
+        } else {
+            descs.push([0, uv["index"]])
+        }
+    }
+    result["constants"].push(descs)
+    return result
+}
+
+fn compileListComp(e, line) {
+    let fnState = cgNewState("<listcomp>", CG_CUR)
+    fnState["isFunction"] = true
+    let prev = CG_CUR
+    CG_CUR = fnState
+
+    beginScope()
+    let resultName = "__result__"
+    emit(OP_MAKE_ARRAY, 0, line)
+    declareLocal(resultName, line)
+    emit(OP_DEFINE_LOCAL, cgLastLocal(), line)
+
+    beginScope()
+    compileExpr(e["iterable"])
+    emit(OP_MAKE_ITER, 0, line)
+    declareLocal("__iter__", line)
+    emit(OP_DEFINE_LOCAL, cgLastLocal(), line)
+
+    let loopStart = len(cgCode())
+    beginLoop(loopStart)
+    let exitJump = emitJump(OP_FOR_ITER, line)
+
+    beginScope()
+    for v in e["vars"] {
+        declareLocal(v, line)
+        emit(OP_DEFINE_LOCAL, cgLastLocal(), line)
+    }
+    if e["condition"] != nil {
+        compileExpr(e["condition"])
+        let skipJump = emitJump(OP_JUMP_IF_FALSE, line)
+        emit(OP_POP, 0, line)
+        compileExpr(e["expr"])
+        cgPushToResult(resultName, line)
+        let jmp = emitJump(OP_JUMP, line)
+        patchJump(skipJump)
+        emit(OP_POP, 0, line)
+        patchJump(jmp)
+    } else {
+        compileExpr(e["expr"])
+        cgPushToResult(resultName, line)
+    }
+    endScope(line)
+    cgPatchContinues()
+    emit(OP_LOOP, len(cgCode()) - loopStart + 1, line)
+    patchJump(exitJump)
+    endLoop()
+    endScope(line)
+
+    emitLoad(resultName, line)
+    endScope(line)
+    emit(OP_RETURN, 0, line)
+    emit(OP_RETURN_NIL, 0, line)
+
+    let result = cgFinishFunction(fnState)
+    CG_CUR = prev
+    emitFunctionValue(result, line)
+    emit(OP_CALL, 0, line)
+}
+
+fn cgPushToResult(resultName, line) {
+    emitLoad(resultName, line)
+    emit(OP_GET_MEMBER, addConst("push"), line)
+    emit(OP_SWAP, 0, line)
+    emit(OP_CALL, 1, line)
+    emit(OP_POP, 0, line)
+}
+
+# ── functions ────────────────────────────────────────────────────────────────
+
+fn cgStripStars(p) {
+    while len(p) > 0 and p[0] == "*" {
+        p = p.slice(1)
+    }
+    return p
+}
+
+# Python scoping for a `def` body: a name is local when its first
+# occurrence, in evaluation order, is a plain assignment; global/nonlocal
+# names never are. Nested functions, lambdas and classes are not scanned.
+fn pyScanWrite(scan, name) {
+    if !(name in scan["seen"]) and !(name in scan["excluded"]) {
+        scan["locals"].push(name)
+    }
+    scan["seen"][name] = true
+}
+
+fn pyScanVisit(scan, n) {
+    if n == nil {
+        return nil
+    }
+    let k = n["k"]
+    if k == "Ident" {
+        scan["seen"][n["name"]] = true
+    } else if k == "Global" {
+        for name in n["names"] {
+            scan["excluded"][name] = true
+            scan["seen"][name] = true
+        }
+    } else if k == "Assign" {
+        pyScanVisit(scan, n["value"])
+        if n["op"] == "kwarg" {
+            return nil
+        }
+        let t = n["target"]
+        if t != nil and t["k"] == "Ident" {
+            if n["op"] == "=" {
+                pyScanWrite(scan, t["name"])
+            } else {
+                scan["seen"][t["name"]] = true
+            }
+        } else if t != nil and t["k"] == "Tuple" {
+            for el in t["elements"] {
+                if el["k"] == "Ident" {
+                    pyScanWrite(scan, el["name"])
+                }
+            }
+        } else {
+            pyScanVisit(scan, t)
+        }
+    } else if k == "Binary" {
+        pyScanVisit(scan, n["left"])
+        pyScanVisit(scan, n["right"])
+    } else if k == "Unary" or k == "AddressOf" or k == "Deref" {
+        pyScanVisit(scan, n["operand"])
+    } else if k == "Call" {
+        pyScanVisit(scan, n["callee"])
+        for a in n["args"] {
+            pyScanVisit(scan, a)
+        }
+    } else if k == "Index" {
+        pyScanVisit(scan, n["object"])
+        pyScanVisit(scan, n["index"])
+    } else if k == "Slice" {
+        pyScanVisit(scan, n["object"])
+        pyScanVisit(scan, n["start"])
+        pyScanVisit(scan, n["stop"])
+        pyScanVisit(scan, n["step"])
+    } else if k == "Member" or k == "Arrow" {
+        pyScanVisit(scan, n["object"])
+    } else if k == "Array" or k == "Tuple" {
+        for el in n["elements"] {
+            pyScanVisit(scan, el)
+        }
+    } else if k == "Dict" {
+        for p in n["pairs"] {
+            pyScanVisit(scan, p[0])
+            pyScanVisit(scan, p[1])
+        }
+    } else if k == "ListComp" {
+        pyScanVisit(scan, n["iterable"])
+        pyScanVisit(scan, n["expr"])
+        pyScanVisit(scan, n["condition"])
+    } else if k == "Ternary" {
+        pyScanVisit(scan, n["condition"])
+        pyScanVisit(scan, n["thenExpr"])
+        pyScanVisit(scan, n["elseExpr"])
+    } else if k == "New" {
+        for a in n["args"] {
+            pyScanVisit(scan, a)
+        }
+        pyScanVisit(scan, n["sizeExpr"])
+    } else if k == "VarDecl" {
+        pyScanVisit(scan, n["initializer"])
+    } else if k == "Return" or k == "Raise" {
+        pyScanVisit(scan, n["value"])
+    } else if k == "If" {
+        pyScanVisit(scan, n["condition"])
+        pyScanVisit(scan, n["thenBranch"])
+        pyScanVisit(scan, n["elseBranch"])
+    } else if k == "While" {
+        pyScanVisit(scan, n["condition"])
+        pyScanVisit(scan, n["body"])
+        pyScanVisit(scan, n["post"])
+    } else if k == "For" {
+        pyScanVisit(scan, n["iterable"])
+        pyScanVisit(scan, n["body"])
+    } else if k == "Block" {
+        for s in n["statements"] {
+            pyScanVisit(scan, s)
+        }
+    } else if k == "ExprStmt" {
+        pyScanVisit(scan, n["expr"])
+    } else if k == "Print" {
+        for a in n["args"] {
+            pyScanVisit(scan, a)
+        }
+    } else if k == "Try" {
+        pyScanVisit(scan, n["body"])
+        for h in n["handlers"] {
+            pyScanVisit(scan, h["body"])
+        }
+        pyScanVisit(scan, n["finallyBody"])
+    }
+    return nil
+}
+
+# Compiles a function body into a new chunk.
+fn compileFunction(name, params, paramIsRef, defaultArgs, body, line, pythonScope) {
+    let fnState = cgNewState(name, CG_CUR)
+    fnState["isFunction"] = true
+    let prev = CG_CUR
+    CG_CUR = fnState
+
+    beginScope()
+    for p in params {
+        declareLocal(cgStripStars(p), line)
+    }
+    # declared C/C++ parameter types (set by the caller for this function only)
+    let i = 0
+    while i < len(CG_PENDING_PTYPES) and i < len(fnState["locals"]) {
+        fnState["locals"][i]["cType"] = CG_PENDING_PTYPES[i]
+        i = i + 1
+    }
+    CG_PENDING_PTYPES = []
+
+    let chunk = fnState["chunk"]
+    chunk["params"] = params.slice(0)
+    if len(paramIsRef) == 0 {
+        let refs = []
+        for p in params {
+            refs.push(false)
+        }
+        chunk["paramIsRef"] = refs
+    } else {
+        chunk["paramIsRef"] = paramIsRef.slice(0)
+    }
+
+    i = 0
+    while i < len(defaultArgs) {
+        if defaultArgs[i] != nil {
+            # only an omitted argument takes the default; an explicit nil is a value
+            emit(OP_ARG_PASSED, i, line)
+            let jumpIfPassed = emitJump(OP_JUMP_IF_TRUE, line)
+            emit(OP_POP, 0, line)
+            compileExpr(defaultArgs[i])
+            emit(OP_STORE_LOCAL, i, line)
+            emit(OP_POP, 0, line)
+            let jumpEnd = emitJump(OP_JUMP, line)
+            patchJump(jumpIfPassed)
+            emit(OP_POP, 0, line)
+            patchJump(jumpEnd)
+        }
+        i = i + 1
+    }
+
+    # destructured parameters: ([a, b]) => ...
+    let paramIndex = 0
+    while paramIndex < len(params) {
+        let param = params[paramIndex]
+        if len(param) >= 2 and param[0] == "[" and param[len(param) - 1] == "]" {
+            let names = []
+            let cur = ""
+            let j = 1
+            while j + 1 < len(param) {
+                let ch = param[j]
+                if ch == "," {
+                    names.push(cur)
+                    cur = ""
+                } else if !cgIsSpace(ch) {
+                    cur = cur + ch
+                }
+                j = j + 1
+            }
+            names.push(cur)
+            let elementIndex = 0
+            for nm in names {
+                if nm != "" {
+                    emit(OP_LOAD_LOCAL, paramIndex, line)
+                    emit(OP_LOAD_CONST, addConst(elementIndex), line)
+                    emit(OP_GET_INDEX, 0, line)
+                    declareLocal(nm, line)
+                    emit(OP_DEFINE_LOCAL, cgLastLocal(), line)
+                }
+                elementIndex = elementIndex + 1
+            }
+        }
+        paramIndex = paramIndex + 1
+    }
+
+    if pythonScope and body != nil {
+        let scan = {"seen": {}, "excluded": {}, "locals": []}
+        for p in params {
+            scan["seen"][cgStripStars(p)] = true
+        }
+        pyScanVisit(scan, body)
+        for local in scan["locals"] {
+            if resolveLocal(CG_CUR, local) != -1 {
+                continue
+            }
+            emit(OP_LOAD_NIL, 0, line)
+            declareLocal(local, line)
+            emit(OP_DEFINE_LOCAL, cgLastLocal(), line)
+        }
+    }
+
+    if body != nil {
+        if body["k"] == "Block" {
+            compileBlock(body)
+        } else {
+            compileExpr(body)
+            emit(OP_RETURN, 0, line)
+        }
+    }
+    emit(OP_RETURN_NIL, 0, line)
+    endScope(line)
+
+    let result = cgFinishFunction(fnState)
+    CG_CUR = prev
+    return result
+}

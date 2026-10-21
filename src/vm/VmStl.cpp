@@ -227,7 +227,7 @@ bool VM::userStreamText(const QuantumValue &v, std::string &out)
 
 void VM::registerStlNatives()
 {
-    // ── C++ ostream formatting (see Parser::parseStreamInsertions) ─────────
+    // ── C++ ostream formatting (see parseStreamInsertions in selfhost/parser_stmt2.sa) ─────────
     {
         auto st = std::make_shared<StreamState>();
         auto nat = [&](const std::string &name, QuantumNativeFunc fn)
@@ -267,7 +267,7 @@ void VM::registerStlNatives()
                 s = st->boolalpha ? (v.asBool() ? "true" : "false") : (v.asBool() ? "1" : "0");
             else if (v.isNumber())
             {
-                // a[2]: the declared kind (Compiler::compileCall) — 1 double, 2 integer
+                // a[2]: the declared kind (compileCall in selfhost/codegen.sa) — 1 double, 2 integer
                 int kind = a.size() > 2 && a[2].isNumber() ? (int)a[2].asNumber() : 0;
                 s = formatNumber(v.asNumber(), *st, kind);
             }
@@ -330,7 +330,7 @@ void VM::registerStlNatives()
         nat("ostringstream", stringStream);
         nat("stringstream", stringStream);
 
-        // `L << x` where x is declared a C/C++ double (Compiler::compileBinary):
+        // `L << x` where x is declared a C/C++ double (compileBinary in selfhost/codegen.sa):
         // a stream gets x formatted as a double; anything else behaves like
         // Op::LSHIFT.
         nat("__shl_float__", [this](std::vector<QuantumValue> a) -> QuantumValue
@@ -379,7 +379,7 @@ void VM::registerStlNatives()
     auto endOf = [](const Range &r)
     { return makeStlIterator(r.arr, r.e); };
 
-    // See Compiler::compileCall: `s = __str_inplace__(s, reverse(s.begin(), s.end()))`.
+    // See compileCall in selfhost/codegen.sa: `s = __str_inplace__(s, reverse(s.begin(), s.end()))`.
     reg("__str_inplace__", [](std::vector<QuantumValue> a) -> QuantumValue
         {
         if (a.size() > 1 && a[0].isString() && a[1].isString()) return a[1];

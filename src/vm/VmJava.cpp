@@ -38,7 +38,7 @@ int64_t jint(const QV &v)
         return (int64_t)*d;
     if (auto b = std::get_if<bool>(&v.data))
         return *b ? 1 : 0;
-    if (auto s = std::get_if<std::string>(&v.data))
+    if (auto s = v.strPtr())
         return s->empty() ? 0 : (int64_t)u16At(*s, 0);
     if (v.isNil())
         jthrow("java.lang.NullPointerException", "");
@@ -53,7 +53,7 @@ double jdouble(const QV &v)
         return (double)*p;
     if (auto b = std::get_if<bool>(&v.data))
         return *b ? 1 : 0;
-    if (auto s = std::get_if<std::string>(&v.data))
+    if (auto s = v.strPtr())
         return s->empty() ? 0 : (double)u16At(*s, 0);
     if (v.isNil())
         jthrow("java.lang.NullPointerException", "");
@@ -324,8 +324,8 @@ bool sameRef(const QV &a, const QV &b)
         return *p == std::get<int64_t>(b.data);
     if (auto d = std::get_if<double>(&a.data))
         return *d == std::get<double>(b.data);
-    if (auto s = std::get_if<std::string>(&a.data))
-        return *s == std::get<std::string>(b.data);
+    if (auto s = a.strPtr())
+        return *s == b.strRef();
     if (a.isBool())
         return a.asBool() == b.asBool();
     if (a.isInstance())
@@ -501,8 +501,8 @@ QV javaBin(int op, const QV &a, const QV &b)
     }
     case SCAT:
     {
-        const std::string *x = std::get_if<std::string>(&a.data);
-        const std::string *y = std::get_if<std::string>(&b.data);
+        const std::string *x = a.strPtr();
+        const std::string *y = b.strPtr();
         std::string r;
         r.reserve((x ? x->size() : 4) + (y ? y->size() : 4));
         r += x ? *x : javaUn(VSTR, a).asString();
@@ -796,12 +796,12 @@ void VM::javaInvoke(const QV &desc, size_t recvIdx, int argc, int line, Chunk::I
     const std::string *key;
     const std::string *fallback = nullptr;
     if (desc.isString())
-        key = &std::get<std::string>(desc.data);
+        key = &desc.strRef();
     else
     {
         const Array &d = *desc.asArray();
-        key = &std::get<std::string>(d[0].data);
-        fallback = &std::get<std::string>(d[1].data);
+        key = &d[0].strRef();
+        fallback = &d[1].strRef();
     }
     QV &recv = stack_[recvIdx];
     if (auto inst = std::get_if<std::shared_ptr<QuantumInstance>>(&recv.data))

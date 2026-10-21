@@ -1,0 +1,204 @@
+# Bytecode files, written in Quantum: a port of src/Serializer.cpp. The
+# output is a string of bytes in exactly Serializer::serialize's format
+# (little-endian, IEEE-754 doubles), ready for write_file.
+
+let SER_BYTES = []
+let SER_I = 0
+while SER_I < 256 {
+    SER_BYTES.push(chr(SER_I))
+    SER_I = SER_I + 1
+}
+
+let SER_2_32 = 4294967296
+let SER_2_52 = 4503599627370496
+
+# value tags (enum class ValueType)
+let VAL_NIL = 0
+let VAL_BOOL = 1
+let VAL_NUMBER = 2
+let VAL_STRING = 3
+let VAL_ARRAY = 4
+let VAL_CLOSURE = 5
+let VAL_LONG = 6
+
+fn serU8(out, b) {
+    out.push(SER_BYTES[b])
+}
+
+# a 32-bit integer (negative ones as two's complement)
+fn serU32(out, n) {
+    if n < 0 {
+        n = n + SER_2_32
+    }
+    out.push(SER_BYTES[n % 256])
+    n = floor(n / 256)
+    out.push(SER_BYTES[n % 256])
+    n = floor(n / 256)
+    out.push(SER_BYTES[n % 256])
+    n = floor(n / 256)
+    out.push(SER_BYTES[n % 256])
+}
+
+# A double as its IEEE-754 bits: [low word, high word]. Scaling by 2 is
+# exact, so the exponent search loses nothing.
+fn serF64Words(v) {
+    let sign = 0
+    if v < 0 {
+        sign = 1
+        v = -v
+    }
+    if v != v {
+        return [0, 2146959360]
+    }
+    if v == 0 {
+        # -0.0 (the Java front-end emits it): atan2 tells the zeros apart
+        if atan2(v, -1) < 0 {
+            sign = 1
+        }
+        return [0, sign * 2147483648]
+    }
+    if v - v != 0 {
+        return [0, sign * 2147483648 + 2146435072]
+    }
+    let e = 0
+    let m = v
+    while m >= 2 {
+        m = m / 2
+        e = e + 1
+    }
+    while m < 1 {
+        m = m * 2
+        e = e - 1
+    }
+    let biased = e + 1023
+    let mant = 0
+    if biased <= 0 {
+        # subnormal: v / 2^-1074, scaled in two exact steps
+        let s = 1
+        let i = 0
+        while i < 537 {
+            s = s * 2
+            i = i + 1
+        }
+        mant = v * s * s
+        biased = 0
+    } else {
+        mant = (m - 1) * SER_2_52
+    }
+    let low = mant % SER_2_32
+    let high = sign * 2147483648 + biased * 1048576 + floor(mant / SER_2_32)
+    return [low, high]
+}
+
+fn serF64(out, v) {
+    let w = serF64Words(v)
+    serU32(out, w[0])
+    serU32(out, w[1])
+}
+
+# A 64-bit integer from its decimal spelling, two's complement.
+fn serI64(out, text) {
+    let neg = false
+    let i = 0
+    if len(text) > 0 and (text[0] == "-" or text[0] == "+") {
+        neg = text[0] == "-"
+        i = 1
+    }
+    let lo = 0
+    let hi = 0
+    while i < len(text) {
+        let d = ord(text[i]) - 48
+        if d < 0 or d > 9 {
+            break
+        }
+        lo = lo * 10 + d
+        let carry = floor(lo / SER_2_32)
+        lo = lo % SER_2_32
+        hi = (hi * 10 + carry) % SER_2_32
+        i = i + 1
+    }
+    if neg {
+        lo = SER_2_32 - 1 - lo + 1
+        hi = SER_2_32 - 1 - hi
+        if lo == SER_2_32 {
+            lo = 0
+            hi = (hi + 1) % SER_2_32
+        }
+    }
+    serU32(out, lo)
+    serU32(out, hi)
+}
+
+fn serString(out, s) {
+    serU32(out, len(s))
+    out.push(s)
+}
+
+fn serValue(out, v) {
+    let t = typeof(v)
+    if t == "undefined" {
+        serU8(out, VAL_NIL)
+    } else if t == "boolean" {
+        serU8(out, VAL_BOOL)
+        if v {
+            serU8(out, 1)
+        } else {
+            serU8(out, 0)
+        }
+    } else if t == "number" {
+        serU8(out, VAL_NUMBER)
+        serF64(out, v)
+    } else if t == "string" {
+        serU8(out, VAL_STRING)
+        serString(out, v)
+    } else if t == "array" {
+        serU8(out, VAL_ARRAY)
+        serU32(out, len(v))
+        for item in v {
+            serValue(out, item)
+        }
+    } else if "fn" in v {
+        serU8(out, VAL_CLOSURE)
+        serChunk(out, v["fn"])
+    } else if "long" in v {
+        serU8(out, VAL_LONG)
+        serI64(out, v["long"])
+    } else {
+        raise "Cannot serialize value of type " + t
+    }
+}
+
+fn serChunk(out, chunk) {
+    serString(out, chunk["name"])
+    let code = chunk["code"]
+    serU32(out, len(code))
+    for ins in code {
+        out.push(SER_BYTES[ins[0]])
+        serU32(out, ins[1])
+        serU32(out, ins[2])
+    }
+    serU32(out, len(chunk["params"]))
+    for p in chunk["params"] {
+        serString(out, p)
+    }
+    serU32(out, len(chunk["paramIsRef"]))
+    for r in chunk["paramIsRef"] {
+        if r {
+            serU8(out, 1)
+        } else {
+            serU8(out, 0)
+        }
+    }
+    serU32(out, chunk["upvalueCount"])
+    serU32(out, len(chunk["constants"]))
+    for c in chunk["constants"] {
+        serValue(out, c)
+    }
+}
+
+# The serialized bytes of a top-level chunk, as one string.
+fn serialize(chunk) {
+    let out = []
+    serChunk(out, chunk)
+    return out.join("")
+}

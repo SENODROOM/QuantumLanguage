@@ -119,7 +119,7 @@ bool VM::valuesEqual(const QuantumValue &a, const QuantumValue &b)
         return x == std::floor(x) && std::fabs(x) < 9.3e18 && (long double)x == (long double)l.asLong();
     }
     if (a.isString() && b.isString())
-        return a.asString() == b.asString();
+        return a.strRef() == b.strRef();
     if (a.isArray() && b.isArray())
     {
         // Deep, element-wise equality. `[1,2] == [1,2]` is true; this also
@@ -352,7 +352,7 @@ QuantumValue VM::execBinary(Op op, const QuantumValue &L_in, const QuantumValue 
     if (L.isString() && R.isString() &&
         (op == Op::LT || op == Op::GT || op == Op::LTE || op == Op::GTE))
     {
-        int c = L.asString().compare(R.asString());
+        int c = L.strRef().compare(R.strRef());
         switch (op)
         {
         case Op::LT: return QuantumValue(c < 0);
@@ -469,7 +469,7 @@ QuantumValue VM::execBinary(Op op, const QuantumValue &L_in, const QuantumValue 
         {
             std::string s;
             for (int i = 0; i < (int)r; i++)
-                s += L.asString();
+                s += L.strRef();
             return QuantumValue(s);
         }
         if (L.isArray() && R.isNumber())
@@ -1061,7 +1061,7 @@ bool VM::bindCppMember(QuantumValue &classVal, const std::string &name, const Qu
 }
 
 // GET_SUPER: the base class's version of a method, bound to self. The operand
-// is "<class>\x1f<method>" inside a method of <class> (Compiler::superKey):
+// is "<class>\x1f<method>" inside a method of <class> (superKey in selfhost/codegen.sa):
 // the lookup starts from that class's base, not the instance's, so a chain of
 // super calls through three or more classes doesn't recurse.
 void VM::getSuper(const std::string &operand, int line)
@@ -1328,13 +1328,17 @@ QuantumValue VM::callBuiltinMethod(QuantumValue &obj, const std::string &method,
         {
             QuantumValue val = native->fn({});
             if (val.isString())
-                return callStringMethod(val.asString(), method, args);
+                return callStringMethod(val.strRef(), method, args);
         }
     }
     if (obj.isArray())
         return callArrayMethod(obj.asArray(), method, args);
     if (obj.isString())
-        return callStringMethod(obj.asString(), method, args);
+    {
+        // a copy holds the text for the call (the receiver's variable may be reassigned)
+        QuantumValue receiver = obj;
+        return callStringMethod(receiver.strRef(), method, args);
+    }
     if (obj.isDict())
         return callDictMethod(obj.asDict(), method, args);
     if (obj.isInstance())

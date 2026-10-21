@@ -140,9 +140,9 @@ void VM::registerNatives()
         std::getline(std::cin, line);
         return QuantumValue(line); });
 
-    // C++ `cin >> target` (see Parser::parseCinExpr): __cin__(current value
+    // C++ `cin >> target` (see parseCinExpr in selfhost/parser_stmt2.sa): __cin__(current value
     // [, declared kind]) extracts from std::cin the way C++ does for the
-    // target's declared type (Compiler::cinKind: 1 double, 2 integer — "3.7"
+    // target's declared type (cinKind in selfhost/codegen.sa: 1 double, 2 integer — "3.7"
     // gives 3 and leaves ".7" — 3 char), else a token typed like the current
     // value: a number for a numeric variable, a string otherwise. A failed
     // read sets a number to 0 / leaves the target unchanged and puts std::cin
@@ -184,7 +184,7 @@ void VM::registerNatives()
         return QuantumValue(tok); });
     reg("__cin_good__", [](std::vector<QuantumValue>) -> QuantumValue
         { return QuantumValue(g_testMode || !std::cin.fail()); });
-    // Emitted before main() of a C/C++ program (applyDialect).
+    // Emitted before main() of a C/C++ program (applyDialect, selfhost/dialect.sa).
     reg("__cpp_runtime__", [this](std::vector<QuantumValue>) -> QuantumValue
         {
         cppNumerics_ = true;
@@ -495,7 +495,7 @@ void VM::registerNatives()
     reg("len", [](std::vector<QuantumValue> args) -> QuantumValue
         {
         if (args.empty()) throw RuntimeError("len() requires 1 argument");
-        if (args[0].isString()) return QuantumValue((double)args[0].asString().size());
+        if (args[0].isString()) return QuantumValue((double)args[0].strRef().size());
         if (args[0].isArray())  return QuantumValue((double)args[0].asArray()->size());
         if (args[0].isDict())   return QuantumValue((double)args[0].asDict()->size());
         throw TypeError("len() unsupported for " + args[0].typeName()); });
@@ -593,7 +593,7 @@ void VM::registerNatives()
                 (*dict)[k] = v;
         return QuantumValue(dict); });
     // One binding of a JS destructuring declaration (see
-    // Parser::parseDestructuringDecl): __destructure__(src, indexOrKey,
+    // parseDestructuringDecl in selfhost/parser.sa): __destructure__(src, indexOrKey,
     // isRest, [takenKeys]). A missing element reads as nil (JS undefined).
     reg("__destructure__", [](std::vector<QuantumValue> args) -> QuantumValue
         {
@@ -633,7 +633,7 @@ void VM::registerNatives()
         return QuantumValue(); });
 
     // C++ overload resolution for a dispatcher built by
-    // Parser::buildOverloadDispatchers: __ovl_pick__(callArgs,
+    // buildOverloadDispatchers in selfhost/parser_stmt2.sa: __ovl_pick__(callArgs,
     // [[minArgs, maxArgs, [paramTypes]], ...]) → k*64 + argCount of the first
     // overload whose arity and declared parameter types fit the arguments
     // (falling back to arity alone).
@@ -990,7 +990,7 @@ void VM::registerNatives()
     }
 
     // `import M [as A]` / `from M import N [as A]` for a module with no file
-    // on disk (see Compiler::compileImport): binds what the VM provides.
+    // on disk (see compileImport in selfhost/codegen.sa): binds what the VM provides.
     // A plain `import random` of an existing global is a no-op; an alias or a
     // from-import binds the module / member under the new name.
     reg("__import_bind__", [this, pyStringModule](std::vector<QuantumValue> a) -> QuantumValue
@@ -3294,6 +3294,86 @@ void VM::registerNatives()
             result = a < b ? -1.0 : (a > b ? 1.0 : 0.0);
         }
         return QuantumValue(result); });
+
+    // ── std::regex (ECMAScript) for Quantum code: the self-hosted compiler's
+    // dialect passes (selfhost/dialect_*.sa) use these exactly as the C++
+    // passes used <regex>. Patterns are compiled once and cached.
+    //   __re_match__(s, re)   whole-string match: [g0, g1, ...] (nil = group
+    //                         unmatched) or nil
+    //   __re_search__(s, re)  first match: [pos, len, g0, g1, ...] or nil
+    //   __re_all__(s, re)     every match (std::sregex_iterator): [[pos, len, g0, ...], ...]
+    //   __re_replace__(s, re, fmt)  std::regex_replace with $& / $1 formats
+    {
+        auto compiled = [](const QuantumValue &p) -> const std::regex &
+        {
+            static std::unordered_map<std::string, std::unique_ptr<std::regex>> cache;
+            const std::string pattern = p.toString();
+            auto it = cache.find(pattern);
+            if (it == cache.end())
+            {
+                try
+                {
+                    it = cache.emplace(pattern, std::make_unique<std::regex>(pattern)).first;
+                }
+                catch (const std::regex_error &e)
+                {
+                    throw RuntimeError("invalid regex /" + pattern + "/: " + e.what());
+                }
+            }
+            return *it->second;
+        };
+        auto groups = [](const std::smatch &m, std::shared_ptr<Array> &out)
+        {
+            for (size_t g = 0; g < m.size(); ++g)
+                out->push_back(m[g].matched ? QuantumValue(m[g].str()) : QuantumValue());
+        };
+        auto located = [groups](const std::smatch &m)
+        {
+            auto out = std::make_shared<Array>();
+            out->push_back(QuantumValue((double)m.position(0)));
+            out->push_back(QuantumValue((double)m.length(0)));
+            groups(m, out);
+            return out;
+        };
+        auto need = [](const std::vector<QuantumValue> &a, size_t n, const char *name)
+        {
+            if (a.size() < n)
+                throw RuntimeError(std::string(name) + "() needs " + std::to_string(n) + " arguments");
+        };
+        reg("__re_match__", [compiled, groups, need](std::vector<QuantumValue> a) -> QuantumValue
+            {
+            need(a, 2, "__re_match__");
+            const std::string held = a[0].isString() ? std::string() : a[0].toString();
+            const std::string &s = a[0].isString() ? a[0].strRef() : held;
+            std::smatch m;
+            if (!std::regex_match(s, m, compiled(a[1])))
+                return QuantumValue();
+            auto out = std::make_shared<Array>();
+            groups(m, out);
+            return QuantumValue(out); });
+        reg("__re_search__", [compiled, located, need](std::vector<QuantumValue> a) -> QuantumValue
+            {
+            need(a, 2, "__re_search__");
+            const std::string held = a[0].isString() ? std::string() : a[0].toString();
+            const std::string &s = a[0].isString() ? a[0].strRef() : held;
+            std::smatch m;
+            if (!std::regex_search(s, m, compiled(a[1])))
+                return QuantumValue();
+            return QuantumValue(located(m)); });
+        reg("__re_all__", [compiled, located, need](std::vector<QuantumValue> a) -> QuantumValue
+            {
+            need(a, 2, "__re_all__");
+            const std::string held = a[0].isString() ? std::string() : a[0].toString();
+            const std::string &s = a[0].isString() ? a[0].strRef() : held;
+            auto out = std::make_shared<Array>();
+            for (auto it = std::sregex_iterator(s.begin(), s.end(), compiled(a[1])); it != std::sregex_iterator(); ++it)
+                out->push_back(QuantumValue(located(*it)));
+            return QuantumValue(out); });
+        reg("__re_replace__", [compiled, need](std::vector<QuantumValue> a) -> QuantumValue
+            {
+            need(a, 3, "__re_replace__");
+            return QuantumValue(std::regex_replace(a[0].toString(), compiled(a[1]), a[2].toString())); });
+    }
 
     // Ruby's `str =~ /re/` match operator. Runs the regex over the string,
     // stores each capture group in a `__rx_1`..`__rx_9` global (which the

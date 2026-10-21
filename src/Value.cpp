@@ -42,7 +42,7 @@ bool QuantumValue::isTruthy() const
         if constexpr (std::is_same_v<T, bool>)          return v;
         if constexpr (std::is_same_v<T, double>)        return v != 0.0;
         if constexpr (std::is_same_v<T, int64_t>)       return v != 0;
-        if constexpr (std::is_same_v<T, std::string>)   return !v.empty() && !(v.size() == 1 && v[0] == '\0');
+        if constexpr (std::is_same_v<T, QStr>)   return !v.str().empty() && !(v.str().size() == 1 && v.str()[0] == '\0');
         if constexpr (std::is_same_v<T, std::shared_ptr<Array>>) return !v->empty();
         if constexpr (std::is_same_v<T, std::shared_ptr<QuantumPointer>>) return v && !v->isNull();
         return true; }, data);
@@ -63,7 +63,7 @@ std::string QuantumValue::toString() const
             oss << std::setprecision(10) << v;
             return oss.str();
         }
-        if constexpr (std::is_same_v<T, std::string>) return v;
+        if constexpr (std::is_same_v<T, QStr>) return v.str();
         if constexpr (std::is_same_v<T, std::shared_ptr<Array>>) {
             std::string s = "[";
             for (size_t i = 0; i < v->size(); i++) {
@@ -125,7 +125,7 @@ std::string QuantumValue::typeName() const
         if constexpr (std::is_same_v<T, QuantumNil>)   return "nil";
         if constexpr (std::is_same_v<T, bool>)         return "bool";
         if constexpr (std::is_same_v<T, double>)       return "number";
-        if constexpr (std::is_same_v<T, std::string>)  return "string";
+        if constexpr (std::is_same_v<T, QStr>)  return "string";
         if constexpr (std::is_same_v<T, std::shared_ptr<Array>>)           return "array";
         if constexpr (std::is_same_v<T, std::shared_ptr<Dict>>)            return "dict";
         if constexpr (std::is_same_v<T, std::shared_ptr<Closure>>)         return "function";

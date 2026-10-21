@@ -1,8 +1,6 @@
 #include "Cli.h"
 #include "Pipeline.h"
-#include "Dialect.h"
-#include "Lexer.h"
-#include "Parser.h"
+#include "SourceFiles.h"
 #include "Vm.h"
 #include "Error.h"
 #include "../qpm/QpmManifest.h"
@@ -116,7 +114,7 @@ int runSingleFileForTest(const std::string &path)
     try
     {
         VM vm;
-        vm.run(compileSource(applyDialect(source, path), path, false));
+        vm.run(compileSource(source, path, false));
         return 0; // clean
     }
     catch (const ParseError &e)

@@ -1,0 +1,632 @@
+# Module resolution, written in Quantum: a port of src/ModuleResolver.cpp —
+# `# @use` directives (whole files inlined ahead of the program) and
+# `import` / `from m import x` of on-disk .sa modules (exported members).
+# @use "./parser_expr.sa"
+# @use "./dialect.sa"
+
+let MOD_QUBITS_DIR = "quantum_qubits"
+let MOD_NODE_MODULES_DIR = "node_modules"
+let MOD_MANIFEST_NAMES = ["package.qon", "package.json", "requirements.txt"]
+
+# ── paths (strings; the parts std::filesystem does that matter here) ────────
+
+fn modIsSep(c) {
+    return c == "/" or c == "\\"
+}
+
+# the index just past a path's root ("C:/", "/"), 0 when it has none
+fn modRootEnd(p) {
+    let i = 0
+    if len(p) >= 2 and p[1] == ":" {
+        i = 2
+    }
+    if i < len(p) and modIsSep(p[i]) {
+        i = i + 1
+    }
+    return i
+}
+
+# fs::path::parent_path: the path without its last element ("" for a bare name)
+fn modParent(p) {
+    let root = modRootEnd(p)
+    let i = len(p) - 1
+    while i >= root and !modIsSep(p[i]) {
+        i = i - 1
+    }
+    if i < root {
+        # one element after the root: the parent is the root itself
+        if len(p) > root {
+            return p.slice(0, root)
+        }
+        return p
+    }
+    while i > root and modIsSep(p[i - 1]) {
+        i = i - 1
+    }
+    return p.slice(0, i)
+}
+
+# fs::path's `a / b`: an absolute `b` replaces `a` (a rooted "/x" keeps
+# only a's drive)
+fn modJoin(a, b) {
+    if len(b) >= 2 and b[1] == ":" {
+        return b
+    }
+    if len(b) > 0 and modIsSep(b[0]) {
+        if len(a) >= 2 and a[1] == ":" {
+            return a.slice(0, 2) + b
+        }
+        return b
+    }
+    if a == "" {
+        return b
+    }
+    if modIsSep(a[len(a) - 1]) {
+        return a + b
+    }
+    return a + "/" + b
+}
+
+fn modIsFile(p) {
+    return os.path.exists(p) and !os.path.isdir(p)
+}
+
+fn modIsDir(p) {
+    return os.path.isdir(p)
+}
+
+# absolute and lexically normal, "/"-separated
+fn modNormal(p) {
+    return os.path.abspath(p)
+}
+
+fn modPathKey(p) {
+    return modNormal(p).lower()
+}
+
+fn modExtLower(p) {
+    let i = len(p) - 1
+    while i >= 0 and !modIsSep(p[i]) {
+        if p[i] == "." {
+            if i == 0 or modIsSep(p[i - 1]) {
+                return ""
+            }
+            return p.slice(i).lower()
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+fn modCwd() {
+    return os.path.abspath(".")
+}
+
+# ── text helpers ─────────────────────────────────────────────────────────────
+
+fn modIsSpace(c) {
+    return c == " " or c == "\t" or c == "\n" or c == "\r" or c == chr(11) or c == chr(12)
+}
+
+# trims " \t\r\n" (the directive scanner's set)
+fn modTrim(s) {
+    let a = 0
+    let b = len(s)
+    while a < b and (s[a] == " " or s[a] == "\t" or s[a] == "\r" or s[a] == "\n") {
+        a = a + 1
+    }
+    while b > a and (s[b - 1] == " " or s[b - 1] == "\t" or s[b - 1] == "\r" or s[b - 1] == "\n") {
+        b = b - 1
+    }
+    return s.slice(a, b)
+}
+
+# trims all <cctype> whitespace (qpm's trim)
+fn modTrimWs(s) {
+    let a = 0
+    let b = len(s)
+    while a < b and modIsSpace(s[a]) {
+        a = a + 1
+    }
+    while b > a and modIsSpace(s[b - 1]) {
+        b = b - 1
+    }
+    return s.slice(a, b)
+}
+
+fn modStripBom(text) {
+    if len(text) >= 3 and ord(text[0]) == 239 and ord(text[1]) == 187 and ord(text[2]) == 191 {
+        return text.slice(3)
+    }
+    return text
+}
+
+# ── manifests (only "main" and "quantum.paths" matter here) ─────────────────
+
+fn modFindManifest(dir) {
+    for name in MOD_MANIFEST_NAMES {
+        let p = modJoin(dir, name)
+        if modIsFile(p) {
+            return p
+        }
+    }
+    return ""
+}
+
+fn modFileName(p) {
+    let i = len(p) - 1
+    while i >= 0 and !modIsSep(p[i]) {
+        i = i - 1
+    }
+    return p.slice(i + 1)
+}
+
+fn modLooksLikeJson(text) {
+    let i = 0
+    while i < len(text) {
+        if !modIsSpace(text[i]) {
+            return text[i] == "{"
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn modSectionKey(raw) {
+    let lower = raw.lower()
+    if lower == "dependencies" or lower == "deps" {
+        return "dependencies"
+    }
+    if lower == "devdependencies" or lower == "dev-dependencies" or lower == "dev_dependencies" or lower == "dev" {
+        return "devDependencies"
+    }
+    if lower == "package" {
+        return ""
+    }
+    return raw
+}
+
+fn modStripComment(line) {
+    let i = 0
+    while i < len(line) {
+        if line[i] == "#" and (i == 0 or modIsSpace(line[i - 1])) {
+            return line.slice(0, i)
+        }
+        i = i + 1
+    }
+    return line
+}
+
+fn modIsNameChar(c) {
+    return lexIsAlnum(c) or c == "-" or c == "_" or c == "." or c == "/"
+}
+
+# requirements-style text: [section] headers, `key = value` lines, and
+# dependency lines (validated, not kept)
+fn modParseRequirements(text) {
+    let data = {}
+    let section = "dependencies"
+    let lines = text.split("\n")
+    if len(lines) > 0 and lines[len(lines) - 1] == "" {
+        lines.pop()
+    }
+    let n = 0
+    while n < len(lines) {
+        let raw = lines[n]
+        if len(raw) > 0 and raw[len(raw) - 1] == "\r" {
+            raw = raw.slice(0, len(raw) - 1)
+        }
+        let line = modTrimWs(modStripComment(raw))
+        let isDeps = section == "dependencies" or section == "devDependencies"
+        if len(line) > 0 and line[0] == "[" and line[len(line) - 1] == "]" {
+            section = modSectionKey(modTrimWs(line.slice(1, len(line) - 1)))
+        } else if line == "" or (isDeps and line[0] == "-") {
+            # blank, or a pip option
+        } else if isDeps {
+            let s = line
+            let i = 0
+            if i < len(s) and s[i] == "@" {
+                i = i + 1
+            }
+            while i < len(s) and modIsNameChar(s[i]) {
+                i = i + 1
+            }
+            let name = s.slice(0, i)
+            if name == "" or name == "@" {
+                raise "line " + str(n + 1) + ": expected a package name, got \"" + line + "\""
+            }
+        } else {
+            let eq = line.indexOf("=")
+            if eq < 0 {
+                let shown = section
+                if shown == "" {
+                    shown = "package"
+                }
+                raise "line " + str(n + 1) + ": expected `key = value` in [" + shown + "]"
+            }
+            let key = modTrimWs(line.slice(0, eq))
+            let rawValue = modTrimWs(line.slice(eq + 1))
+            let value = rawValue
+            if len(rawValue) > 0 and (rawValue[0] == "[" or rawValue[0] == "{" or rawValue[0] == "\"") {
+                value = JSON.parse(rawValue)
+            }
+            if section == "" {
+                data[key] = value
+            } else {
+                if !(section in data) or typeof(data[section]) != "object" {
+                    data[section] = {}
+                }
+                data[section][key] = value
+            }
+        }
+        n = n + 1
+    }
+    return data
+}
+
+fn modLoadManifest(path) {
+    let text = read_file(path)
+    if text == nil {
+        raise "can't read " + path
+    }
+    text = modStripBom(text)
+    let file = modFileName(path)
+    let data = nil
+    try {
+        if file == "package.json" or (file != "requirements.txt" and modLooksLikeJson(text)) {
+            data = JSON.parse(text)
+            if typeof(data) != "object" {
+                raise "expected a JSON object"
+            }
+        } else {
+            data = modParseRequirements(text)
+        }
+    } catch (e) {
+        raise file + ": " + str(e)
+    }
+    return data
+}
+
+fn modGet(obj, key) {
+    if typeof(obj) == "object" and key in obj {
+        return obj[key]
+    }
+    return nil
+}
+
+# a package's entry file: its manifest's "main", else index.sa
+fn modPackageMain(pkgDir) {
+    let manifestPath = modFindManifest(pkgDir)
+    if manifestPath == "" {
+        return modJoin(pkgDir, "index.sa")
+    }
+    let meta = nil
+    try {
+        meta = modLoadManifest(manifestPath)
+    } catch (e) {
+        parseErrorAt("invalid manifest at " + manifestPath + ": " + str(e), 0, 0)
+    }
+    let main = modGet(meta, "main")
+    if typeof(main) == "string" {
+        return modNormal(modJoin(pkgDir, main))
+    }
+    return modJoin(pkgDir, "index.sa")
+}
+
+# ── `import` of on-disk modules ──────────────────────────────────────────────
+
+# <dir>/<module>.sa, else a package in quantum_qubits / node_modules of <dir>
+# or any parent directory; "" when there is no file (a host library)
+fn modResolveModulePath(module, fromDir) {
+    let local = modJoin(fromDir, module + ".sa")
+    if os.path.exists(local) {
+        return local
+    }
+    let dir = fromDir
+    while true {
+        for folder in [MOD_QUBITS_DIR, MOD_NODE_MODULES_DIR] {
+            let pkgDir = modJoin(modJoin(dir, folder), module)
+            if !modIsDir(pkgDir) {
+                continue
+            }
+            if modIsFile(modJoin(pkgDir, module + ".sa")) {
+                return modJoin(pkgDir, module + ".sa")
+            }
+            if modIsFile(modJoin(pkgDir, "index.sa")) {
+                return modJoin(pkgDir, "index.sa")
+            }
+            let main = modPackageMain(pkgDir)
+            if modIsFile(main) {
+                return main
+            }
+        }
+        let parent = modParent(dir)
+        if parent == "" or parent == dir {
+            break
+        }
+        dir = parent
+    }
+    return ""
+}
+
+# A module's exported functions and variables, in source order: [[name, decl]].
+fn modLoadModuleExports(path, resolving) {
+    let canon = modNormal(path)
+    for r in resolving {
+        if r == canon {
+            let chain = ""
+            for p in resolving {
+                chain = chain + p + " -> "
+            }
+            parseErrorAt("Circular import detected: " + chain + canon, 0, 0)
+        }
+    }
+    let source = read_file(path)
+    if source == nil {
+        parseErrorAt("Could not read module file: " + path, 0, 0)
+    }
+    let moduleRoot = parseProgram(lexTokenize(source), false)
+    resolving.push(canon)
+    modResolveImportsIn(moduleRoot, path, resolving)
+    resolving.pop()
+    let exported = []
+    let names = {}
+    for stmt in moduleRoot["statements"] {
+        if (stmt["k"] == "FunctionDecl" or stmt["k"] == "VarDecl") and stmt["isExported"] {
+            if !(stmt["name"] in names) {
+                names[stmt["name"]] = true
+                exported.push([stmt["name"], stmt])
+            }
+        }
+    }
+    return exported
+}
+
+fn modResolveImportsIn(root, sourcePath, resolving) {
+    let dir = modParent(sourcePath)
+    if dir == "" {
+        dir = modCwd()
+    }
+    let newStmts = []
+    for stmt in root["statements"] {
+        if stmt["k"] != "Import" {
+            newStmts.push(stmt)
+            continue
+        }
+        if stmt["module"] != "" {
+            # from <module> import a, b as c
+            let modPath = modResolveModulePath(stmt["module"], dir)
+            if modPath == "" {
+                newStmts.push(stmt)
+                continue
+            }
+            let exports = modLoadModuleExports(modPath, resolving)
+            for item in stmt["imports"] {
+                # each export can be taken once (the C++ moves it out)
+                let found = nil
+                for ex in exports {
+                    if ex[0] == item["name"] and found == nil {
+                        found = ex
+                    }
+                }
+                let decl = nil
+                if found != nil {
+                    decl = found[1]
+                    found[1] = nil
+                }
+                if decl == nil {
+                    parseErrorAt("Module \"" + stmt["module"] + "\" has no exported member \"" + item["name"] + "\"", stmt["line"], 0)
+                }
+                let finalName = item["alias"]
+                if finalName == "" {
+                    finalName = item["name"]
+                }
+                decl["name"] = finalName
+                newStmts.push(decl)
+            }
+        } else {
+            # bare `import a, b`: every exported member of each on-disk module
+            let hostModules = nImport("", stmt["line"])
+            for item in stmt["imports"] {
+                let modPath = modResolveModulePath(item["name"], dir)
+                if modPath == "" {
+                    hostModules["imports"].push(item)
+                    continue
+                }
+                for ex in modLoadModuleExports(modPath, resolving) {
+                    newStmts.push(ex[1])
+                }
+            }
+            if len(hostModules["imports"]) > 0 {
+                newStmts.push(hostModules)
+            }
+        }
+    }
+    root["statements"] = newStmts
+}
+
+fn resolveImports(root, sourcePath) {
+    modResolveImportsIn(root, sourcePath, [modNormal(sourcePath)])
+}
+
+# ── `# @use` directives ──────────────────────────────────────────────────────
+
+# the `# @use <spec>` (or `// @use <spec>`) lines of a source: [{"spec", "line"}]
+fn parseUseDirectives(source) {
+    let uses = []
+    let lines = source.split("\n")
+    let line = 0
+    for raw in lines {
+        line = line + 1
+        let t = modTrim(raw)
+        let rest = ""
+        if t.startsWith("# @use ") {
+            rest = t.slice(7)
+        } else if t.startsWith("// @use ") {
+            rest = t.slice(8)
+        } else {
+            continue
+        }
+        let spec = modTrim(rest)
+        if len(spec) >= 2 and (spec[0] == "\"" or spec[0] == "'") {
+            spec = spec.slice(1, len(spec) - 1)
+        }
+        if spec != "" {
+            uses.push({"spec": spec, "line": line})
+        }
+    }
+    return uses
+}
+
+# quantum-bundle output keeps its modules' @use lines (already satisfied)
+fn isBundleOutput(source) {
+    for raw in source.split("\n") {
+        let t = modTrim(raw)
+        if t != "" {
+            return t.includes("Generated by quantum-bundle")
+        }
+    }
+    return false
+}
+
+# <root>/quantum_qubits, <root>/node_modules, then the root manifest's
+# "quantum.paths" (relative to <root>)
+fn modUseOptions(entryDir) {
+    let root = entryDir
+    let manifestPath = ""
+    let dir = entryDir
+    while true {
+        manifestPath = modFindManifest(dir)
+        if manifestPath != "" {
+            root = dir
+            break
+        }
+        let parent = modParent(dir)
+        if parent == "" or parent == dir {
+            break
+        }
+        dir = parent
+    }
+    let searchDirs = [modJoin(root, MOD_QUBITS_DIR), modJoin(root, MOD_NODE_MODULES_DIR)]
+    if manifestPath != "" {
+        try {
+            let paths = modGet(modGet(modLoadManifest(manifestPath), "quantum"), "paths")
+            if typeof(paths) == "array" {
+                for p in paths {
+                    if typeof(p) == "string" {
+                        searchDirs.push(modNormal(modJoin(root, p)))
+                    }
+                }
+            }
+        } catch (e) {
+            # a broken manifest only loses the extra search paths
+        }
+    }
+    return {"root": root, "searchDirs": searchDirs}
+}
+
+fn modResolveUse(use, fromDir, opts) {
+    let spec = use["spec"]
+    let relative = spec.startsWith("./") or spec.startsWith("../") or spec.startsWith("/") or (len(spec) >= 3 and spec[1] == ":" and modIsSep(spec[2]))
+    if relative {
+        let target = modNormal(modJoin(fromDir, spec))
+        if modIsFile(target) {
+            return target
+        }
+        parseErrorAt("cannot find '" + spec + "' (looked for " + target + ")", use["line"], 0)
+    }
+    # "name/sub/file.sa" or "@scope/name/file.sa": package + subpath
+    let parts = spec.split("/")
+    let nameParts = 1
+    if spec[0] == "@" and len(parts) > 1 {
+        nameParts = 2
+    }
+    let name = ""
+    let sub = ""
+    let i = 0
+    while i < len(parts) {
+        if i < nameParts {
+            name = modJoin(name, parts[i])
+        } else {
+            sub = modJoin(sub, parts[i])
+        }
+        i = i + 1
+    }
+    let tried = ""
+    for dir in opts["searchDirs"] {
+        let pkgDir = modJoin(dir, name)
+        let target = ""
+        if sub == "" {
+            target = modPackageMain(pkgDir)
+        } else {
+            target = modNormal(modJoin(pkgDir, sub))
+        }
+        if modIsFile(target) {
+            return target
+        }
+        if tried != "" {
+            tried = tried + ", "
+        }
+        tried = tried + target
+    }
+    parseErrorAt("cannot find package '" + spec + "' (tried: " + tried + ")", use["line"], 0)
+}
+
+# depth-first: a module's statements follow all of its dependencies'
+fn modVisitUse(path, walk) {
+    let key = modPathKey(path)
+    if key in walk["done"] {
+        return nil
+    }
+    if key in walk["visiting"] and walk["visiting"][key] {
+        fprintf("stderr", "%s\n", "[UseWarning] circular @use skipped: " + path)
+        return nil
+    }
+    walk["visiting"][key] = true
+    let source = read_file(path)
+    if source == nil {
+        parseErrorAt("cannot read " + path, 0, 0)
+    }
+    source = modStripBom(source)
+    for use in parseUseDirectives(source) {
+        modVisitUse(modResolveUse(use, modParent(path), walk["opts"]), walk)
+    }
+    let module = nil
+    try {
+        module = parseProgram(lexTokenize(applyDialect(source, path)), false)
+        resolveImports(module, path)
+    } catch (e) {
+        # the line is this module's, not the entry file's — say which
+        if typeof(e) == "object" and "kind" in e and e["kind"] == "ParseError" {
+            e["message"] = e["message"] + " (in @use module " + path + ")"
+        }
+        raise e
+    }
+    for stmt in module["statements"] {
+        walk["statements"].push(stmt)
+    }
+    walk["visiting"][key] = false
+    walk["done"][key] = true
+    return nil
+}
+
+fn resolveUseDirectives(root, source, sourcePath) {
+    if sourcePath == "" or modExtLower(sourcePath) != ".sa" or isBundleOutput(source) {
+        return nil
+    }
+    let uses = parseUseDirectives(source)
+    if len(uses) == 0 {
+        return nil
+    }
+    let entry = modNormal(sourcePath)
+    let walk = {"opts": modUseOptions(modParent(entry)), "done": {}, "visiting": {}, "statements": []}
+    walk["visiting"][modPathKey(entry)] = true
+    for use in uses {
+        modVisitUse(modResolveUse(use, modParent(entry), walk["opts"]), walk)
+    }
+    for stmt in root["statements"] {
+        walk["statements"].push(stmt)
+    }
+    root["statements"] = walk["statements"]
+    return nil
+}

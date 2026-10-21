@@ -1,5 +1,11 @@
 # Quantum Language Architecture
 
+> **Historical document.** It describes an early tree-walking interpreter.
+> Quantum now compiles to bytecode for a stack VM, and its compiler is
+> written in Quantum itself — see `selfhost/README.md` for the current
+> pipeline and the compiler's sources, and the "Architecture" section of the
+> top-level `README.md` for the VM.
+
 ## Overview
 
 Quantum Language is a modern, cybersecurity-focused scripting language implemented as a tree-walk interpreter in C++17. The language processes `.sa` (Quantum Script) files through a classic compilation pipeline: **Lexical Analysis → Parsing → Abstract Syntax Tree Generation → Interpretation**.

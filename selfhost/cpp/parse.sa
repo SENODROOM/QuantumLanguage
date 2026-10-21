@@ -1,0 +1,2649 @@
+# Parser of the typed C/C++ front-end: tokens -> C++ AST. A port of
+# src/cpp/CppParse.cpp.
+#
+# Declarations and expressions are told apart the way a C++ compiler does it,
+# approximately: a table of names known to denote types (built-in, standard
+# library, and every class / enum / alias / template parameter declared so
+# far), plus speculative parsing with backtracking for statements.
+#
+# Nodes are dicts. TypeName: {"name", "targs" (per name component, a list of
+# {"type", "expr"}), "hasTargs", "isConst", "pointers", "constPtr", "ref",
+# "rref", "arrayDims", "pointeeDims", "isFunction", "ret", "params",
+# "elaborated"}. Expr: {"k", "line", "op", "str", "num", "isUnsigned",
+# "isLong", "isFloatSuffix", "name", "targs", "hasTargs", "kids", "type",
+# "arrow", "braced", "newArray", "lambda", "designator", "designIndex"}.
+# Stmt: {"k", "line", "expr", "decls", "isStatic", "body", "init", "then",
+# "els", "cond2", "step", "condDecl", "catches", "local"}. Decl: see cxMkDecl.
+# @use "./lex.sa"
+
+fn cxTypeName() {
+    return {"name": [], "targs": [], "hasTargs": false, "isConst": false, "pointers": 0, "constPtr": [],
+            "ref": false, "rref": false, "arrayDims": [], "pointeeDims": [], "isFunction": false, "ret": nil,
+            "params": [], "elaborated": false}
+}
+
+# a copy of a TypeName (its lists copied, the nodes in them shared)
+fn cxTypeNameCopy(t) {
+    let targs = []
+    for ta in t["targs"] {
+        targs.push(ta.slice(0))
+    }
+    return {"name": t["name"].slice(0), "targs": targs, "hasTargs": t["hasTargs"], "isConst": t["isConst"],
+            "pointers": t["pointers"], "constPtr": t["constPtr"].slice(0), "ref": t["ref"], "rref": t["rref"],
+            "arrayDims": t["arrayDims"].slice(0), "pointeeDims": t["pointeeDims"].slice(0),
+            "isFunction": t["isFunction"], "ret": t["ret"], "params": t["params"].slice(0),
+            "elaborated": t["elaborated"]}
+}
+
+fn cxIsAutoType(t) {
+    return len(t["name"]) == 1 and t["name"][0] == "auto"
+}
+
+fn cxTypeNameStr(t) {
+    let s = ""
+    if t["isConst"] {
+        s = "const "
+    }
+    if t["isFunction"] {
+        if t["ret"] != nil {
+            s = s + cxTypeNameStr(t["ret"]) + "("
+        } else {
+            s = s + "void("
+        }
+        let i = 0
+        while i < len(t["params"]) {
+            if i > 0 {
+                s = s + ","
+            }
+            s = s + cxTypeNameStr(t["params"][i])
+            i = i + 1
+        }
+        s = s + ")"
+    }
+    let i = 0
+    while i < len(t["name"]) {
+        if i > 0 {
+            s = s + "::"
+        }
+        s = s + t["name"][i]
+        if i < len(t["targs"]) and len(t["targs"][i]) > 0 {
+            s = s + "<"
+            let j = 0
+            while j < len(t["targs"][i]) {
+                if j > 0 {
+                    s = s + ","
+                }
+                let ta = t["targs"][i][j]
+                if ta["type"] != nil {
+                    s = s + cxTypeNameStr(ta["type"])
+                } else {
+                    s = s + "#"
+                }
+                j = j + 1
+            }
+            s = s + ">"
+        }
+        i = i + 1
+    }
+    let k = 0
+    while k < t["pointers"] {
+        s = s + "*"
+        k = k + 1
+    }
+    if t["ref"] {
+        s = s + "&"
+    }
+    if t["rref"] {
+        s = s + "&&"
+    }
+    for d in t["arrayDims"] {
+        s = s + "[]"
+    }
+    return s
+}
+
+fn cxExpr(k, line) {
+    return {"k": k, "line": line, "op": "", "str": "", "num": 0, "isUnsigned": false, "isLong": false,
+            "isFloatSuffix": false, "name": [], "targs": [], "hasTargs": false, "kids": [], "type": nil,
+            "arrow": false, "braced": false, "newArray": false, "lambda": nil, "designator": "", "designIndex": nil}
+}
+
+fn cxExprCopy(e) {
+    return {"k": e["k"], "line": e["line"], "op": e["op"], "str": e["str"], "num": e["num"],
+            "isUnsigned": e["isUnsigned"], "isLong": e["isLong"], "isFloatSuffix": e["isFloatSuffix"],
+            "name": e["name"].slice(0), "targs": e["targs"].slice(0), "hasTargs": e["hasTargs"],
+            "kids": e["kids"].slice(0), "type": e["type"], "arrow": e["arrow"], "braced": e["braced"],
+            "newArray": e["newArray"], "lambda": e["lambda"], "designator": e["designator"],
+            "designIndex": e["designIndex"]}
+}
+
+fn cxVarDecl() {
+    return {"name": "", "type": nil, "init": "None", "args": [], "line": 0, "bindings": []}
+}
+
+fn cxStmt(k, line) {
+    return {"k": k, "line": line, "expr": nil, "decls": [], "isStatic": false, "body": [], "init": nil,
+            "then": nil, "els": nil, "cond2": nil, "step": nil, "condDecl": nil, "catches": [], "local": nil}
+}
+
+fn cxMkDecl(k, line, file, tu) {
+    return {"id": cxNextId(), "k": k, "line": line, "file": file, "tu": tu, "name": [], "templateParams": [], "isTemplate": false,
+            "ret": nil, "params": [], "variadic": false, "isConst": false, "isStatic": false, "isVirtual": false,
+            "isPure": false, "isExplicit": false, "isCtor": false, "isDtor": false, "isDefault": false,
+            "isDeleted": false, "isOperator": false, "isFriend": false, "isInline": false, "isConstexpr": false,
+            "noreturn": false, "inits": [], "body": nil, "var": cxVarDecl(), "isExtern": false,
+            "isStruct": false, "isUnion": false, "bases": [], "members": [], "forwardOnly": false,
+            "scoped": false, "underlying": nil, "enumerators": [], "aliased": nil, "decls": [],
+            "anonymous": false, "inheritingCtor": false, "access": "public", "friendNames": []}
+}
+
+fn cxSetOf(words) {
+    let d = {}
+    for w in words {
+        d[w] = true
+    }
+    return d
+}
+
+let CX_BUILTIN_WORDS = cxSetOf(["void", "bool", "char", "short", "int", "long", "float", "double", "signed",
+                                "unsigned", "wchar_t", "char8_t", "char16_t", "char32_t", "auto"])
+let CX_SPECIFIER_WORDS = cxSetOf(["const", "volatile", "static", "extern", "inline", "constexpr", "consteval",
+                                  "constinit", "mutable", "virtual", "explicit", "friend", "typedef",
+                                  "thread_local", "register", "typename"])
+let CX_KEYWORDS = cxSetOf(["if", "else", "while", "do", "for", "switch", "case", "default", "break", "continue",
+                           "return", "try", "catch", "throw", "goto", "new", "delete", "sizeof", "this", "true",
+                           "false", "nullptr", "struct", "class", "union", "enum", "namespace", "using",
+                           "typedef", "template", "operator", "public", "private", "protected", "static_cast",
+                           "dynamic_cast", "const_cast", "reinterpret_cast", "static_assert", "decltype",
+                           "noexcept", "alignof", "alignas"])
+let CX_C_TYPES = ["size_t", "ptrdiff_t", "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t",
+                  "uint32_t", "uint64_t", "intptr_t", "uintptr_t", "intmax_t", "uintmax_t", "FILE", "time_t",
+                  "clock_t", "ssize_t", "wchar_t", "va_list", "nullptr_t"]
+let CX_STD_TYPES = ["string", "wstring", "string_view", "vector", "map", "unordered_map", "set", "unordered_set",
+                    "multimap", "multiset", "pair", "tuple", "optional", "variant", "monostate", "unique_ptr",
+                    "shared_ptr", "weak_ptr", "function", "array", "deque", "list", "forward_list", "stack", "queue",
+                    "priority_queue", "ostream", "istream", "iostream", "ostringstream", "istringstream",
+                    "stringstream", "ifstream", "ofstream", "fstream", "exception", "runtime_error", "logic_error",
+                    "invalid_argument", "out_of_range", "length_error", "domain_error", "range_error",
+                    "overflow_error", "underflow_error", "bad_alloc", "bad_variant_access", "bad_optional_access",
+                    "bad_cast", "size_t", "ptrdiff_t", "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t",
+                    "uint16_t", "uint32_t", "uint64_t", "intptr_t", "uintptr_t", "intmax_t", "uintmax_t",
+                    "nullptr_t", "initializer_list", "numeric_limits", "nullopt_t", "streamsize", "bitset", "less",
+                    "greater", "hash", "mt19937", "mt19937_64", "random_device", "uniform_int_distribution",
+                    "uniform_real_distribution", "FILE", "time_t", "clock_t", "any", "reference_wrapper",
+                    "ssize_t", "byte"]
+let CX_STD_TEMPLATES = ["vector", "map", "unordered_map", "set", "unordered_set", "multimap", "multiset", "pair",
+                        "tuple", "optional", "variant", "unique_ptr", "shared_ptr", "weak_ptr", "function",
+                        "array", "deque", "list", "forward_list", "stack", "queue", "priority_queue",
+                        "numeric_limits", "initializer_list", "bitset", "less", "greater", "hash",
+                        "uniform_int_distribution", "uniform_real_distribution", "reference_wrapper",
+                        "basic_string", "static_cast", "dynamic_cast", "const_cast", "reinterpret_cast",
+                        "make_unique", "make_shared", "get", "get_if", "holds_alternative", "max", "min",
+                        "make_pair", "make_tuple", "any_cast", "accumulate", "to_underlying", "clamp", "swap",
+                        "forward", "move", "declval", "bit_cast"]
+
+# ── parser state ────────────────────────────────────────────────────────────
+
+let CXP_T = []
+let CXP_N = 0
+let CXP_P = 0
+let CXP_C = false
+let CXP_CTAGS = {}
+let CXP_TYPES = {}
+let CXP_TEMPLATES = {}
+let CXP_CLASSES = []
+let CXP_FURTHEST = nil
+let CXP_FURTHEST_POS = 0
+let CXP_CONV = nil
+
+fn cxCur() {
+    return CXP_T[CXP_P]
+}
+
+fn cxPeekTok(k) {
+    let j = CXP_P + k
+    if j > CXP_N - 1 {
+        j = CXP_N - 1
+    }
+    return CXP_T[j]
+}
+
+fn cxAt(kind) {
+    return CXP_T[CXP_P]["kind"] == kind
+}
+
+fn cxIs(s) {
+    let c = CXP_T[CXP_P]
+    return (c["kind"] == CX_PUNCT or c["kind"] == CX_IDENT) and c["text"] == s
+}
+
+fn cxIsAt(k, s) {
+    let x = cxPeekTok(k)
+    return (x["kind"] == CX_PUNCT or x["kind"] == CX_IDENT) and x["text"] == s
+}
+
+fn cxAccept(s) {
+    if cxIs(s) {
+        CXP_P = CXP_P + 1
+        return true
+    }
+    return false
+}
+
+fn cxIsPF(e) {
+    return typeof(e) == "object" and "pf" in e
+}
+
+# The parser backtracks (declaration first, then expression), so the failure
+# that propagates is often a later, shallower attempt. The one that got
+# furthest into the tokens is the parse the author meant: it is what a syntax
+# error is reported as (see cxParse).
+fn cxFail(msg) {
+    let c = cxCur()
+    let f = {"pf": true, "msg": msg, "line": c["line"], "file": c["file"], "col": c["col"]}
+    if CXP_FURTHEST == nil or CXP_P > CXP_FURTHEST_POS {
+        CXP_FURTHEST = f
+        CXP_FURTHEST_POS = CXP_P
+    }
+    raise f
+}
+
+fn cxExpect(s) {
+    if !cxAccept(s) {
+        cxFail("expected '" + s + "' near '" + cxCur()["text"] + "'")
+    }
+}
+
+fn cxIdent() {
+    if !cxAt(CX_IDENT) {
+        cxFail("expected identifier near '" + cxCur()["text"] + "'")
+    }
+    let t = CXP_T[CXP_P]["text"]
+    CXP_P = CXP_P + 1
+    return t
+}
+
+# `>>` closing two template argument lists at once
+fn cxExpectCloseAngle() {
+    if cxIs(">") {
+        CXP_P = CXP_P + 1
+        return nil
+    }
+    if cxIs(">>") {
+        CXP_T[CXP_P]["text"] = ">"
+        return nil
+    }
+    if cxIs(">=") {
+        CXP_T[CXP_P]["text"] = "="
+        return nil
+    }
+    if cxIs(">>=") {
+        CXP_T[CXP_P]["text"] = ">="
+        return nil
+    }
+    cxFail("expected '>'")
+}
+
+fn cxIsKeyword(w) {
+    return w in CX_KEYWORDS
+}
+
+# Starts a declaration: specifiers, a built-in or known type, `std::`
+# followed by a known type, or `struct X` style elaborated names.
+fn cxStartsType(k) {
+    let x = cxPeekTok(k)
+    if x["kind"] != CX_IDENT {
+        return x["kind"] == CX_PUNCT and x["text"] == "::" and cxPeekTok(k + 1)["kind"] == CX_IDENT and cxStartsType(k + 1)
+    }
+    let w = x["text"]
+    if w in CX_SPECIFIER_WORDS or w in CX_BUILTIN_WORDS {
+        return true
+    }
+    if w == "struct" or w == "class" or w == "enum" or w == "union" or w == "decltype" {
+        return true
+    }
+    if w in CXP_TYPES {
+        return true
+    }
+    # ns::Type
+    let j = k
+    while cxPeekTok(j)["kind"] == CX_IDENT and cxPeekTok(j + 1)["kind"] == CX_PUNCT and cxPeekTok(j + 1)["text"] == "::" {
+        j = j + 2
+    }
+    if j != k and cxPeekTok(j)["kind"] == CX_IDENT and cxPeekTok(j)["text"] in CXP_TYPES {
+        return true
+    }
+    return false
+}
+
+# ── types ───────────────────────────────────────────────────────────────────
+
+fn cxParseTemplateArgs() {
+    let args = []
+    cxExpect("<")
+    if cxIs(">") or cxIs(">>") {
+        cxExpectCloseAngle()
+        return args
+    }
+    while true {
+        let a = {"type": nil, "expr": nil}
+        let save = CXP_P
+        let asType = false
+        if cxStartsType(0) or (cxAt(CX_IDENT) and !cxIsKeyword(cxCur()["text"]) and (cxIsAt(1, ">") or cxIsAt(1, ",") or cxIsAt(1, ">>") or cxIsAt(1, "*") or cxIsAt(1, "&") or cxIsAt(1, "<") or cxIsAt(1, "("))) {
+            try {
+                a["type"] = cxParseTypeId()
+                if cxIs(">") or cxIs(",") or cxIs(">>") or cxIs(">=") or cxIs(">>=") or cxIs("...") {
+                    asType = true
+                } else {
+                    CXP_P = save
+                }
+            } catch (e) {
+                if !cxIsPF(e) {
+                    raise e
+                }
+                CXP_P = save
+            }
+        }
+        if !asType {
+            a["type"] = nil
+            a["expr"] = cxParseCondExpr(true)
+        }
+        cxAccept("...")
+        args.push(a)
+        if cxAccept(",") {
+            continue
+        }
+        cxExpectCloseAngle()
+        break
+    }
+    return args
+}
+
+fn cxSpecs() {
+    return {"isConst": false, "isStatic": false, "isExtern": false, "isInline": false, "isConstexpr": false,
+            "isVirtual": false, "isExplicit": false, "isFriend": false, "isTypedef": false, "isMutable": false}
+}
+
+fn cxParseSpecWords(s) {
+    while cxAt(CX_IDENT) and cxCur()["text"] in CX_SPECIFIER_WORDS {
+        let w = cxCur()["text"]
+        if w == "const" or w == "constexpr" {
+            s["isConst"] = s["isConst"] or w == "const"
+        }
+        if w == "constexpr" or w == "consteval" {
+            s["isConstexpr"] = true
+        }
+        if w == "static" {
+            s["isStatic"] = true
+        }
+        if w == "extern" {
+            s["isExtern"] = true
+        }
+        if w == "inline" {
+            s["isInline"] = true
+        }
+        if w == "virtual" {
+            s["isVirtual"] = true
+        }
+        if w == "explicit" {
+            s["isExplicit"] = true
+        }
+        if w == "friend" {
+            s["isFriend"] = true
+        }
+        if w == "typedef" {
+            s["isTypedef"] = true
+        }
+        if w == "mutable" {
+            s["isMutable"] = true
+        }
+        CXP_P = CXP_P + 1
+        if w == "extern" and cxAt(CX_STRING) {
+            CXP_P = CXP_P + 1
+        }
+        if w == "explicit" and cxIs("(") {
+            cxSkipBalanced("(", ")")
+        }
+    }
+}
+
+fn cxSkipAttributes() {
+    while true {
+        if cxIs("[") and cxIsAt(1, "[") {
+            let depth = 0
+            while true {
+                if cxIs("[") {
+                    depth = depth + 1
+                } elif cxIs("]") {
+                    depth = depth - 1
+                }
+                CXP_P = CXP_P + 1
+                if !(depth > 0 and !cxAt(CX_END)) {
+                    break
+                }
+            }
+            continue
+        }
+        if cxIs("__attribute__") or cxIs("__declspec") or cxIs("alignas") {
+            CXP_P = CXP_P + 1
+            if cxIs("(") {
+                cxSkipBalanced("(", ")")
+            }
+            continue
+        }
+        break
+    }
+}
+
+fn cxSkipBalanced(open, close) {
+    let depth = 0
+    while true {
+        if cxIs(open) {
+            depth = depth + 1
+        } elif cxIs(close) {
+            depth = depth - 1
+        }
+        CXP_P = CXP_P + 1
+        if !(depth > 0 and !cxAt(CX_END)) {
+            break
+        }
+    }
+}
+
+# the base type of a declaration (decl-specifiers), without declarators
+fn cxParseBaseType(specs) {
+    let ty = cxTypeName()
+    cxSkipAttributes()
+    cxParseSpecWords(specs)
+    cxSkipAttributes()
+    # built-in multiword
+    let words = []
+    while cxAt(CX_IDENT) and (cxCur()["text"] in CX_BUILTIN_WORDS or cxCur()["text"] == "const" or cxCur()["text"] == "volatile") {
+        if cxCur()["text"] == "const" {
+            ty["isConst"] = true
+        } elif cxCur()["text"] != "volatile" {
+            words.push(cxCur()["text"])
+        }
+        CXP_P = CXP_P + 1
+        cxParseSpecWords(specs)
+    }
+    if len(words) > 0 {
+        ty["name"].push(cxNormalizeBuiltin(words))
+        ty["targs"].push([])
+    } else {
+        if cxIs("struct") or cxIs("class") or cxIs("union") or cxIs("enum") or cxIs("typename") {
+            ty["elaborated"] = !cxIs("typename")
+            CXP_P = CXP_P + 1
+        }
+        if cxIs("decltype") {
+            CXP_P = CXP_P + 1
+            cxSkipBalanced("(", ")")
+            ty["name"].push("auto")
+            ty["targs"].push([])
+        } else {
+            cxAccept("::")
+            while true {
+                if !cxAt(CX_IDENT) or cxIsKeyword(cxCur()["text"]) {
+                    cxFail("expected a type near '" + cxCur()["text"] + "'")
+                }
+                let n = cxIdent()
+                ty["name"].push(n)
+                ty["targs"].push([])
+                if cxIs("<") and (n in CXP_TEMPLATES or n in CXP_TYPES) {
+                    ty["targs"][len(ty["targs"]) - 1] = cxParseTemplateArgs()
+                    ty["hasTargs"] = true
+                }
+                if cxIs("::") and cxPeekTok(1)["kind"] == CX_IDENT {
+                    CXP_P = CXP_P + 1
+                    cxAccept("template")
+                    continue
+                }
+                break
+            }
+        }
+    }
+    # trailing cv / specifiers: `int const`, `std::string const&`
+    while cxAt(CX_IDENT) and (cxCur()["text"] == "const" or cxCur()["text"] == "volatile" or cxCur()["text"] in CX_SPECIFIER_WORDS) {
+        if cxCur()["text"] == "const" {
+            ty["isConst"] = true
+        } else {
+            cxParseSpecWords(specs)
+        }
+        if cxCur()["text"] == "const" or cxCur()["text"] == "volatile" {
+            CXP_P = CXP_P + 1
+        }
+    }
+    if specs["isConst"] {
+        ty["isConst"] = true
+    }
+    return ty
+}
+
+fn cxNormalizeBuiltin(w) {
+    let longs = 0
+    let isUnsigned = false
+    let isSigned = false
+    let isShort = false
+    let isChar = false
+    let other = ""
+    for x in w {
+        if x == "long" {
+            longs = longs + 1
+        } elif x == "unsigned" {
+            isUnsigned = true
+        } elif x == "signed" {
+            isSigned = true
+        } elif x == "short" {
+            isShort = true
+        } elif x == "char" {
+            isChar = true
+        } elif x == "int" {
+            let skip = true
+        } else {
+            other = x
+        }
+    }
+    if other != "" {
+        if other == "double" and longs > 0 {
+            return "long double"
+        }
+        return other
+    }
+    if isChar {
+        if isUnsigned {
+            return "unsigned char"
+        }
+        if isSigned {
+            return "signed char"
+        }
+        return "char"
+    }
+    let base = "int"
+    if isShort {
+        base = "short"
+    } elif longs >= 2 {
+        base = "long long"
+    } elif longs == 1 {
+        base = "long"
+    }
+    if isUnsigned {
+        return "unsigned " + base
+    }
+    return base
+}
+
+# pointer / reference part of a declarator
+fn cxParsePtrOps(ty) {
+    while true {
+        cxSkipAttributes()
+        if cxAccept("*") {
+            ty["pointers"] = ty["pointers"] + 1
+            let c = false
+            while cxIs("const") or cxIs("volatile") or cxIs("__restrict") or cxIs("restrict") {
+                c = c or cxIs("const")
+                CXP_P = CXP_P + 1
+            }
+            ty["constPtr"].push(c)
+            continue
+        }
+        if CXP_C and (cxIs("&") or cxIs("&&")) {
+            cxFail("expected ';', ',' or ')' near '" + cxCur()["text"] + "'")
+        }
+        if cxAccept("&") {
+            ty["ref"] = true
+            continue
+        }
+        if cxAccept("&&") {
+            ty["rref"] = true
+            continue
+        }
+        break
+    }
+}
+
+# a type with an abstract declarator: template args, casts, sizeof, new
+fn cxParseTypeId() {
+    let s = cxSpecs()
+    let ty = cxParseBaseType(s)
+    cxParsePtrOps(ty)
+    # function type: R(Args)  or function pointer R(*)(Args)
+    if cxIs("(") and (cxIsAt(1, ")") or cxIsAt(1, "*") or cxStartsType(1)) {
+        let save = CXP_P
+        try {
+            if cxIsAt(1, "*") {
+                cxExpect("(")
+                cxExpect("*")
+                cxExpect(")")
+            }
+            let fn1 = cxTypeName()
+            fn1["isFunction"] = true
+            fn1["ret"] = ty
+            let vflag = {"v": false}
+            for prm in cxParseParams(vflag) {
+                fn1["params"].push(prm["type"])
+            }
+            if cxIsAt(0, "const") {
+                CXP_P = CXP_P + 1
+            }
+            cxAccept("noexcept")
+            cxParsePtrOps(fn1)
+            return fn1
+        } catch (e) {
+            if !cxIsPF(e) {
+                raise e
+            }
+            CXP_P = save
+        }
+    }
+    while cxIs("[") {
+        CXP_P = CXP_P + 1
+        if cxIs("]") {
+            ty["arrayDims"].push(nil)
+        } else {
+            ty["arrayDims"].push(cxParseExpr())
+        }
+        cxExpect("]")
+    }
+    return ty
+}
+
+# vflag: {"v": variadic}
+fn cxParseParams(vflag) {
+    let ps = []
+    cxExpect("(")
+    if cxIs("void") and cxIsAt(1, ")") {
+        CXP_P = CXP_P + 1
+    }
+    while !cxIs(")") {
+        if cxAccept("...") {
+            vflag["v"] = true
+            break
+        }
+        let prm = {"type": nil, "name": "", "def": nil}
+        let s = cxSpecs()
+        let base = cxParseBaseType(s)
+        let ty = cxTypeNameCopy(base)
+        cxParsePtrOps(ty)
+        if cxIs("(") and cxIsAt(1, "*") {
+            # function pointer parameter: R (*name)(Args)
+            cxExpect("(")
+            cxExpect("*")
+            if cxAt(CX_IDENT) {
+                prm["name"] = cxIdent()
+            }
+            cxExpect(")")
+            let fn1 = cxTypeName()
+            fn1["isFunction"] = true
+            fn1["ret"] = ty
+            let v2 = {"v": false}
+            for x in cxParseParams(v2) {
+                fn1["params"].push(x["type"])
+            }
+            fn1["pointers"] = 1
+            ty = fn1
+        } else {
+            cxAccept("...")
+            if cxAt(CX_IDENT) and !cxIsKeyword(cxCur()["text"]) {
+                prm["name"] = cxIdent()
+            }
+            let decayed = false
+            while cxIs("[") {
+                CXP_P = CXP_P + 1
+                let dim = nil
+                if !cxIs("]") {
+                    dim = cxParseExpr()
+                }
+                cxExpect("]")
+                if !decayed {
+                    # the array decays to a pointer to its first element
+                    ty["pointers"] = ty["pointers"] + 1
+                    ty["constPtr"].push(false)
+                    decayed = true
+                } else {
+                    ty["pointeeDims"].push(dim)
+                }
+            }
+        }
+        cxSkipAttributes()
+        prm["type"] = ty
+        if CXP_C and cxIs("=") {
+            cxFail("expected ';', ',' or ')' near '='")
+        }
+        if cxAccept("=") {
+            prm["def"] = cxParseAssignExpr()
+        }
+        ps.push(prm)
+        if !cxAccept(",") {
+            break
+        }
+    }
+    cxExpect(")")
+    return ps
+}
+
+# ── declarations ────────────────────────────────────────────────────────────
+
+# tflag: {"t": isTemplate}
+fn cxParseTemplateHeader(tflag) {
+    let params = []
+    tflag["t"] = false
+    while cxIs("template") {
+        tflag["t"] = true
+        CXP_P = CXP_P + 1
+        cxExpect("<")
+        while !cxIs(">") {
+            if cxIs("typename") or cxIs("class") {
+                CXP_P = CXP_P + 1
+                cxAccept("...")
+                if cxAt(CX_IDENT) {
+                    let n = cxIdent()
+                    params.push(n)
+                    CXP_TYPES[n] = true
+                }
+                if cxAccept("=") {
+                    cxParseTypeId()
+                }
+            } else {
+                # non-type parameter: int N = 3
+                let s = cxSpecs()
+                cxParseBaseType(s)
+                cxAccept("...")
+                if cxAt(CX_IDENT) {
+                    params.push(cxIdent())
+                }
+                if cxAccept("=") {
+                    cxParseCondExpr(true)
+                }
+            }
+            if !cxAccept(",") {
+                break
+            }
+        }
+        cxExpectCloseAngle()
+    }
+    return params
+}
+
+fn cxPushAll(out, xs) {
+    for x in xs {
+        out.push(x)
+    }
+}
+
+# One declaration at namespace or class scope (`cls` = enclosing class name).
+# A declaration with several declarators yields several Decls.
+fn cxParseDecl(inClass, cls) {
+    let line = cxCur()["line"]
+    let file = cxCur()["file"]
+    let tu = cxCur()["tu"]
+    let mk = [line, file, tu]
+    cxSkipAttributes()
+    if cxAccept(";") {
+        return []
+    }
+    if inClass and (cxIs("public") or cxIs("private") or cxIs("protected")) and cxIsAt(1, ":") {
+        CXP_P = CXP_P + 2
+        return []
+    }
+    let tflag = {"t": false}
+    let tparams = cxParseTemplateHeader(tflag)
+    let isTemplate = tflag["t"]
+    if cxIs("namespace") {
+        CXP_P = CXP_P + 1
+        let d = cxMkDecl("Namespace", line, file, tu)
+        if cxAt(CX_IDENT) {
+            d["name"].push(cxIdent())
+            while cxAccept("::") {
+                cxAccept("inline")
+                d["name"].push(cxIdent())
+            }
+        } else {
+            d["anonymous"] = true
+        }
+        if cxAccept("=") {
+            # namespace alias: namespace fs = std::filesystem;
+            while !cxIs(";") {
+                CXP_P = CXP_P + 1
+            }
+            cxExpect(";")
+            return []
+        }
+        cxExpect("{")
+        while !cxIs("}") and !cxAt(CX_END) {
+            cxPushAll(d["decls"], cxParseDecl(false, ""))
+        }
+        cxExpect("}")
+        return [d]
+    }
+    if cxIs("inline") and cxIsAt(1, "namespace") {
+        CXP_P = CXP_P + 1
+        return cxParseDecl(inClass, cls)
+    }
+    if cxIs("extern") and cxPeekTok(1)["kind"] == CX_STRING and cxIsAt(2, "{") {
+        CXP_P = CXP_P + 3
+        let all = []
+        while !cxIs("}") and !cxAt(CX_END) {
+            cxPushAll(all, cxParseDecl(false, ""))
+        }
+        cxExpect("}")
+        return all
+    }
+    if cxIs("using") {
+        CXP_P = CXP_P + 1
+        if cxAccept("namespace") {
+            let d = cxMkDecl("UsingDirective", line, file, tu)
+            cxAccept("::")
+            d["name"].push(cxIdent())
+            while cxAccept("::") {
+                d["name"].push(cxIdent())
+            }
+            cxExpect(";")
+            return [d]
+        }
+        if cxAt(CX_IDENT) and cxIsAt(1, "=") {
+            let d = cxMkDecl("Alias", line, file, tu)
+            d["name"].push(cxIdent())
+            cxExpect("=")
+            d["aliased"] = cxParseTypeId()
+            cxExpect(";")
+            CXP_TYPES[d["name"][0]] = true
+            d["isTemplate"] = isTemplate
+            d["templateParams"] = tparams
+            if isTemplate {
+                CXP_TEMPLATES[d["name"][0]] = true
+            }
+            return [d]
+        }
+        let d = cxMkDecl("UsingDecl", line, file, tu)
+        cxAccept("typename")
+        cxAccept("::")
+        d["name"].push(cxIdent())
+        while cxAccept("::") {
+            d["name"].push(cxIdent())
+        }
+        cxExpect(";")
+        let nn = len(d["name"])
+        if nn >= 2 and d["name"][nn - 1] == d["name"][nn - 2] {
+            d["inheritingCtor"] = true
+        }
+        return [d]
+    }
+    if cxIs("static_assert") {
+        CXP_P = CXP_P + 1
+        cxSkipBalanced("(", ")")
+        cxExpect(";")
+        return []
+    }
+    if cxIs("typedef") {
+        CXP_P = CXP_P + 1
+        let s = cxSpecs()
+        # typedef struct X { ... } Y;
+        if (cxIs("struct") or cxIs("class") or cxIs("union") or cxIs("enum")) and (cxIsAt(1, "{") or (cxPeekTok(1)["kind"] == CX_IDENT and cxIsAt(2, "{"))) {
+            let inner = cxParseClassOrEnum(inClass, mk)
+            # typedef struct { ... } Name;  the anonymous struct takes the typedef's name
+            let anon = len(inner["name"]) == 0 or inner["name"][len(inner["name"]) - 1] == ""
+            if anon {
+                let k = 0
+                while cxPeekTok(k)["kind"] == CX_PUNCT and cxPeekTok(k)["text"] == "*" {
+                    k = k + 1
+                }
+                inner["name"] = [cxPeekTok(k)["text"]]
+            }
+            let out = [inner]
+            while true {
+                let ty = cxTypeName()
+                ty["name"].push(inner["name"][len(inner["name"]) - 1])
+                ty["targs"].push([])
+                cxParsePtrOps(ty)
+                let aliasName = cxIdent()
+                CXP_TYPES[aliasName] = true
+                if !(aliasName == inner["name"][len(inner["name"]) - 1] and ty["pointers"] == 0) {
+                    let a = cxMkDecl("Alias", line, file, tu)
+                    a["name"].push(aliasName)
+                    a["aliased"] = ty
+                    out.push(a)
+                }
+                if !cxAccept(",") {
+                    break
+                }
+            }
+            cxExpect(";")
+            return out
+        }
+        let base = cxParseBaseType(s)
+        let out = []
+        while true {
+            let ty = cxTypeNameCopy(base)
+            cxParsePtrOps(ty)
+            let a = cxMkDecl("Alias", line, file, tu)
+            if cxIs("(") and cxIsAt(1, "*") {
+                # typedef R (*Name)(Args);
+                cxExpect("(")
+                cxExpect("*")
+                a["name"].push(cxIdent())
+                cxExpect(")")
+                let fn1 = cxTypeName()
+                fn1["isFunction"] = true
+                fn1["ret"] = ty
+                let v = {"v": false}
+                for x in cxParseParams(v) {
+                    fn1["params"].push(x["type"])
+                }
+                fn1["pointers"] = 1
+                ty = fn1
+            } else {
+                a["name"].push(cxIdent())
+                while cxIs("[") {
+                    CXP_P = CXP_P + 1
+                    if cxIs("]") {
+                        ty["arrayDims"].push(nil)
+                    } else {
+                        ty["arrayDims"].push(cxParseExpr())
+                    }
+                    cxExpect("]")
+                }
+            }
+            a["aliased"] = ty
+            CXP_TYPES[a["name"][0]] = true
+            out.push(a)
+            if !cxAccept(",") {
+                break
+            }
+        }
+        cxExpect(";")
+        return out
+    }
+    if (cxIs("struct") or cxIs("class") or cxIs("union") or cxIs("enum")) and (cxIsAt(1, "{") or (cxPeekTok(1)["kind"] == CX_IDENT and (cxIsAt(2, "{") or cxIsAt(2, ":") or cxIsAt(2, ";") or cxIsAt(2, "final") or (cxIsAt(1, "class") and cxIsAt(3, "{")) or (cxIsAt(1, "class") and cxIsAt(3, ":")) or (cxIsAt(1, "struct") and (cxIsAt(3, "{") or cxIsAt(3, ":")))))) {
+        let d = cxParseClassOrEnum(inClass, mk)
+        d["isTemplate"] = isTemplate
+        d["templateParams"] = tparams
+        if isTemplate {
+            CXP_TEMPLATES[d["name"][len(d["name"]) - 1]] = true
+        }
+        let out = [d]
+        # struct X { ... } a, b;
+        if !cxIs(";") {
+            let base = cxTypeName()
+            base["name"].push(d["name"][len(d["name"]) - 1])
+            base["targs"].push([])
+            let s = cxSpecs()
+            cxParseVarDeclarators(base, s, out, mk, inClass)
+            return out
+        }
+        cxExpect(";")
+        return out
+    }
+
+    # function or variable
+    let specs = cxSpecs()
+    cxSkipAttributes()
+    cxParseSpecWords(specs)
+    cxSkipAttributes()
+    let noreturn = false
+    # constructor / destructor / conversion operator have no return type
+    let ctorLike = false
+    if inClass and cxAt(CX_IDENT) and cxCur()["text"] == cls and cxIsAt(1, "(") {
+        ctorLike = true
+    }
+    if inClass and cxIs("~") {
+        ctorLike = true
+    }
+    if cxIs("operator") {
+        ctorLike = true
+    }
+    # out-of-class ctor/dtor: Cls::Cls( / Cls::~Cls(
+    if !inClass and cxAt(CX_IDENT) {
+        let j = 0
+        let q = []
+        while cxPeekTok(j)["kind"] == CX_IDENT and cxIsAt(j + 1, "::") {
+            q.push(cxPeekTok(j)["text"])
+            j = j + 2
+            if cxIsAt(j, "<") {
+                break
+            }
+        }
+        if len(q) > 0 and ((cxPeekTok(j)["kind"] == CX_IDENT and cxPeekTok(j)["text"] == q[len(q) - 1] and cxIsAt(j + 1, "(")) or cxIsAt(j, "~") or (cxIsAt(j, "operator") and !cxStartsAfterOperatorIsSymbol(j))) {
+            ctorLike = true
+        }
+    }
+    let base = nil
+    if !ctorLike {
+        base = cxParseBaseType(specs)
+    } else {
+        base = cxTypeName()
+        base["name"].push("void")
+        base["targs"].push([])
+    }
+    let out = []
+    # declarator(s)
+    let ty = cxTypeNameCopy(base)
+    cxParsePtrOps(ty)
+    cxSkipAttributes()
+    # function pointer variable: R (*name)(Args) = ...;
+    if cxIs("(") and cxIsAt(1, "*") {
+        cxExpect("(")
+        cxExpect("*")
+        let d = cxMkDecl("Var", line, file, tu)
+        let n = cxIdent()
+        let dims = []
+        while cxIs("[") {
+            CXP_P = CXP_P + 1
+            if cxIs("]") {
+                dims.push(nil)
+            } else {
+                dims.push(cxParseExpr())
+            }
+            cxExpect("]")
+        }
+        cxExpect(")")
+        let fn1 = cxTypeName()
+        fn1["isFunction"] = true
+        fn1["ret"] = ty
+        let v = {"v": false}
+        for x in cxParseParams(v) {
+            fn1["params"].push(x["type"])
+        }
+        fn1["pointers"] = 1
+        fn1["arrayDims"] = dims
+        d["name"].push(n)
+        d["var"]["name"] = n
+        d["var"]["type"] = fn1
+        d["var"]["line"] = line
+        d["isStatic"] = specs["isStatic"]
+        if cxAccept("=") {
+            d["var"]["init"] = "Copy"
+            d["var"]["args"].push(cxParseAssignExpr())
+        }
+        cxExpect(";")
+        return [d]
+    }
+    # name (qualified, operator, destructor)
+    let qname = []
+    let isOperator = false
+    let isDtor = false
+    while true {
+        if cxIs("~") {
+            CXP_P = CXP_P + 1
+            isDtor = true
+            qname.push("~" + cxIdent())
+            break
+        }
+        if cxIs("operator") {
+            CXP_P = CXP_P + 1
+            isOperator = true
+            qname.push("operator" + cxParseOperatorName())
+            break
+        }
+        if !cxAt(CX_IDENT) or cxIsKeyword(cxCur()["text"]) {
+            cxFail("expected a declarator name near '" + cxCur()["text"] + "'")
+        }
+        qname.push(cxIdent())
+        if cxIs("<") and qname[len(qname) - 1] in CXP_TEMPLATES and cxIsAt(0, "<") {
+            # explicit specialization / class template member: Cls<T>::f
+            let save = CXP_P
+            try {
+                cxParseTemplateArgs()
+            } catch (e) {
+                if !cxIsPF(e) {
+                    raise e
+                }
+                CXP_P = save
+            }
+        }
+        if cxIs("::") {
+            CXP_P = CXP_P + 1
+            continue
+        }
+        break
+    }
+    cxSkipAttributes()
+    let isFunc = cxIs("(") and !(inClass == false and cxLooksLikeDirectInit())
+    if isFunc {
+        let d = cxMkDecl("Func", line, file, tu)
+        d["name"] = qname
+        d["ret"] = ty
+        d["isOperator"] = isOperator
+        d["isDtor"] = isDtor
+        d["isStatic"] = specs["isStatic"]
+        d["isVirtual"] = specs["isVirtual"]
+        d["isExplicit"] = specs["isExplicit"]
+        d["isFriend"] = specs["isFriend"]
+        d["isInline"] = specs["isInline"]
+        d["isConstexpr"] = specs["isConstexpr"]
+        d["noreturn"] = noreturn
+        d["isTemplate"] = isTemplate
+        d["templateParams"] = tparams
+        if isTemplate {
+            CXP_TEMPLATES[qname[len(qname) - 1]] = true
+        }
+        let owner = ""
+        if inClass {
+            owner = cls
+        } elif len(qname) >= 2 {
+            owner = qname[len(qname) - 2]
+        }
+        d["isCtor"] = !isDtor and !isOperator and owner != "" and qname[len(qname) - 1] == owner
+        if d["isCtor"] or isDtor {
+            let rv = cxTypeName()
+            rv["name"].push("void")
+            rv["targs"].push([])
+            d["ret"] = rv
+        }
+        if isOperator and ctorLike and !d["isCtor"] {
+            # conversion operator: the type is in the name
+            if CXP_CONV != nil {
+                d["ret"] = CXP_CONV
+            }
+        }
+        let vflag = {"v": false}
+        d["params"] = cxParseParams(vflag)
+        d["variadic"] = vflag["v"]
+        # qualifiers
+        while true {
+            if cxAccept("const") {
+                d["isConst"] = true
+            } elif cxIs("volatile") or cxIs("&") or cxIs("&&") or cxIs("override") or cxIs("final") {
+                CXP_P = CXP_P + 1
+            } elif cxAccept("noexcept") {
+                if cxIs("(") {
+                    cxSkipBalanced("(", ")")
+                }
+            } elif cxIs("throw") and cxIsAt(1, "(") {
+                CXP_P = CXP_P + 1
+                cxSkipBalanced("(", ")")
+            } elif cxIs("->") {
+                CXP_P = CXP_P + 1
+                d["ret"] = cxParseTypeId()
+            } else {
+                break
+            }
+        }
+        cxSkipAttributes()
+        if cxAccept("=") {
+            if cxAccept("0") {
+                d["isPure"] = true
+            } elif cxAccept("default") {
+                d["isDefault"] = true
+            } elif cxAccept("delete") {
+                d["isDeleted"] = true
+            } elif cxAt(CX_INT) {
+                CXP_P = CXP_P + 1
+                d["isPure"] = true
+            }
+            cxExpect(";")
+            return [d]
+        }
+        if cxAccept(";") {
+            return [d]
+        }
+        if cxIs("try") {
+            CXP_P = CXP_P + 1
+        }
+        if cxAccept(":") {
+            # member initializer list
+            while true {
+                let mi = {"name": "", "args": [], "braced": false}
+                cxAccept("::")
+                mi["name"] = cxIdent()
+                while cxAccept("::") {
+                    mi["name"] = cxIdent()
+                }
+                if cxIs("<") {
+                    cxParseTemplateArgs()
+                }
+                if cxIs("{") {
+                    mi["braced"] = true
+                    mi["args"] = cxParseBraceList()
+                } else {
+                    cxExpect("(")
+                    if !cxIs(")") {
+                        mi["args"] = cxParseExprList(")")
+                    }
+                    cxExpect(")")
+                }
+                d["inits"].push(mi)
+                if !cxAccept(",") {
+                    break
+                }
+            }
+        }
+        CXP_CLASSES.push(owner)
+        d["body"] = cxParseBlock()
+        CXP_CLASSES.pop()
+        if cxIs("catch") {
+            cxParseCatches()
+        }
+        return [d]
+    }
+    # variables
+    let first = cxMkDecl("Var", line, file, tu)
+    first["name"] = qname
+    cxFinishVarDeclarator(first, ty, specs)
+    out.push(first)
+    while cxAccept(",") {
+        let t2 = cxTypeNameCopy(base)
+        cxParsePtrOps(t2)
+        let d = cxMkDecl("Var", line, file, tu)
+        d["name"].push(cxIdent())
+        cxFinishVarDeclarator(d, t2, specs)
+        out.push(d)
+    }
+    if inClass and cxAccept(":") {
+        cxParseCondExpr(false)
+    }
+    cxExpect(";")
+    return out
+}
+
+fn cxStartsAfterOperatorIsSymbol(j) {
+    return cxPeekTok(j + 1)["kind"] == CX_PUNCT
+}
+
+fn cxParseOperatorName() {
+    CXP_CONV = nil
+    if cxAccept("(") {
+        cxExpect(")")
+        return "()"
+    }
+    if cxAccept("[") {
+        cxExpect("]")
+        return "[]"
+    }
+    if cxIs("new") or cxIs("delete") {
+        let w = cxIdent()
+        if cxAccept("[") {
+            cxExpect("]")
+            w = w + "[]"
+        }
+        return " " + w
+    }
+    if cxAt(CX_PUNCT) {
+        let t = CXP_T[CXP_P]["text"]
+        CXP_P = CXP_P + 1
+        return t
+    }
+    if cxAt(CX_STRING) and cxCur()["value"] == "" {
+        CXP_P = CXP_P + 1
+        return "\"\"" + cxIdent()
+    }
+    # conversion operator: operator bool / operator int / operator std::string
+    let s = cxSpecs()
+    let ty = cxParseBaseType(s)
+    cxParsePtrOps(ty)
+    CXP_CONV = ty
+    return " " + cxTypeNameStr(ty)
+}
+
+# At `(` after a declarator name: `T x(args)` is a variable built from
+# arguments when the parentheses hold expressions rather than parameter
+# declarations.
+fn cxLooksLikeDirectInit() {
+    if cxIsAt(1, ")") {
+        return false
+    }
+    let x = cxPeekTok(1)
+    let k = x["kind"]
+    if k == CX_INT or k == CX_FLOAT or k == CX_STRING or k == CX_CHAR {
+        return true
+    }
+    if k == CX_PUNCT and x["text"] != "::" {
+        return !(x["text"] == "." and cxIsAt(2, "."))
+    }
+    if k == CX_IDENT and (x["text"] == "true" or x["text"] == "false" or x["text"] == "nullptr" or x["text"] == "this" or x["text"] == "new") {
+        return true
+    }
+    return !cxStartsType(1)
+}
+
+fn cxFinishVarDeclarator(d, ty, specs) {
+    if len(d["name"]) == 0 {
+        d["var"]["name"] = ""
+    } else {
+        d["var"]["name"] = d["name"][len(d["name"]) - 1]
+    }
+    d["var"]["line"] = d["line"]
+    d["isStatic"] = specs["isStatic"]
+    d["isExtern"] = specs["isExtern"]
+    d["isConstexpr"] = specs["isConstexpr"]
+    while cxIs("[") {
+        CXP_P = CXP_P + 1
+        if cxIs("]") {
+            ty["arrayDims"].push(nil)
+        } else {
+            ty["arrayDims"].push(cxParseExpr())
+        }
+        cxExpect("]")
+    }
+    d["var"]["type"] = ty
+    cxParseInitializer(d["var"])
+}
+
+fn cxParseInitializer(v) {
+    if cxAccept("=") {
+        if cxIs("{") {
+            v["init"] = "Brace"
+            v["args"] = cxParseBraceList()
+        } else {
+            v["init"] = "Copy"
+            v["args"].push(cxParseAssignExpr())
+        }
+    } elif cxIs("{") {
+        v["init"] = "Brace"
+        v["args"] = cxParseBraceList()
+    } elif cxIs("(") {
+        CXP_P = CXP_P + 1
+        v["init"] = "Direct"
+        if !cxIs(")") {
+            v["args"] = cxParseExprList(")")
+        }
+        cxExpect(")")
+    }
+}
+
+fn cxParseVarDeclarators(base, specs, out, mk, inClass) {
+    while true {
+        let ty = cxTypeNameCopy(base)
+        cxParsePtrOps(ty)
+        let d = cxMkDecl("Var", mk[0], mk[1], mk[2])
+        d["name"].push(cxIdent())
+        cxFinishVarDeclarator(d, ty, specs)
+        out.push(d)
+        if !cxAccept(",") {
+            break
+        }
+    }
+    cxExpect(";")
+}
+
+fn cxParseClassOrEnum(inClass, mk) {
+    if cxAccept("enum") {
+        let d = cxMkDecl("Enum", mk[0], mk[1], mk[2])
+        if cxAccept("class") or cxAccept("struct") {
+            d["scoped"] = true
+        }
+        if cxAt(CX_IDENT) {
+            d["name"].push(cxIdent())
+        } else {
+            d["name"].push("")
+        }
+        let last = d["name"][len(d["name"]) - 1]
+        if last != "" and !CXP_C {
+            CXP_TYPES[last] = true
+        }
+        if cxAccept(":") {
+            let s = cxSpecs()
+            d["underlying"] = cxParseBaseType(s)
+        }
+        if cxAccept(";") {
+            CXP_P = CXP_P - 1
+            d["forwardOnly"] = true
+            return d
+        }
+        cxExpect("{")
+        while !cxIs("}") {
+            let n = cxIdent()
+            cxSkipAttributes()
+            let v = nil
+            if cxAccept("=") {
+                v = cxParseCondExpr(false)
+            }
+            d["enumerators"].push([n, v])
+            if !cxAccept(",") {
+                break
+            }
+        }
+        cxExpect("}")
+        return d
+    }
+    let d = cxMkDecl("Class", mk[0], mk[1], mk[2])
+    d["isStruct"] = cxIs("struct")
+    d["isUnion"] = cxIs("union")
+    CXP_P = CXP_P + 1
+    cxSkipAttributes()
+    if cxAt(CX_IDENT) and !cxIs("final") {
+        d["name"].push(cxIdent())
+    } else {
+        d["name"].push("")
+    }
+    let last = d["name"][len(d["name"]) - 1]
+    if last != "" and !CXP_C {
+        CXP_TYPES[last] = true
+    }
+    if last != "" and CXP_C {
+        CXP_CTAGS[last] = true
+    }
+    cxAccept("final")
+    if cxIs(";") {
+        d["forwardOnly"] = true
+        return d
+    }
+    if cxAccept(":") {
+        while true {
+            while cxIs("public") or cxIs("private") or cxIs("protected") or cxIs("virtual") {
+                CXP_P = CXP_P + 1
+            }
+            d["bases"].push(cxParseTypeId())
+            if !cxAccept(",") {
+                break
+            }
+        }
+    }
+    cxExpect("{")
+    CXP_CLASSES.push(last)
+    let access = "private"
+    if d["isStruct"] or d["isUnion"] {
+        access = "public"
+    }
+    while !cxIs("}") and !cxAt(CX_END) {
+        if (cxIs("public") or cxIs("private") or cxIs("protected")) and cxIsAt(1, ":") {
+            access = cxCur()["text"]
+            CXP_P = CXP_P + 2
+            continue
+        }
+        if cxIs("friend") and (cxIsAt(1, "class") or cxIsAt(1, "struct")) and cxPeekTok(2)["kind"] == CX_IDENT {
+            # friend class X;
+            d["friendNames"].push(cxPeekTok(2)["text"])
+            while !cxIs(";") and !cxAt(CX_END) {
+                CXP_P = CXP_P + 1
+            }
+            cxAccept(";")
+            continue
+        }
+        let ms = cxParseDecl(true, last)
+        for m in ms {
+            m["access"] = access
+            if m["isFriend"] and len(m["name"]) > 0 {
+                d["friendNames"].push(m["name"][len(m["name"]) - 1])
+            }
+            if m["k"] == "Func" and m["isFriend"] and m["body"] == nil {
+                continue
+            }
+            d["members"].push(m)
+        }
+    }
+    CXP_CLASSES.pop()
+    cxExpect("}")
+    return d
+}
+
+# ── statements ──────────────────────────────────────────────────────────────
+
+fn cxMkStmt(k) {
+    return cxStmt(k, cxCur()["line"])
+}
+
+fn cxParseBlock() {
+    let b = cxMkStmt("Block")
+    cxExpect("{")
+    while !cxIs("}") and !cxAt(CX_END) {
+        b["body"].push(cxParseStmt())
+    }
+    cxExpect("}")
+    return b
+}
+
+fn cxParseCatches() {
+    let cs = []
+    while cxAccept("catch") {
+        let c = {"type": nil, "name": "", "body": nil}
+        cxExpect("(")
+        if !cxAccept("...") {
+            let s = cxSpecs()
+            let ty = cxParseBaseType(s)
+            cxParsePtrOps(ty)
+            if cxAt(CX_IDENT) {
+                c["name"] = cxIdent()
+            }
+            c["type"] = ty
+        }
+        cxExpect(")")
+        c["body"] = cxParseBlock()
+        cs.push(c)
+    }
+    return cs
+}
+
+fn cxInitListAt() {
+    let il = cxExpr("InitList", cxCur()["line"])
+    il["kids"] = cxParseBraceList()
+    return il
+}
+
+fn cxParseStmt() {
+    cxSkipAttributes()
+    if cxIs("{") {
+        return cxParseBlock()
+    }
+    if cxAccept(";") {
+        return cxMkStmt("Empty")
+    }
+    if cxIs("if") {
+        let s = cxMkStmt("If")
+        CXP_P = CXP_P + 1
+        cxAccept("constexpr")
+        cxExpect("(")
+        cxParseCondition(s)
+        cxExpect(")")
+        s["then"] = cxParseStmt()
+        if cxAccept("else") {
+            s["els"] = cxParseStmt()
+        }
+        return s
+    }
+    if cxIs("while") {
+        let s = cxMkStmt("While")
+        CXP_P = CXP_P + 1
+        cxExpect("(")
+        cxParseCondition(s)
+        cxExpect(")")
+        s["then"] = cxParseStmt()
+        return s
+    }
+    if cxIs("do") {
+        let s = cxMkStmt("Do")
+        CXP_P = CXP_P + 1
+        s["then"] = cxParseStmt()
+        cxExpect("while")
+        cxExpect("(")
+        s["expr"] = cxParseExpr()
+        cxExpect(")")
+        cxExpect(";")
+        return s
+    }
+    if cxIs("for") {
+        CXP_P = CXP_P + 1
+        cxExpect("(")
+        # range-for: for (decl : expr)
+        let save = CXP_P
+        if cxStartsType(0) and !CXP_C {
+            let ranged = nil
+            try {
+                let s = cxMkStmt("RangeFor")
+                let specs = cxSpecs()
+                let base = cxParseBaseType(specs)
+                let ty = cxTypeNameCopy(base)
+                cxParsePtrOps(ty)
+                let v = cxVarDecl()
+                v["line"] = cxCur()["line"]
+                if cxIs("[") {
+                    CXP_P = CXP_P + 1
+                    while true {
+                        v["bindings"].push(cxIdent())
+                        if !cxAccept(",") {
+                            break
+                        }
+                    }
+                    cxExpect("]")
+                } else {
+                    v["name"] = cxIdent()
+                }
+                v["type"] = ty
+                if cxAccept(":") {
+                    s["decls"].push(v)
+                    if cxIs("{") {
+                        s["expr"] = cxInitListAt()
+                    } else {
+                        s["expr"] = cxParseExpr()
+                    }
+                    cxExpect(")")
+                    s["then"] = cxParseStmt()
+                    ranged = s
+                }
+            } catch (e) {
+                if !cxIsPF(e) {
+                    raise e
+                }
+            }
+            if ranged != nil {
+                return ranged
+            }
+            CXP_P = save
+        }
+        let s = cxMkStmt("For")
+        if !cxAccept(";") {
+            s["init"] = cxParseSimpleStmt()
+        }
+        if !cxIs(";") {
+            s["cond2"] = cxParseExpr()
+        }
+        cxExpect(";")
+        if !cxIs(")") {
+            s["step"] = cxParseExpr()
+        }
+        cxExpect(")")
+        s["then"] = cxParseStmt()
+        return s
+    }
+    if cxIs("switch") {
+        let s = cxMkStmt("Switch")
+        CXP_P = CXP_P + 1
+        cxExpect("(")
+        cxParseCondition(s)
+        cxExpect(")")
+        let body = cxParseStmt()
+        if body["k"] == "Block" {
+            s["body"] = body["body"]
+        } else {
+            s["body"].push(body)
+        }
+        return s
+    }
+    if cxIs("case") {
+        let s = cxMkStmt("Case")
+        CXP_P = CXP_P + 1
+        s["expr"] = cxParseCondExpr(false)
+        if cxAccept("...") {
+            cxParseCondExpr(false)
+        }
+        cxExpect(":")
+        return s
+    }
+    if cxIs("default") and cxIsAt(1, ":") {
+        let s = cxMkStmt("Default")
+        CXP_P = CXP_P + 2
+        return s
+    }
+    if cxIs("break") {
+        let s = cxMkStmt("Break")
+        CXP_P = CXP_P + 1
+        cxExpect(";")
+        return s
+    }
+    if cxIs("continue") {
+        let s = cxMkStmt("Continue")
+        CXP_P = CXP_P + 1
+        cxExpect(";")
+        return s
+    }
+    if cxIs("return") {
+        let s = cxMkStmt("Return")
+        CXP_P = CXP_P + 1
+        if cxIs("{") {
+            s["expr"] = cxInitListAt()
+        } elif !cxIs(";") {
+            s["expr"] = cxParseExpr()
+        }
+        cxExpect(";")
+        return s
+    }
+    if cxIs("try") {
+        let s = cxMkStmt("Try")
+        CXP_P = CXP_P + 1
+        s["then"] = cxParseBlock()
+        s["catches"] = cxParseCatches()
+        return s
+    }
+    if cxIs("goto") {
+        cxFail("goto is not supported")
+    }
+    if cxAt(CX_IDENT) and cxIsAt(1, ":") and !cxIsAt(2, ":") and !cxIsKeyword(cxCur()["text"]) and !(cxCur()["text"] in CXP_TYPES) {
+        cxFail("labels are not supported")
+    }
+    if cxIs("struct") or cxIs("class") or cxIs("union") or cxIs("enum") or cxIs("using") or cxIs("typedef") or cxIs("static_assert") or cxIs("template") {
+        # local type / alias / using-directive
+        let s0 = cxMkStmt("LocalClass")
+        let ds = cxParseDecl(false, "")
+        let blk = cxMkStmt("Block")
+        for d in ds {
+            let ls = cxMkStmt("LocalClass")
+            ls["local"] = d
+            if d["k"] == "Var" {
+                # struct X {...} x; -> a declaration of x as well
+                let vs = cxMkStmt("Decl")
+                vs["decls"].push(d["var"])
+                vs["isStatic"] = d["isStatic"]
+                blk["body"].push(vs)
+                continue
+            }
+            blk["body"].push(ls)
+        }
+        if len(blk["body"]) == 1 {
+            return blk["body"][0]
+        }
+        # a pseudo block that does not open a scope
+        let sq = cxMkStmt("Block")
+        sq["body"] = blk["body"]
+        sq["isStatic"] = true
+        return sq
+    }
+    return cxParseSimpleStmt()
+}
+
+# declaration or expression statement (also a for-init), with ';'
+fn cxParseSimpleStmt() {
+    # C: `Point p;` for a `struct Point` (no typedef) -- gcc's own advice
+    if CXP_C and cxAt(CX_IDENT) and cxCur()["text"] in CXP_CTAGS and !(cxCur()["text"] in CXP_TYPES) and (cxPeekTok(1)["kind"] == CX_IDENT or (cxPeekTok(1)["kind"] == CX_PUNCT and cxPeekTok(1)["text"] == "*")) {
+        cxFail("unknown type name '" + cxCur()["text"] + "'; use 'struct' keyword to refer to the type")
+    }
+    if cxStartsType(0) {
+        let save = CXP_P
+        let decl = nil
+        try {
+            decl = cxParseLocalDecl(true)
+        } catch (e) {
+            if !cxIsPF(e) {
+                raise e
+            }
+            CXP_P = save
+        }
+        if decl != nil {
+            return decl
+        }
+    }
+    let s = cxMkStmt("Expr")
+    s["expr"] = cxParseExpr()
+    cxExpect(";")
+    return s
+}
+
+fn cxParseLocalDecl(needSemi) {
+    let s = cxMkStmt("Decl")
+    let specs = cxSpecs()
+    let base = cxParseBaseType(specs)
+    s["isStatic"] = specs["isStatic"]
+    while true {
+        let ty = cxTypeNameCopy(base)
+        cxParsePtrOps(ty)
+        let v = cxVarDecl()
+        v["line"] = cxCur()["line"]
+        let done = false
+        if cxIs("[") and cxIsAutoType(base) {
+            CXP_P = CXP_P + 1
+            while true {
+                v["bindings"].push(cxIdent())
+                if !cxAccept(",") {
+                    break
+                }
+            }
+            cxExpect("]")
+            v["type"] = ty
+            cxParseInitializer(v)
+            s["decls"].push(v)
+            done = true
+        } elif cxIs("(") and cxIsAt(1, "*") {
+            cxExpect("(")
+            cxExpect("*")
+            v["name"] = cxIdent()
+            let dims = []
+            while cxIs("[") {
+                CXP_P = CXP_P + 1
+                if cxIs("]") {
+                    dims.push(nil)
+                } else {
+                    dims.push(cxParseExpr())
+                }
+                cxExpect("]")
+            }
+            cxExpect(")")
+            let fn1 = cxTypeName()
+            fn1["isFunction"] = true
+            fn1["ret"] = ty
+            let vv = {"v": false}
+            for x in cxParseParams(vv) {
+                fn1["params"].push(x["type"])
+            }
+            fn1["pointers"] = 1
+            fn1["arrayDims"] = dims
+            v["type"] = fn1
+            cxParseInitializer(v)
+            s["decls"].push(v)
+            done = true
+        }
+        if !done {
+            v["name"] = cxIdent()
+            if cxIsKeyword(v["name"]) {
+                cxFail("keyword as a name")
+            }
+            while cxIs("[") {
+                CXP_P = CXP_P + 1
+                if cxIs("]") {
+                    ty["arrayDims"].push(nil)
+                } else {
+                    ty["arrayDims"].push(cxParseExpr())
+                }
+                cxExpect("]")
+            }
+            v["type"] = ty
+            if cxIs("(") and !cxLooksLikeDirectInit() {
+                # a local function declaration (`T f();`, `int g(int)`): skip
+                let vv = {"v": false}
+                cxParseParams(vv)
+                while cxIs("const") or cxIs("noexcept") {
+                    CXP_P = CXP_P + 1
+                }
+            } else {
+                cxParseInitializer(v)
+                s["decls"].push(v)
+            }
+        }
+        if !cxAccept(",") {
+            break
+        }
+    }
+    if needSemi {
+        cxExpect(";")
+    }
+    if len(s["decls"]) == 0 {
+        s["k"] = "Empty"
+    }
+    return s
+}
+
+# if/while/switch condition: an expression, or `T x = e` / init-statement
+fn cxParseCondition(s) {
+    if cxStartsType(0) {
+        let save = CXP_P
+        let settled = false
+        try {
+            let d = cxParseLocalDecl(false)
+            if cxAccept(";") {
+                s["init"] = d
+                s["expr"] = cxParseExpr()
+                settled = true
+            } elif cxIs(")") and d["k"] == "Decl" and len(d["decls"]) == 1 and d["decls"][0]["init"] != "None" {
+                s["condDecl"] = d
+                settled = true
+            }
+        } catch (e) {
+            if !cxIsPF(e) {
+                raise e
+            }
+        }
+        if settled {
+            return nil
+        }
+        CXP_P = save
+    }
+    s["expr"] = cxParseExpr()
+    if cxAccept(";") {
+        let init = cxMkStmt("Expr")
+        init["expr"] = s["expr"]
+        s["init"] = init
+        s["expr"] = cxParseExpr()
+    }
+}
+
+# ── expressions ─────────────────────────────────────────────────────────────
+
+fn cxParseExprList(close) {
+    let v = []
+    while !cxIs(close) {
+        if cxIs("{") {
+            v.push(cxInitListAt())
+        } else {
+            v.push(cxParseAssignExpr())
+        }
+        cxAccept("...")
+        if !cxAccept(",") {
+            break
+        }
+    }
+    return v
+}
+
+# `[i] = e` in a brace list (not a lambda's `[captures](...)`)
+fn cxDesignatorAhead() {
+    let depth = 0
+    let k = 0
+    while CXP_P + k < CXP_N {
+        let t = CXP_T[CXP_P + k]
+        if t["kind"] == CX_PUNCT and (t["text"] == "[" or t["text"] == "(" or t["text"] == "{") {
+            depth = depth + 1
+        } elif t["kind"] == CX_PUNCT and (t["text"] == "]" or t["text"] == ")" or t["text"] == "}") {
+            depth = depth - 1
+            if depth == 0 {
+                return cxIsAt(k + 1, "=")
+            }
+        } elif t["kind"] == CX_END {
+            return false
+        }
+        k = k + 1
+    }
+    return false
+}
+
+fn cxParseBraceList() {
+    cxExpect("{")
+    let v = []
+    while !cxIs("}") {
+        # designated initializers: .x = 1, [2] = 3
+        let field = ""
+        let index = nil
+        if cxIs(".") and cxPeekTok(1)["kind"] == CX_IDENT and cxIsAt(2, "=") {
+            field = cxPeekTok(1)["text"]
+            CXP_P = CXP_P + 3
+        } elif cxIs("[") and cxDesignatorAhead() {
+            CXP_P = CXP_P + 1
+            index = cxParseAssignExpr()
+            cxExpect("]")
+            cxExpect("=")
+        }
+        if cxIs("{") {
+            v.push(cxInitListAt())
+        } else {
+            v.push(cxParseAssignExpr())
+        }
+        v[len(v) - 1]["designator"] = field
+        v[len(v) - 1]["designIndex"] = index
+        if !cxAccept(",") {
+            break
+        }
+    }
+    cxExpect("}")
+    return v
+}
+
+fn cxParseExpr() {
+    let e = cxParseAssignExpr()
+    while cxIs(",") {
+        let line = cxCur()["line"]
+        CXP_P = CXP_P + 1
+        let c = cxExpr("Comma", line)
+        c["kids"] = [e, cxParseAssignExpr()]
+        e = c
+    }
+    return e
+}
+
+let CX_ASSIGN_OPS = ["=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "<<=", ">>="]
+
+fn cxParseAssignExpr() {
+    let line = cxCur()["line"]
+    if cxIs("throw") {
+        CXP_P = CXP_P + 1
+        let e = cxExpr("Throw", line)
+        if !cxIs(";") and !cxIs(")") and !cxIs(",") and !cxIs(":") {
+            e["kids"].push(cxParseAssignExpr())
+        }
+        return e
+    }
+    let l = cxParseCondExpr(false)
+    for op in CX_ASSIGN_OPS {
+        if cxIs(op) {
+            CXP_P = CXP_P + 1
+            let e = cxExpr("Assign", line)
+            e["op"] = op
+            let r = nil
+            if cxIs("{") {
+                r = cxInitListAt()
+            } else {
+                r = cxParseAssignExpr()
+            }
+            e["kids"] = [l, r]
+            return e
+        }
+    }
+    return l
+}
+
+# `inTArgs`: inside template arguments, where '>' ends the expression
+fn cxParseCondExpr(inTArgs) {
+    let line = cxCur()["line"]
+    let c = cxParseBin(0, inTArgs)
+    if cxIs("?") {
+        CXP_P = CXP_P + 1
+        let e = cxExpr("Cond", line)
+        let a = cxParseExpr()
+        cxExpect(":")
+        let b = cxParseAssignExpr()
+        e["kids"] = [c, a, b]
+        return e
+    }
+    return c
+}
+
+let CX_PREC = {"||": 1, "&&": 2, "|": 3, "^": 4, "&": 5, "==": 6, "!=": 6, "<=>": 7, "<": 7, "<=": 7, ">=": 7,
+               ">": 7, "<<": 8, ">>": 8, "+": 9, "-": 9, "*": 10, "/": 10, "%": 10}
+
+fn cxPrecOf(op, inTArgs) {
+    if inTArgs and (op == ">" or op == ">>") {
+        return -1
+    }
+    if op in CX_PREC {
+        return CX_PREC[op]
+    }
+    return -1
+}
+
+let CX_ALT_OPS = {"and": "&&", "or": "||", "bitand": "&", "bitor": "|", "xor": "^", "not_eq": "!="}
+
+fn cxParseBin(minPrec, inTArgs) {
+    let l = cxParseUnary()
+    while cxAt(CX_PUNCT) or (cxAt(CX_IDENT) and cxCur()["text"] in CX_ALT_OPS) {
+        let op = cxCur()["text"]
+        if cxAt(CX_IDENT) {
+            op = CX_ALT_OPS[op]
+        }
+        let p = cxPrecOf(op, inTArgs)
+        if p < 0 or p < minPrec {
+            break
+        }
+        let line = cxCur()["line"]
+        CXP_P = CXP_P + 1
+        let r = cxParseBin(p + 1, inTArgs)
+        let e = cxExpr("Binary", line)
+        e["op"] = op
+        e["kids"] = [l, r]
+        l = e
+    }
+    return l
+}
+
+let CX_PREFIX_OPS = ["++", "--", "+", "-", "!", "~", "*", "&"]
+
+fn cxParseUnary() {
+    let line = cxCur()["line"]
+    for op in CX_PREFIX_OPS {
+        if cxIs(op) {
+            CXP_P = CXP_P + 1
+            let e = cxExpr("Unary", line)
+            e["op"] = op
+            e["kids"].push(cxParseUnary())
+            return e
+        }
+    }
+    if cxIs("not") {
+        CXP_P = CXP_P + 1
+        let e = cxExpr("Unary", line)
+        e["op"] = "!"
+        e["kids"].push(cxParseUnary())
+        return e
+    }
+    if cxIs("sizeof") or cxIs("alignof") {
+        CXP_P = CXP_P + 1
+        cxAccept("...")
+        if cxIs("(") and cxStartsType(1) {
+            let save = CXP_P
+            let got = nil
+            try {
+                CXP_P = CXP_P + 1
+                let ty = cxParseTypeId()
+                cxExpect(")")
+                let e = cxExpr("SizeofT", line)
+                e["type"] = ty
+                got = e
+            } catch (e2) {
+                if !cxIsPF(e2) {
+                    raise e2
+                }
+                CXP_P = save
+            }
+            if got != nil {
+                return got
+            }
+        }
+        let e = cxExpr("SizeofE", line)
+        e["kids"].push(cxParseUnary())
+        return e
+    }
+    if cxIs("new") {
+        CXP_P = CXP_P + 1
+        let e = cxExpr("New", line)
+        if cxIs("(") {
+            cxFail("placement new is not supported")
+        }
+        let s = cxSpecs()
+        let ty = cxParseBaseType(s)
+        cxParsePtrOps(ty)
+        e["type"] = ty
+        if cxAccept("[") {
+            e["newArray"] = true
+            e["kids"].push(cxParseExpr())
+            cxExpect("]")
+            if cxIs("{") {
+                e["braced"] = true
+                cxPushAll(e["kids"], cxParseBraceList())
+            } elif cxIs("(") {
+                CXP_P = CXP_P + 1
+                cxExpect(")")
+            }
+        } elif cxIs("(") {
+            CXP_P = CXP_P + 1
+            if !cxIs(")") {
+                e["kids"] = cxParseExprList(")")
+            }
+            cxExpect(")")
+        } elif cxIs("{") {
+            e["braced"] = true
+            e["kids"] = cxParseBraceList()
+        }
+        return e
+    }
+    if cxIs("delete") {
+        CXP_P = CXP_P + 1
+        if cxIs("[") and cxIsAt(1, "]") {
+            CXP_P = CXP_P + 2
+        }
+        let e = cxExpr("Delete", line)
+        e["kids"].push(cxParseUnary())
+        return e
+    }
+    # C-style cast: (T)expr
+    if cxIs("(") and cxStartsType(1) {
+        let save = CXP_P
+        let got = nil
+        try {
+            CXP_P = CXP_P + 1
+            let ty = cxParseTypeId()
+            cxExpect(")")
+            if cxIs("{") {
+                # compound literal (T){...}
+                let e = cxExpr("Construct", line)
+                e["type"] = ty
+                e["braced"] = true
+                e["kids"] = cxParseBraceList()
+                got = cxParsePostfix(e)
+            } elif cxAt(CX_IDENT) or cxAt(CX_INT) or cxAt(CX_FLOAT) or cxAt(CX_CHAR) or cxAt(CX_STRING) or cxIs("(") or cxIs("-") or cxIs("+") or cxIs("!") or cxIs("~") or cxIs("*") or cxIs("&") or cxIs("::") {
+                # must be followed by an operand
+                let e = cxExpr("Cast", line)
+                e["op"] = "c"
+                e["type"] = ty
+                e["kids"].push(cxParseUnary())
+                got = e
+            }
+        } catch (e3) {
+            if !cxIsPF(e3) {
+                raise e3
+            }
+        }
+        if got != nil {
+            return got
+        }
+        CXP_P = save
+    }
+    return cxParsePostfix(cxParsePrimary())
+}
+
+fn cxParsePostfix(e) {
+    while true {
+        let line = cxCur()["line"]
+        if cxIs("(") and e["k"] == "Name" and len(e["name"]) == 1 and e["name"][0] == "va_arg" {
+            # va_arg(ap, T): the type is carried by a sizeof node
+            CXP_P = CXP_P + 1
+            let c = cxExpr("Call", line)
+            c["kids"].push(e)
+            c["kids"].push(cxParseAssignExpr())
+            cxExpect(",")
+            let t = cxExpr("SizeofT", line)
+            let s = cxSpecs()
+            t["type"] = cxParseBaseType(s)
+            cxParsePtrOps(t["type"])
+            c["kids"].push(t)
+            cxExpect(")")
+            e = c
+            continue
+        }
+        if cxIs("(") {
+            CXP_P = CXP_P + 1
+            let c = cxExpr("Call", line)
+            c["kids"].push(e)
+            cxPushAll(c["kids"], cxParseExprList(")"))
+            cxExpect(")")
+            e = c
+            continue
+        }
+        if cxIs("[") {
+            CXP_P = CXP_P + 1
+            let c = cxExpr("Index", line)
+            let idx = nil
+            if cxIs("{") {
+                idx = cxInitListAt()
+            } else {
+                idx = cxParseExpr()
+            }
+            c["kids"] = [e, idx]
+            cxExpect("]")
+            e = c
+            continue
+        }
+        if cxIs(".") or cxIs("->") {
+            let arrow = cxIs("->")
+            CXP_P = CXP_P + 1
+            cxAccept("template")
+            let m = cxExpr("Member", line)
+            m["arrow"] = arrow
+            m["kids"].push(e)
+            if cxIs("~") {
+                CXP_P = CXP_P + 1
+                m["op"] = "~" + cxIdent()
+            } elif cxIs("operator") {
+                CXP_P = CXP_P + 1
+                m["op"] = "operator" + cxParseOperatorName()
+            } else {
+                m["op"] = cxIdent()
+                # qualified member: obj.Base::f()
+                while cxIs("::") {
+                    CXP_P = CXP_P + 1
+                    m["op"] = cxIdent()
+                }
+            }
+            if cxIs("<") and m["op"] in CXP_TEMPLATES {
+                let save = CXP_P
+                try {
+                    m["targs"] = cxParseTemplateArgs()
+                    m["hasTargs"] = true
+                } catch (e4) {
+                    if !cxIsPF(e4) {
+                        raise e4
+                    }
+                    CXP_P = save
+                }
+            }
+            e = m
+            continue
+        }
+        if cxIs("++") or cxIs("--") {
+            let c = cxExpr("Postfix", line)
+            c["op"] = cxCur()["text"]
+            CXP_P = CXP_P + 1
+            c["kids"].push(e)
+            e = c
+            continue
+        }
+        break
+    }
+    return e
+}
+
+# the digits of a literal in `base` as a double (strtoull, saturating)
+fn cxDigitsValue(s, base) {
+    let v = 0
+    let i = 0
+    while i < len(s) {
+        let c = s[i]
+        let d = 99
+        if cxIsDigit(c) {
+            d = ord(c) - 48
+        } elif cxIsXDigit(c) {
+            d = cxHexVal(c)
+        }
+        if d >= base {
+            break
+        }
+        v = v * base + d
+        i = i + 1
+    }
+    if v > 18446744073709551615.0 {
+        return 18446744073709551615.0
+    }
+    return v
+}
+
+# std::strtod for a C++ literal's digits
+fn cxStrtod(s) {
+    let n = parseFloat(s)
+    if n != n {
+        return 0
+    }
+    return n
+}
+
+# the number in a literal; flags: {"isUnsigned", "isLong", "isFloatSuffix"}
+fn cxParseNumber(txt, flags, isFloat) {
+    let s = txt
+    flags["isUnsigned"] = false
+    flags["isLong"] = false
+    flags["isFloatSuffix"] = false
+    if isFloat {
+        while len(s) > 0 and sFind("fFlL", s[len(s) - 1], 0) >= 0 {
+            if s[len(s) - 1] == "f" or s[len(s) - 1] == "F" {
+                flags["isFloatSuffix"] = true
+            }
+            s = s.slice(0, len(s) - 1)
+        }
+        return cxStrtod(s)
+    }
+    while len(s) > 0 and sFind("uUlLzZ", s[len(s) - 1], 0) >= 0 {
+        if s[len(s) - 1] == "u" or s[len(s) - 1] == "U" {
+            flags["isUnsigned"] = true
+        } else {
+            flags["isLong"] = true
+        }
+        s = s.slice(0, len(s) - 1)
+    }
+    if len(s) > 2 and s[0] == "0" and (s[1] == "b" or s[1] == "B") {
+        let v = 0
+        let i = 2
+        while i < len(s) {
+            v = v * 2 + (ord(s[i]) - 48)
+            i = i + 1
+        }
+        return v
+    }
+    if len(s) > 2 and s[0] == "0" and (s[1] == "x" or s[1] == "X") {
+        return cxDigitsValue(s.slice(2), 16)
+    }
+    if len(s) > 1 and s[0] == "0" {
+        return cxDigitsValue(s.slice(1), 8)
+    }
+    return cxStrtod(s)
+}
+
+fn cxParseLambda() {
+    let lam = {"params": [], "ret": nil, "body": nil, "captureAllByRef": false, "captureAllByValue": false,
+               "captures": [], "isMutable": false}
+    cxExpect("[")
+    while !cxIs("]") {
+        if cxIs("&") and (cxIsAt(1, ",") or cxIsAt(1, "]")) {
+            CXP_P = CXP_P + 1
+            lam["captureAllByRef"] = true
+        } elif cxIs("=") and (cxIsAt(1, ",") or cxIsAt(1, "]")) {
+            CXP_P = CXP_P + 1
+            lam["captureAllByValue"] = true
+        } elif cxAccept("&") {
+            lam["captures"].push("&" + cxIdent())
+        } elif cxAccept("this") {
+            lam["captures"].push("this")
+        } elif cxIs("*") and cxIsAt(1, "this") {
+            CXP_P = CXP_P + 2
+            lam["captures"].push("this")
+        } else {
+            let n = cxIdent()
+            if cxAccept("=") {
+                cxParseAssignExpr()
+            }
+            lam["captures"].push(n)
+        }
+        if !cxAccept(",") {
+            break
+        }
+    }
+    cxExpect("]")
+    if cxIs("<") {
+        # template lambda: []<typename T>(T x)
+        cxParseTemplateHeaderInline()
+    }
+    if cxIs("(") {
+        let v = {"v": false}
+        lam["params"] = cxParseParams(v)
+    }
+    while true {
+        if cxAccept("mutable") {
+            lam["isMutable"] = true
+        } elif cxAccept("constexpr") or cxAccept("consteval") {
+            let skip = true
+        } elif cxAccept("noexcept") {
+            if cxIs("(") {
+                cxSkipBalanced("(", ")")
+            }
+        } elif cxAccept("->") {
+            lam["ret"] = cxParseTypeId()
+        } else {
+            break
+        }
+    }
+    lam["body"] = cxParseBlock()
+    return lam
+}
+
+fn cxParseTemplateHeaderInline() {
+    cxExpect("<")
+    while !cxIs(">") {
+        if cxIs("typename") or cxIs("class") {
+            CXP_P = CXP_P + 1
+            if cxAt(CX_IDENT) {
+                CXP_TYPES[cxIdent()] = true
+            }
+        } else {
+            CXP_P = CXP_P + 1
+        }
+        cxAccept(",")
+    }
+    cxExpect(">")
+}
+
+fn cxParsePrimary() {
+    let line = cxCur()["line"]
+    let tk = cxCur()
+    let kind = tk["kind"]
+    if kind == CX_INT or kind == CX_FLOAT {
+        let ek = "Float"
+        if kind == CX_INT {
+            ek = "Int"
+        }
+        let e = cxExpr(ek, line)
+        let flags = {}
+        e["num"] = cxParseNumber(tk["text"], flags, kind == CX_FLOAT)
+        e["isUnsigned"] = flags["isUnsigned"]
+        e["isLong"] = flags["isLong"]
+        e["isFloatSuffix"] = flags["isFloatSuffix"]
+        if kind == CX_INT {
+            e["str"] = tk["text"]
+        }
+        CXP_P = CXP_P + 1
+        return e
+    }
+    if kind == CX_CHAR {
+        let e = cxExpr("Char", line)
+        e["str"] = tk["value"]
+        # multi-character constants: value of the bytes, big-endian
+        let v = 0
+        let i = 0
+        while i < len(tk["value"]) {
+            v = v * 256 + ord(tk["value"][i])
+            i = i + 1
+        }
+        e["num"] = v
+        CXP_P = CXP_P + 1
+        return e
+    }
+    if kind == CX_STRING {
+        let e = cxExpr("Str", line)
+        let parts = []
+        while cxAt(CX_STRING) {
+            parts.push(CXP_T[CXP_P]["value"])
+            CXP_P = CXP_P + 1
+        }
+        e["str"] = parts.join("")
+        if cxAt(CX_IDENT) and cxCur()["text"] == "s" and !cxCur()["sp"] {
+            CXP_P = CXP_P + 1
+        }
+        return e
+    }
+    if kind == CX_PUNCT {
+        if tk["text"] == "(" {
+            CXP_P = CXP_P + 1
+            let e = cxParseExpr()
+            cxExpect(")")
+            return e
+        }
+        if tk["text"] == "[" {
+            if CXP_C {
+                cxFail("expected expression near '['")
+            }
+            let e = cxExpr("Lambda", line)
+            e["lambda"] = cxParseLambda()
+            return e
+        }
+        if tk["text"] == "{" {
+            let e = cxExpr("InitList", line)
+            e["kids"] = cxParseBraceList()
+            return e
+        }
+        if tk["text"] == "::" {
+            CXP_P = CXP_P + 1
+            return cxParsePrimary()
+        }
+        cxFail("unexpected '" + tk["text"] + "'")
+    }
+    if kind == CX_END {
+        cxFail("unexpected end of input")
+    }
+    let w = tk["text"]
+    if w == "true" or w == "false" {
+        let e = cxExpr("Bool", line)
+        if w == "true" {
+            e["num"] = 1
+        }
+        CXP_P = CXP_P + 1
+        return e
+    }
+    if w == "nullptr" {
+        CXP_P = CXP_P + 1
+        return cxExpr("Nullptr", line)
+    }
+    if w == "this" {
+        CXP_P = CXP_P + 1
+        return cxExpr("This", line)
+    }
+    if w == "static_cast" or w == "dynamic_cast" or w == "const_cast" or w == "reinterpret_cast" {
+        CXP_P = CXP_P + 1
+        let e = cxExpr("Cast", line)
+        e["op"] = w
+        cxExpect("<")
+        e["type"] = cxParseTypeId()
+        cxExpectCloseAngle()
+        cxExpect("(")
+        e["kids"].push(cxParseExpr())
+        cxExpect(")")
+        return e
+    }
+    if w == "operator" {
+        CXP_P = CXP_P + 1
+        let e = cxExpr("Name", line)
+        e["name"].push("operator" + cxParseOperatorName())
+        return e
+    }
+    # functional cast / construction with a built-in type: int(x), unsigned(x)
+    if w in CX_BUILTIN_WORDS and w != "auto" {
+        let s = cxSpecs()
+        let ty = cxParseBaseType(s)
+        let e = cxExpr("Construct", line)
+        e["type"] = ty
+        if cxIs("{") {
+            e["braced"] = true
+            e["kids"] = cxParseBraceList()
+        } else {
+            cxExpect("(")
+            if !cxIs(")") {
+                e["kids"] = cxParseExprList(")")
+            }
+            cxExpect(")")
+        }
+        return e
+    }
+    # (qualified) name, maybe with template args
+    let e = cxExpr("Name", line)
+    let allTargs = []
+    while true {
+        let n = cxIdent()
+        e["name"].push(n)
+        allTargs.push([])
+        if cxIs("<") and n in CXP_TEMPLATES {
+            let save = CXP_P
+            try {
+                allTargs[len(allTargs) - 1] = cxParseTemplateArgs()
+                e["hasTargs"] = true
+            } catch (e5) {
+                if !cxIsPF(e5) {
+                    raise e5
+                }
+                CXP_P = save
+            }
+        }
+        if cxIs("::") and (cxPeekTok(1)["kind"] == CX_IDENT or cxIsAt(1, "~") or cxIsAt(1, "operator")) {
+            CXP_P = CXP_P + 1
+            cxAccept("template")
+            if cxIs("~") {
+                CXP_P = CXP_P + 1
+                e["name"].push("~" + cxIdent())
+                allTargs.push([])
+                break
+            }
+            if cxIs("operator") {
+                CXP_P = CXP_P + 1
+                e["name"].push("operator" + cxParseOperatorName())
+                allTargs.push([])
+                break
+            }
+            continue
+        }
+        break
+    }
+    e["targs"] = allTargs[len(allTargs) - 1]
+    # a type used as a value: T(args) / T{args}
+    let isType = e["name"][len(e["name"]) - 1] in CXP_TYPES
+    if isType and (cxIs("(") or cxIs("{")) {
+        let ty = cxTypeName()
+        ty["name"] = e["name"]
+        ty["targs"] = allTargs
+        ty["hasTargs"] = e["hasTargs"]
+        let c = cxExpr("Construct", line)
+        c["type"] = ty
+        if cxIs("{") {
+            c["braced"] = true
+            c["kids"] = cxParseBraceList()
+        } else {
+            CXP_P = CXP_P + 1
+            if !cxIs(")") {
+                c["kids"] = cxParseExprList(")")
+            }
+            cxExpect(")")
+        }
+        return c
+    }
+    # keep earlier components' template args (Cls<int>::f) on the type path
+    if e["hasTargs"] and len(allTargs) > 1 {
+        let ty = cxTypeName()
+        ty["name"] = e["name"]
+        ty["targs"] = allTargs
+        ty["hasTargs"] = true
+        e["type"] = ty
+    }
+    return e
+}
+
+fn cxParserInit(pp) {
+    CXP_T = pp["tokens"]
+    CXP_N = len(CXP_T)
+    CXP_P = 0
+    CXP_C = pp["cMode"]
+    CXP_CTAGS = {}
+    CXP_TYPES = {}
+    CXP_TEMPLATES = {}
+    CXP_CLASSES = []
+    CXP_FURTHEST = nil
+    CXP_FURTHEST_POS = 0
+    CXP_CONV = nil
+    if CXP_C {
+        # C: only the typedef names its standard headers declare
+        for n in CX_C_TYPES {
+            CXP_TYPES[n] = true
+        }
+        return nil
+    }
+    for n in CX_STD_TYPES {
+        CXP_TYPES[n] = true
+    }
+    for n in CX_STD_TEMPLATES {
+        CXP_TEMPLATES[n] = true
+    }
+}
+
+# Program: {"decls", "files", "cMode", "systemHeaders"}
+fn cxParse(pp) {
+    cxParserInit(pp)
+    let prog = {"decls": [], "files": pp["files"], "cMode": pp["cMode"], "systemHeaders": pp["systemHeaders"]}
+    try {
+        while !cxAt(CX_END) {
+            cxPushAll(prog["decls"], cxParseDecl(false, ""))
+        }
+    } catch (e) {
+        if !cxIsPF(e) {
+            raise e
+        }
+        let f = e
+        if CXP_FURTHEST != nil {
+            f = CXP_FURTHEST
+        }
+        let file = ""
+        if f["file"] < len(pp["files"]) {
+            file = pp["files"][f["file"]]
+        }
+        let u = cxUnsupported("parse: " + f["msg"], file, f["line"])
+        u["col"] = f["col"]
+        u["syntax"] = true
+        raise u
+    }
+    return prog
+}

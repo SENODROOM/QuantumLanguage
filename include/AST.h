@@ -160,7 +160,7 @@ struct FunctionDecl
     std::vector<std::string> cppParamTypes; // C++ param types, for overloads
     std::string cReturnType; // C/C++ declared return type ("double"), for stream formatting
     // Declared with Python's `def`: a name the body assigns before reading
-    // it is a local of the function (Compiler::compileFunction).
+    // it is a local of the function (compileFunction in selfhost/codegen.sa).
     bool pythonScope = false;
 };
 

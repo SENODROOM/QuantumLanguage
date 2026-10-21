@@ -1,0 +1,1937 @@
+# C++ project-structure passes, written in Quantum: a port of
+# src/dialect/CppDialect.cpp. Source-to-source rewrites that turn a header +
+# implementation C++ project into the single-file shape the parser reads:
+# local #includes spliced in, namespaces lowered to N__member names,
+# out-of-class member definitions moved into their class, free operator
+# functions renamed for the VM, and prototypes of defined functions dropped.
+# @use "./dialect_scan.sa"
+
+# ── paths ────────────────────────────────────────────────────────────────────
+
+fn cdIsSep(c) {
+    return c == "/" or c == "\\"
+}
+
+fn cdRootEnd(p) {
+    let i = 0
+    if len(p) >= 2 and p[1] == ":" {
+        i = 2
+    }
+    if i < len(p) and cdIsSep(p[i]) {
+        i = i + 1
+    }
+    return i
+}
+
+# fs::path::parent_path
+fn cdParent(p) {
+    let root = cdRootEnd(p)
+    let i = len(p) - 1
+    while i >= root and !cdIsSep(p[i]) {
+        i = i - 1
+    }
+    if i < root {
+        if len(p) > root {
+            return p.slice(0, root)
+        }
+        return p
+    }
+    while i > root and cdIsSep(p[i - 1]) {
+        i = i - 1
+    }
+    return p.slice(0, i)
+}
+
+fn cdFileName(p) {
+    let i = len(p) - 1
+    while i >= 0 and !cdIsSep(p[i]) {
+        i = i - 1
+    }
+    return p.slice(i + 1)
+}
+
+# fs::path's `a / b`: an absolute `b` replaces `a` (a rooted "/x" keeps
+# only a's drive)
+fn cdJoin(a, b) {
+    if len(b) >= 2 and b[1] == ":" {
+        return b
+    }
+    if len(b) > 0 and cdIsSep(b[0]) {
+        if len(a) >= 2 and a[1] == ":" {
+            return a.slice(0, 2) + b
+        }
+        return b
+    }
+    if a == "" {
+        return b
+    }
+    if cdIsSep(a[len(a) - 1]) {
+        return a + b
+    }
+    return a + "/" + b
+}
+
+# fs::path::extension of the file name ("" for none or a dot-file)
+fn cdExtension(p) {
+    let name = cdFileName(p)
+    let dot = sRFind(name, ".")
+    if dot <= 0 or name == ".." {
+        return ""
+    }
+    return name.slice(dot)
+}
+
+fn fileExtLower(path) {
+    return cdExtension(path).lower()
+}
+
+fn hasSupportedExt(path) {
+    let ext = fileExtLower(path)
+    return ext == ".sa" or ext == ".js" or ext == ".py" or ext == ".rb" or ext == ".c" or ext == ".cpp" or ext == ".java"
+}
+
+fn cdReplaceExtension(p, ext) {
+    let cur = cdExtension(p)
+    return p.slice(0, len(p) - len(cur)) + ext
+}
+
+fn cdIsFile(p) {
+    return p != "" and os.path.exists(p) and !os.path.isdir(p)
+}
+
+fn cdExists(p) {
+    return os.path.exists(p) or os.path.isdir(p)
+}
+
+fn cdAbsolute(p) {
+    return os.path.abspath(p)
+}
+
+fn cdReadTextFile(p) {
+    let s = read_file(p)
+    if s == nil {
+        return ""
+    }
+    if len(s) >= 3 and ord(s[0]) == 239 and ord(s[1]) == 187 and ord(s[2]) == 191 {
+        s = s.slice(3)
+    }
+    return s
+}
+
+fn cdPathKey(p) {
+    return cdAbsolute(p).lower()
+}
+
+fn cdIsHeaderExt(p) {
+    let ext = fileExtLower(p)
+    return ext == ".h" or ext == ".hpp" or ext == ".hh" or ext == ".hxx" or ext == ".h++"
+}
+
+# a folder that holds a whole project: include lookups stop climbing here
+fn cdIsProjectRoot(dir) {
+    for marker in ["CMakeLists.txt", "Makefile", "makefile", "package.json", "package.qon", ".git"] {
+        if cdExists(cdJoin(dir, marker)) {
+            return true
+        }
+    }
+    return false
+}
+
+# `#include "x"`: next to the including file, then in each folder above it
+# and that folder's include/, up to the project root
+fn cdFindInclude(name, fromFile) {
+    let dir = cdParent(cdAbsolute(fromFile))
+    if cdIsFile(cdJoin(dir, name)) {
+        return cdJoin(dir, name)
+    }
+    let up = 0
+    while up < 8 and dir != "" {
+        if up > 0 and cdIsFile(cdJoin(dir, name)) {
+            return cdJoin(dir, name)
+        }
+        if cdIsFile(cdJoin(cdJoin(dir, "include"), name)) {
+            return cdJoin(cdJoin(dir, "include"), name)
+        }
+        let parent = cdParent(dir)
+        if cdIsProjectRoot(dir) or parent == dir {
+            break
+        }
+        dir = parent
+        up = up + 1
+    }
+    return ""
+}
+
+let CD_IMPL_EXTS = [".sa", ".cpp", ".cc", ".cxx", ".c"]
+
+# a header's implementation file: next to it, or for include/<lib>/x.hpp in
+# the project's src/
+fn cdFindImplementation(header) {
+    for ext in CD_IMPL_EXTS {
+        let impl = cdReplaceExtension(header, ext)
+        if cdIsFile(impl) {
+            return impl
+        }
+    }
+    let abs = cdAbsolute(header)
+    let dir = cdParent(abs)
+    let root = ""
+    let belowInclude = ""
+    let up = 0
+    while up < 8 and dir != "" {
+        if belowInclude == "" and cdFileName(dir) == "include" {
+            belowInclude = abs.slice(len(dir) + 1)
+        }
+        let parent = cdParent(dir)
+        if cdIsProjectRoot(dir) or parent == dir {
+            root = dir
+            break
+        }
+        dir = parent
+        up = up + 1
+    }
+    if root == "" or belowInclude == "" {
+        return ""
+    }
+    let stems = [belowInclude, cdFileName(belowInclude)]
+    for base in ["src", "source", "lib", ""] {
+        for stem in stems {
+            for ext in CD_IMPL_EXTS {
+                let dirBase = root
+                if base != "" {
+                    dirBase = cdJoin(root, base)
+                }
+                let impl = cdJoin(dirBase, cdReplaceExtension(stem, ext))
+                if cdIsFile(impl) {
+                    return impl
+                }
+            }
+        }
+    }
+    return ""
+}
+
+let CD_INCLUDE_RE = "^\\s*#\\s*include\\s*\"([^\"]+)\\\"\\s*(//.*|/\\*.*\\*/\\s*)?\\r?$"
+
+# st: {"seen": {}, "impls": [], "queued": {}}
+fn cdExpandIncludes(src, file, st) {
+    let out = []
+    for line in sGetLines(src) {
+        let m = reMatch(line, CD_INCLUDE_RE)
+        if m != nil {
+            let target = cdFindInclude(m[1], file)
+            if target != "" {
+                let key = cdPathKey(target)
+                if !(key in st["seen"]) {
+                    st["seen"][key] = true
+                    out.push(cdExpandIncludes(cdReadTextFile(target), target, st))
+                    out.push("\n")
+                    if cdIsHeaderExt(target) {
+                        let impl = cdFindImplementation(target)
+                        if impl != "" {
+                            let ik = cdPathKey(impl)
+                            if !(ik in st["queued"]) {
+                                st["queued"][ik] = true
+                                st["impls"].push(impl)
+                            }
+                        }
+                    }
+                } else {
+                    out.push("\n")
+                }
+                continue
+            }
+        }
+        out.push(line)
+        out.push("\n")
+    }
+    return out.join("")
+}
+
+# ── token scan for the structural passes ────────────────────────────────────
+
+let TK_IDENT = 0
+let TK_PUNCT = 1
+let TK_LITERAL = 2
+
+let CD_SPACE_RUN = " \t\r" + chr(11) + chr(12)
+let CD_IDENT_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+
+# tokens [kind, text, begin, end]; comments and preprocessor lines skipped
+# (runs of spaces, comments and identifiers are crossed with the VM's
+# std::string searches rather than a character at a time)
+fn cdScan(s) {
+    let out = []
+    let i = 0
+    let n = len(s)
+    let lineStart = true
+    while i < n {
+        let c = s[i]
+        if c == "\n" {
+            lineStart = true
+            i = i + 1
+            continue
+        }
+        if cIsSpace(c) {
+            i = sFindFirstNotOf(s, CD_SPACE_RUN, i)
+            if i == -1 {
+                i = n
+            }
+            continue
+        }
+        if c == "#" and lineStart {
+            # to the end of the line; a backslash continues it
+            while true {
+                let q = sFindFirstOf(s, "\n\\", i)
+                if q == -1 {
+                    i = n
+                    break
+                }
+                if s[q] == "\n" {
+                    i = q
+                    break
+                }
+                if q + 1 < n {
+                    i = q + 2
+                } else {
+                    i = q + 1
+                }
+            }
+            continue
+        }
+        lineStart = false
+        if c == "/" and i + 1 < n and s[i + 1] == "/" {
+            i = sFind(s, "\n", i)
+            if i == -1 {
+                i = n
+            }
+            continue
+        }
+        if c == "/" and i + 1 < n and s[i + 1] == "*" {
+            let e = sFind(s, "*/", i + 2)
+            if e == -1 {
+                i = n
+            } else {
+                i = e + 2
+            }
+            continue
+        }
+        if c == "\"" or c == "'" {
+            let b = i
+            i = i + 1
+            let stops = c + "\\\n"
+            while i < n {
+                let q = sFindFirstOf(s, stops, i)
+                if q == -1 {
+                    i = n
+                    break
+                }
+                if s[q] == "\\" {
+                    i = q + 2
+                    continue
+                }
+                i = q
+                break
+            }
+            if i < n and s[i] == c {
+                i = i + 1
+            }
+            out.push([TK_LITERAL, s.slice(b, i), b, i])
+            continue
+        }
+        if rbIsIdentStart(c) {
+            let b = i
+            i = sFindFirstNotOf(s, CD_IDENT_CHARS, i)
+            if i == -1 {
+                i = n
+            }
+            let id = s.slice(b, i)
+            # raw string literal: R"delim( ... )delim"
+            if i < n and s[i] == "\"" and sLast(id) == "R" {
+                let open = sFind(s, "(", i)
+                if open != -1 {
+                    let close = ")" + s.slice(i + 1, open) + "\""
+                    let e = sFind(s, close, open)
+                    if e == -1 {
+                        i = n
+                    } else {
+                        i = e + len(close)
+                    }
+                    out.push([TK_LITERAL, s.slice(b, i), b, i])
+                    continue
+                }
+            }
+            out.push([TK_IDENT, id, b, i])
+            continue
+        }
+        if cIsDigit(c) {
+            let b = i
+            while i < n and (rbIsIdentChar(s[i]) or s[i] == "." or s[i] == "'" or ((s[i] == "+" or s[i] == "-") and (s[i - 1] == "e" or s[i - 1] == "E" or s[i - 1] == "p" or s[i - 1] == "P"))) {
+                i = i + 1
+            }
+            out.push([TK_LITERAL, s.slice(b, i), b, i])
+            continue
+        }
+        if c == ":" and i + 1 < n and s[i + 1] == ":" {
+            out.push([TK_PUNCT, "::", i, i + 2])
+            i = i + 2
+            continue
+        }
+        if c == "-" and i + 1 < n and s[i + 1] == ">" {
+            out.push([TK_PUNCT, "->", i, i + 2])
+            i = i + 2
+            continue
+        }
+        out.push([TK_PUNCT, c, i, i + 1])
+        i = i + 1
+    }
+    return out
+}
+
+# ── names that are Quantum keywords but plain identifiers in C/C++ ─────────
+
+let CD_CLASHES = {"let": true, "fn": true, "def": true, "extends": true, "self": true, "elif": true,
+                  "in": true, "of": true, "raise": true, "except": true, "finally": true, "as": true,
+                  "with": true, "from": true, "is": true, "nil": true, "null": true, "undefined": true,
+                  "None": true, "True": true, "False": true}
+
+let CD_NOT_TYPES = {"return": true, "case": true, "else": true, "throw": true, "new": true, "delete": true,
+                    "sizeof": true, "typeid": true, "goto": true, "using": true, "namespace": true,
+                    "operator": true, "co_return": true, "co_yield": true, "co_await": true, "do": true}
+
+fn cdTokIs(toks, i, text) {
+    return i >= 0 and i < len(toks) and toks[i][1] == text
+}
+
+# A clashing word is renamed (__kw_word, everywhere) only when the C/C++
+# code declares it: a variable, parameter, member or enumerator.
+fn renameKeywordClashes(s) {
+    if sFindFirstOf(s, "abcdefghijklmnopqrstuvwxyzNTF", 0) == -1 {
+        return s
+    }
+    let toks = cdScan(s)
+    let n = len(toks)
+    let declared = {}
+    let i = 0
+    while i < n {
+        let tk = toks[i]
+        # enum [class|struct] [Name] [: type] { a, b = 1, ... }
+        if tk[0] == TK_IDENT and tk[1] == "enum" {
+            let j = i + 1
+            while j < n and !cdTokIs(toks, j, "{") and !cdTokIs(toks, j, ";") {
+                j = j + 1
+            }
+            if cdTokIs(toks, j, "{") {
+                j = j + 1
+                while j < n and !cdTokIs(toks, j, "}") {
+                    if toks[j][0] == TK_IDENT and toks[j][1] in CD_CLASHES and (cdTokIs(toks, j - 1, "{") or cdTokIs(toks, j - 1, ",")) {
+                        declared[toks[j][1]] = true
+                    }
+                    j = j + 1
+                }
+            }
+            i = i + 1
+            continue
+        }
+        if tk[0] != TK_IDENT or !(tk[1] in CD_CLASHES) or i == 0 or i + 1 >= n {
+            i = i + 1
+            continue
+        }
+        # a type before it (`ifstream in`, `Node* self`, `vector<int> of`), then ( ) ; = , [ { after it
+        let prev = toks[i - 1]
+        let typeBefore = (prev[0] == TK_IDENT and !(prev[1] in CD_NOT_TYPES) and !(prev[1] in CD_CLASHES)) or prev[1] == "*" or prev[1] == "&" or prev[1] == ">"
+        let next = toks[i + 1][1]
+        let declEnd = next == "(" or next == ")" or next == ";" or next == "=" or next == "," or next == "[" or next == "{"
+        let pythonFor = i >= 2 and toks[i - 2][1] == "for"
+        if typeBefore and declEnd and !pythonFor {
+            declared[tk[1]] = true
+        }
+        i = i + 1
+    }
+    if len(declared) == 0 {
+        return s
+    }
+    let out = []
+    let last = 0
+    for t in toks {
+        if t[0] != TK_IDENT or !(t[1] in declared) {
+            continue
+        }
+        out.push(s.slice(last, t[2]))
+        out.push("__kw_" + t[1])
+        last = t[3]
+    }
+    out.push(s.slice(last))
+    return out.join("")
+}
+
+# A scanned source: tokens, the index of each bracket's partner (-1 when
+# unmatched), and the brace depth before each token.
+fn cdScanned(src) {
+    let t = cdScan(src)
+    let n = len(t)
+    let match = []
+    let depth = []
+    let i = 0
+    while i < n {
+        match.push(-1)
+        depth.push(0)
+        i = i + 1
+    }
+    let stack = []
+    let d = 0
+    i = 0
+    while i < n {
+        let x = t[i][1]
+        let punct = t[i][0] == TK_PUNCT
+        if punct and (x == "{" or x == "(" or x == "[") {
+            depth[i] = d
+            if x == "{" {
+                d = d + 1
+            }
+            stack.push(i)
+        } else if punct and (x == "}" or x == ")" or x == "]") {
+            if x == "}" and d > 0 {
+                d = d - 1
+            }
+            depth[i] = d
+            let want = "["
+            if x == "}" {
+                want = "{"
+            } else if x == ")" {
+                want = "("
+            }
+            # unbalanced input: drop unmatched openers of another kind
+            while len(stack) > 0 and t[stack[len(stack) - 1]][1] != want {
+                stack.pop()
+            }
+            if len(stack) > 0 {
+                let o = stack.pop()
+                match[o] = i
+                match[i] = o
+            }
+        } else {
+            depth[i] = d
+        }
+        i = i + 1
+    }
+    # the texts of the identifier and punctuation tokens present
+    let words = {}
+    for tk in t {
+        if tk[0] != TK_LITERAL {
+            words[tk[1]] = true
+        }
+    }
+    return {"src": src, "t": t, "n": n, "match": match, "depth": depth, "words": words}
+}
+
+# The passes re-scan only text that changed: the last scan is kept.
+let CD_SCAN_SRC = nil
+let CD_SCAN = nil
+
+fn cdScannedCached(src) {
+    if CD_SCAN == nil or CD_SCAN_SRC != src {
+        CD_SCAN = cdScanned(src)
+        CD_SCAN_SRC = src
+    }
+    return CD_SCAN
+}
+
+# whether `text` is an identifier or punctuation token of `src` (a pass
+# whose construct needs that token changes nothing without it)
+fn cdHasToken(src, text) {
+    return text in cdScannedCached(src)["words"]
+}
+
+fn scIs(s, i, x) {
+    if i < 0 or i >= s["n"] {
+        return false
+    }
+    let tk = s["t"][i]
+    return tk[1] == x and tk[0] != TK_LITERAL
+}
+
+fn scIdent(s, i) {
+    return i >= 0 and i < s["n"] and s["t"][i][0] == TK_IDENT
+}
+
+fn scText1(s, i) {
+    return s["t"][i][1]
+}
+
+# the index just past the bracket group opening at i
+fn scPast(s, i) {
+    let m = s["match"][i]
+    if m > i {
+        return m + 1
+    }
+    return i + 1
+}
+
+# the source text of tokens [first, last]
+fn scText(s, first, last) {
+    return s["src"].slice(s["t"][first][2], s["t"][last][3])
+}
+
+fn scBegin(s, i) {
+    return s["t"][i][2]
+}
+
+fn scEnd(s, i) {
+    return s["t"][i][3]
+}
+
+# edits [begin, end, text]; applied from the back (stably, by begin),
+# skipping any that overlaps one already applied
+fn cdApplyEdits(src, edits) {
+    # stable sort by descending begin (insertion sort keeps equal ones in order)
+    let sorted = []
+    for e in edits {
+        let k = len(sorted)
+        sorted.push(e)
+        while k > 0 and sorted[k - 1][0] < e[0] {
+            sorted[k] = sorted[k - 1]
+            k = k - 1
+        }
+        sorted[k] = e
+    }
+    let out = src
+    let limit = -1
+    for e in sorted {
+        if limit != -1 and e[1] > limit {
+            continue
+        }
+        out = out.slice(0, e[0]) + e[2] + out.slice(e[1])
+        limit = e[0]
+    }
+    return out
+}
+
+let CD_KEYWORDS = {"return": true, "using": true, "typedef": true, "operator": true, "template": true,
+                   "typename": true, "class": true, "struct": true, "union": true, "enum": true,
+                   "namespace": true, "public": true, "private": true, "protected": true, "virtual": true,
+                   "static": true, "inline": true, "const": true, "constexpr": true, "extern": true,
+                   "friend": true, "explicit": true, "if": true, "while": true, "for": true, "switch": true,
+                   "do": true, "else": true, "new": true, "delete": true, "sizeof": true, "throw": true,
+                   "case": true, "default": true}
+
+# Statements at one brace level, as token ranges [first, last].
+fn cdSplitStatements(s, b, e) {
+    let out = []
+    let j = b
+    while j < e {
+        let start = j
+        if (scIs(s, j, "public") or scIs(s, j, "private") or scIs(s, j, "protected")) and scIs(s, j + 1, ":") {
+            out.push([j, j + 1])
+            j = j + 2
+            continue
+        }
+        let typeBody = false
+        let sawAssign = false
+        let sawParens = false
+        let last = start
+        while j < e {
+            let tk = s["t"][j]
+            if tk[0] == TK_IDENT and (tk[1] == "class" or tk[1] == "struct" or tk[1] == "union" or tk[1] == "enum") {
+                typeBody = true
+            }
+            if scIs(s, j, "=") and !scIs(s, j + 1, "=") and !scIs(s, j - 1, "=") and !scIs(s, j - 1, "!") and !scIs(s, j - 1, "<") and !scIs(s, j - 1, ">") and !scIs(s, j - 1, "operator") {
+                sawAssign = true
+            }
+            if scIs(s, j, "(") or scIs(s, j, "[") {
+                sawParens = sawParens or scIs(s, j, "(")
+                j = scPast(s, j)
+                continue
+            }
+            if scIs(s, j, "{") {
+                let close = scPast(s, j) - 1
+                j = close + 1
+                if (typeBody or sawAssign) and !sawParens {
+                    continue
+                }
+                last = close
+                if scIs(s, j, ";") {
+                    last = j
+                    j = j + 1
+                }
+                break
+            }
+            if scIs(s, j, ";") {
+                last = j
+                j = j + 1
+                break
+            }
+            last = j
+            j = j + 1
+        }
+        if j > e and last > e - 1 {
+            last = e - 1
+        }
+        out.push([start, last])
+    }
+    return out
+}
+
+# parameter token ranges inside the parens at [open, close]
+fn cdSplitParams(s, open, close) {
+    let out = []
+    let j = open + 1
+    let start = j
+    let angle = 0
+    while j < close {
+        if scIs(s, j, "(") or scIs(s, j, "[") or scIs(s, j, "{") {
+            j = scPast(s, j)
+            continue
+        }
+        if scIs(s, j, "<") {
+            angle = angle + 1
+        } else if scIs(s, j, ">") and angle > 0 {
+            angle = angle - 1
+        } else if scIs(s, j, ",") and angle == 0 {
+            if j > start {
+                out.push([start, j - 1])
+            }
+            start = j + 1
+        }
+        j = j + 1
+    }
+    if close > start {
+        out.push([start, close - 1])
+    }
+    # "(void)" declares no parameters
+    if len(out) == 1 and out[0][0] == out[0][1] and scIs(s, out[0][0], "void") {
+        out = []
+    }
+    return out
+}
+
+# the index of a top-level '=' inside a parameter range, or 0
+fn cdParamDefaultEq(s, p) {
+    let j = p[0]
+    while j <= p[1] {
+        if scIs(s, j, "(") or scIs(s, j, "[") or scIs(s, j, "{") {
+            j = scPast(s, j)
+            continue
+        }
+        if scIs(s, j, "=") {
+            return j
+        }
+        j = j + 1
+    }
+    return 0
+}
+
+# edits giving a definition's parameters its prototype's defaults
+fn cdInheritDefaults(s, protoOpen, defOpen, edits) {
+    let pp = cdSplitParams(s, protoOpen, s["match"][protoOpen])
+    let dp = cdSplitParams(s, defOpen, s["match"][defOpen])
+    let i = 0
+    while i < len(pp) and i < len(dp) {
+        let eq = cdParamDefaultEq(s, pp[i])
+        if eq != 0 and cdParamDefaultEq(s, dp[i]) == 0 {
+            let at = scEnd(s, dp[i][1])
+            edits.push([at, at, " = " + scText(s, eq + 1, pp[i][1])])
+        }
+        i = i + 1
+    }
+}
+
+# the declarator's '(' in a function statement, or 0
+fn cdFunctionParen(s, st) {
+    let j = st[0]
+    while j <= st[1] {
+        if scIs(s, j, "=") or scIs(s, j, "{") {
+            return 0
+        }
+        if scIs(s, j, "(") {
+            if j > st[0] and (scIdent(s, j - 1) or scIs(s, j - 1, ">")) {
+                return j
+            }
+            return 0
+        }
+        if scIs(s, j, "[") {
+            j = scPast(s, j)
+            continue
+        }
+        j = j + 1
+    }
+    return 0
+}
+
+# the '{' opening the body of a function whose parameters open at
+# `paramsOpen` (past qualifiers, a trailing return type and a constructor
+# initialiser list), or 0 for a body-less declaration
+fn cdBodyAfterParams(s, paramsOpen) {
+    let n = s["n"]
+    let k = scPast(s, paramsOpen)
+    while k < n and !scIs(s, k, "{") and !scIs(s, k, ":") and !scIs(s, k, ";") and !scIs(s, k, "=") and !scIs(s, k, "}") {
+        if scIs(s, k, "(") {
+            k = scPast(s, k)
+        } else {
+            k = k + 1
+        }
+    }
+    if scIs(s, k, ":") {
+        k = k + 1
+        while k < n {
+            while k < n and !scIs(s, k, "(") and !scIs(s, k, "{") and !scIs(s, k, ";") {
+                k = k + 1
+            }
+            if !scIs(s, k, "(") and !scIs(s, k, "{") {
+                return 0
+            }
+            k = scPast(s, k)
+            if !scIs(s, k, ",") {
+                break
+            }
+            k = k + 1
+        }
+    }
+    if scIs(s, k, "{") and s["match"][k] > 0 {
+        return k
+    }
+    return 0
+}
+
+# ── namespaces ───────────────────────────────────────────────────────────────
+
+# names a namespace (or class) body declares at its own level, into `out`
+fn cdCollectMembers(s, b, e, out) {
+    for st in cdSplitStatements(s, b, e) {
+        let j = st[0]
+        if scIs(s, j, "template") and scIs(s, j + 1, "<") {
+            let angle = 0
+            j = j + 1
+            while j <= st[1] {
+                if scIs(s, j, "<") {
+                    angle = angle + 1
+                } else if scIs(s, j, ">") {
+                    angle = angle - 1
+                    if angle == 0 {
+                        j = j + 1
+                        break
+                    }
+                }
+                j = j + 1
+            }
+        }
+        if scIs(s, j, "namespace") and scIdent(s, j + 1) {
+            out[scText1(s, j + 1)] = true
+            continue
+        }
+        if scIs(s, j, "using") or scIs(s, j, "public") or scIs(s, j, "private") or scIs(s, j, "protected") {
+            continue
+        }
+        let typeDecl = false
+        let k = j
+        while k <= st[1] {
+            if scIs(s, k, "class") or scIs(s, k, "struct") or scIs(s, k, "union") or scIs(s, k, "enum") {
+                let nm = k + 1
+                if scIs(s, nm, "class") or scIs(s, nm, "struct") {
+                    nm = nm + 1
+                }
+                if scIdent(s, nm) and (scIs(s, nm + 1, "{") or scIs(s, nm + 1, ":") or scIs(s, nm + 1, ";") or scIs(s, nm + 1, "final")) {
+                    out[scText1(s, nm)] = true
+                    typeDecl = true
+                }
+                # an unscoped enum's constants belong to the enclosing scope
+                if scIs(s, k, "enum") and nm == k + 1 {
+                    let open = nm
+                    while open <= st[1] and !scIs(s, open, "{") and !scIs(s, open, ";") {
+                        open = open + 1
+                    }
+                    if scIs(s, open, "{") and s["match"][open] > 0 {
+                        let c = open + 1
+                        while c < s["match"][open] {
+                            if scIdent(s, c) and (scIs(s, c - 1, "{") or scIs(s, c - 1, ",")) {
+                                out[scText1(s, c)] = true
+                            }
+                            c = c + 1
+                        }
+                    }
+                }
+                break
+            }
+            if scIs(s, k, "(") or scIs(s, k, "=") or scIs(s, k, "{") {
+                break
+            }
+            k = k + 1
+        }
+        if typeDecl {
+            continue
+        }
+        # declarators: an identifier followed by ( = ; [ , or {
+        k = j
+        while k <= st[1] {
+            if scIs(s, k, "{") or scIs(s, k, "[") or scIs(s, k, "(") {
+                k = scPast(s, k)
+                continue
+            }
+            if !scIdent(s, k) or scText1(s, k) in CD_KEYWORDS or scIs(s, k - 1, ".") or scIs(s, k - 1, "->") {
+                k = k + 1
+                continue
+            }
+            let qualified = scIs(s, k - 1, "::")
+            let nx = k + 1
+            if scIs(s, nx, "(") {
+                if !qualified {
+                    out[scText1(s, k)] = true
+                }
+                break
+            }
+            if scIs(s, nx, "=") or scIs(s, nx, ";") or scIs(s, nx, "[") or scIs(s, nx, ",") or scIs(s, nx, "{") {
+                if qualified {
+                    break
+                }
+                out[scText1(s, k)] = true
+                if scIs(s, nx, "=") {
+                    # skip the initialiser up to the next declarator
+                    k = nx + 1
+                    while k <= st[1] and !scIs(s, k, ",") {
+                        if scIs(s, k, "(") or scIs(s, k, "[") or scIs(s, k, "{") {
+                            k = scPast(s, k)
+                        } else {
+                            k = k + 1
+                        }
+                    }
+                }
+            }
+            k = k + 1
+        }
+    }
+}
+
+# C++17 `namespace a::b { ... }` -> `namespace a { namespace b { ... } }`
+fn cdSplitNestedNamespaces(src) {
+    let s = cdScannedCached(src)
+    let edits = []
+    let i = 0
+    while i + 3 < s["n"] {
+        if !scIs(s, i, "namespace") or !scIdent(s, i + 1) or !scIs(s, i + 2, "::") {
+            i = i + 1
+            continue
+        }
+        let header = "namespace " + scText1(s, i + 1)
+        let levels = 1
+        let j = i + 2
+        while scIs(s, j, "::") and scIdent(s, j + 1) {
+            header = header + " { namespace " + scText1(s, j + 1)
+            levels = levels + 1
+            j = j + 2
+        }
+        if !scIs(s, j, "{") or s["match"][j] < 0 {
+            i = i + 1
+            continue
+        }
+        edits.push([scBegin(s, i), scEnd(s, j - 1), header])
+        let closeAt = scEnd(s, s["match"][j])
+        edits.push([closeAt, closeAt, sRepeat("}", levels - 1)])
+        i = j + 1
+    }
+    if len(edits) > 0 {
+        return cdApplyEdits(src, edits)
+    }
+    return src
+}
+
+# Lowers every block of the first namespace found; [changed, src].
+fn cdLowerNamespace(src) {
+    let s = cdScannedCached(src)
+    let n = s["n"]
+    let first = -1
+    let i = 0
+    while i + 1 < n {
+        if scIs(s, i, "namespace") and !scIs(s, i - 1, "using") and !(i > 0 and scIs(s, i - 1, "::")) {
+            if scIs(s, i + 1, "{") or (scIdent(s, i + 1) and scIs(s, i + 2, "{")) {
+                first = i
+                break
+            }
+        }
+        i = i + 1
+    }
+    if first == -1 {
+        return [false, src]
+    }
+    let edits = []
+    if scIs(s, first + 1, "{") {
+        # anonymous namespace: its members are simply file-level
+        let open = first + 1
+        edits.push([scBegin(s, first), scEnd(s, open), ""])
+        if s["match"][open] > 0 {
+            edits.push([scBegin(s, s["match"][open]), scEnd(s, s["match"][open]), ""])
+        }
+        return [true, cdApplyEdits(src, edits)]
+    }
+
+    let name = scText1(s, first + 1)
+    let prefix = name + "__"
+    let level = s["depth"][first]
+
+    let bodies = []
+    i = first
+    while i + 2 < n {
+        if scIs(s, i, "namespace") and s["depth"][i] == level and scIs(s, i + 1, name) and scIs(s, i + 2, "{") and s["match"][i + 2] > 0 and !scIs(s, i - 1, "using") {
+            bodies.push([i + 2, s["match"][i + 2]])
+            edits.push([scBegin(s, i), scEnd(s, i + 2), ""])
+            edits.push([scBegin(s, s["match"][i + 2]), scEnd(s, s["match"][i + 2]), ""])
+        }
+        i = i + 1
+    }
+
+    let members = {}
+    for b in bodies {
+        cdCollectMembers(s, b[0] + 1, b[1], members)
+    }
+
+    let rename = []
+    i = 0
+    while i < n {
+        rename.push(false)
+        i = i + 1
+    }
+    for b in bodies {
+        let k = b[0] + 1
+        while k < b[1] and k < n {
+            rename[k] = true
+            k = k + 1
+        }
+    }
+
+    # class scope: a class's own members hide the namespace's names
+    let classMembers = {}
+    let shadows = []
+    for b in bodies {
+        for st in cdSplitStatements(s, b[0] + 1, b[1]) {
+            let k = st[0]
+            while k + 1 <= st[1] {
+                if !(scIs(s, k, "class") or scIs(s, k, "struct")) or !scIdent(s, k + 1) or scIs(s, k - 1, "enum") {
+                    k = k + 1
+                    continue
+                }
+                let open = k + 2
+                while open <= st[1] and !scIs(s, open, "{") and !scIs(s, open, ";") {
+                    open = open + 1
+                }
+                if scIs(s, open, "{") and s["match"][open] > 0 {
+                    let cname = scText1(s, k + 1)
+                    if !(cname in classMembers) {
+                        classMembers[cname] = {}
+                    }
+                    let names = classMembers[cname]
+                    cdCollectMembers(s, open + 1, s["match"][open], names)
+                    # the class name itself is the namespace's (false: not a member)
+                    names[cname] = false
+                    shadows.push([open + 1, s["match"][open], names])
+                }
+                break
+            }
+        }
+    }
+    for b in bodies {
+        for st in cdSplitStatements(s, b[0] + 1, b[1]) {
+            let k = st[0]
+            while k + 1 <= st[1] {
+                if scIs(s, k, "(") or scIs(s, k, "{") or scIs(s, k, "=") {
+                    break
+                }
+                if scIdent(s, k) and scIs(s, k + 1, "::") and scText1(s, k) in classMembers {
+                    shadows.push([st[0], st[1] + 1, classMembers[scText1(s, k)]])
+                    break
+                }
+                k = k + 1
+            }
+        }
+    }
+
+    let usedAll = {}
+    i = 0
+    while i < n {
+        # using namespace N;
+        if scIs(s, i, "using") and scIs(s, i + 1, "namespace") and scIs(s, i + 2, name) and scIs(s, i + 3, ";") {
+            edits.push([scBegin(s, i), scEnd(s, i + 3), ""])
+            let k = i + 4
+            while k < n {
+                rename[k] = true
+                k = k + 1
+            }
+            i = i + 4
+            continue
+        }
+        # using N::m;
+        if scIs(s, i, "using") and scIs(s, i + 1, name) and scIs(s, i + 2, "::") and scIdent(s, i + 3) and scIs(s, i + 4, ";") {
+            edits.push([scBegin(s, i), scEnd(s, i + 4), ""])
+            let used = scText1(s, i + 3)
+            usedAll[used] = true
+            let k = i + 5
+            while k < n {
+                if s["t"][k][1] == used {
+                    rename[k] = true
+                }
+                k = k + 1
+            }
+            i = i + 5
+            continue
+        }
+        # N::m (and an out-of-namespace definition `T N::f(...) {`)
+        if scIs(s, i, name) and scIs(s, i + 1, "::") and scIdent(s, i + 2) and !scIs(s, i - 1, "::") and !scIs(s, i - 1, ".") and !scIs(s, i - 1, "->") {
+            edits.push([scBegin(s, i), scEnd(s, i + 2), prefix + scText1(s, i + 2)])
+            let last = i + 2
+            let cls = ""
+            while scIs(s, last + 1, "::") and (scIdent(s, last + 2) or (scIs(s, last + 2, "~") and scIdent(s, last + 3))) {
+                if cls == "" {
+                    cls = scText1(s, last)
+                }
+                if scIs(s, last + 2, "~") {
+                    last = last + 3
+                } else {
+                    last = last + 2
+                }
+            }
+            if s["depth"][i] == 0 and scIs(s, last + 1, "(") {
+                let body = cdBodyAfterParams(s, last + 1)
+                if body != 0 {
+                    let k = last + 1
+                    while k < s["match"][body] and k < n {
+                        rename[k] = true
+                        k = k + 1
+                    }
+                    if cls in classMembers {
+                        shadows.push([last + 1, s["match"][body], classMembers[cls]])
+                    }
+                }
+            }
+            i = i + 3
+            continue
+        }
+        i = i + 1
+    }
+
+    let k = 0
+    while k < n {
+        if rename[k] and scIdent(s, k) and (scText1(s, k) in members or scText1(s, k) in usedAll) {
+            let skip = scIs(s, k - 1, "::") or scIs(s, k - 1, ".") or scIs(s, k - 1, "->") or scIs(s, k - 1, "namespace")
+            if !skip {
+                for sh in shadows {
+                    if k >= sh[0] and k < sh[1] and scText1(s, k) in sh[2] and sh[2][scText1(s, k)] {
+                        skip = true
+                        break
+                    }
+                }
+            }
+            if !skip {
+                edits.push([scBegin(s, k), scEnd(s, k), prefix + scText1(s, k)])
+            }
+        }
+        k = k + 1
+    }
+    # nested namespaces keep their blocks, renamed for the next round
+    for b in bodies {
+        let k2 = b[0] + 1
+        while k2 < b[1] {
+            if scIs(s, k2, "namespace") and scIdent(s, k2 + 1) and s["depth"][k2] == level + 1 {
+                edits.push([scBegin(s, k2 + 1), scEnd(s, k2 + 1), prefix + scText1(s, k2 + 1)])
+            }
+            k2 = k2 + 1
+        }
+    }
+    return [true, cdApplyEdits(src, edits)]
+}
+
+# ── classes ──────────────────────────────────────────────────────────────────
+
+# class/struct name -> [open, close] brace indices (the first definition)
+fn cdFindClasses(s) {
+    let out = {}
+    let n = s["n"]
+    let i = 0
+    while i + 1 < n {
+        if (scIs(s, i, "class") or scIs(s, i, "struct")) and scIdent(s, i + 1) and !scIs(s, i - 1, "enum") {
+            let j = i + 2
+            while j < n and !scIs(s, j, "{") and !scIs(s, j, ";") and !scIs(s, j, "(") and !scIs(s, j, "=") and !scIs(s, j, ")") and !scIs(s, j, ",") {
+                j = j + 1
+            }
+            let name = scText1(s, i + 1)
+            if scIs(s, j, "{") and s["match"][j] > 0 and !(name in out) {
+                out[name] = [j, s["match"][j]]
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+# the keys of a dict in std::map order
+fn cdSortedKeys(d) {
+    let keys = Object.keys(d)
+    keys.sort()
+    return keys
+}
+
+# enums nested in a class are hoisted before it as Class__Enum; [changed, src]
+fn cdHoistNestedEnums(src) {
+    if sFind(src, "enum", 0) == -1 {
+        return [false, src]
+    }
+    let s = cdScannedCached(src)
+    let n = s["n"]
+    let edits = []
+    let qualified = {}
+    let classes = cdFindClasses(s)
+    for cls in cdSortedKeys(classes) {
+        let open = classes[cls][0]
+        let close = classes[cls][1]
+        let level = s["depth"][open] + 1
+        let local = {}
+        let removed = []
+        let hoisted = ""
+        let k = open + 1
+        while k < close {
+            if !scIs(s, k, "enum") or s["depth"][k] != level {
+                k = k + 1
+                continue
+            }
+            let nm = k + 1
+            if scIs(s, nm, "class") or scIs(s, nm, "struct") {
+                nm = nm + 1
+            }
+            if !scIdent(s, nm) {
+                k = k + 1
+                continue
+            }
+            let b = nm + 1
+            while b < close and !scIs(s, b, "{") and !scIs(s, b, ";") {
+                b = b + 1
+            }
+            if !scIs(s, b, "{") or s["match"][b] < 0 or !scIs(s, s["match"][b] + 1, ";") {
+                k = k + 1
+                continue
+            }
+            let e = s["match"][b]
+            let semi = e + 1
+            let flat = cls + "__" + scText1(s, nm)
+            local[scText1(s, nm)] = flat
+            qualified[cls + " " + scText1(s, nm)] = true
+            hoisted = hoisted + scText(s, k, nm - 1) + " " + flat + " " + scText(s, nm + 1, e) + ";\n"
+            edits.push([scBegin(s, k), scEnd(s, semi), ""])
+            removed.push([k, semi])
+            k = semi + 1
+        }
+        if len(local) == 0 {
+            continue
+        }
+        cdRenameEnumUses(s, open + 1, close - 1, local, removed, edits)
+        k = 0
+        while k + 3 < n {
+            if s["depth"][k] != 0 or !scIs(s, k, cls) or !scIs(s, k + 1, "::") or scIs(s, k - 1, "::") {
+                k = k + 1
+                continue
+            }
+            let paren = k + 2
+            while paren < k + 6 and paren < n and !scIs(s, paren, "(") and !scIs(s, paren, ";") and !scIs(s, paren, "{") {
+                paren = paren + 1
+            }
+            if scIs(s, paren, "(") {
+                let body = cdBodyAfterParams(s, paren)
+                if body != 0 {
+                    cdRenameEnumUses(s, paren, s["match"][body], local, removed, edits)
+                }
+            }
+            k = k + 1
+        }
+        # the hoisted enums go right before `struct Expr`
+        let kw = open
+        while kw > 0 and !((scIs(s, kw, "struct") or scIs(s, kw, "class")) and scIs(s, kw + 1, cls)) {
+            kw = kw - 1
+        }
+        edits.push([scBegin(s, kw), scBegin(s, kw), hoisted])
+    }
+    if len(qualified) == 0 {
+        return [false, src]
+    }
+    # qualified uses anywhere: Expr::Kind -> Expr__Kind
+    let k = 0
+    while k + 2 < n {
+        if scIdent(s, k) and scIs(s, k + 1, "::") and scIdent(s, k + 2) and (scText1(s, k) + " " + scText1(s, k + 2)) in qualified and !scIs(s, k - 1, "::") {
+            edits.push([scBegin(s, k), scEnd(s, k + 2), scText1(s, k) + "__" + scText1(s, k + 2)])
+        }
+        k = k + 1
+    }
+    return [true, cdApplyEdits(src, edits)]
+}
+
+fn cdRenameEnumUses(s, first, last, local, removed, edits) {
+    let k = first
+    while k <= last and k < s["n"] {
+        let inRemoved = false
+        for r in removed {
+            if k >= r[0] and k <= r[1] {
+                inRemoved = true
+            }
+        }
+        if !inRemoved and scIdent(s, k) and scText1(s, k) in local and !scIs(s, k - 1, "::") and !scIs(s, k - 1, ".") and !scIs(s, k - 1, "->") {
+            edits.push([scBegin(s, k), scEnd(s, k), local[scText1(s, k)]])
+        }
+        k = k + 1
+    }
+}
+
+# the member name after "Cls::" at index i ("f", "~Cls", "operator+") and
+# the index just past it
+fn cdMemberNameAt(s, i) {
+    if scIs(s, i, "~") and scIdent(s, i + 1) {
+        return ["~" + scText1(s, i + 1), i + 2]
+    }
+    if scIs(s, i, "operator") {
+        let nm = "operator"
+        let j = i + 1
+        if scIs(s, j, "(") and scIs(s, j + 1, ")") {
+            return [nm + "()", j + 2]
+        }
+        while j < s["n"] and !scIs(s, j, "(") {
+            nm = nm + scText1(s, j)
+            j = j + 1
+        }
+        return [nm, j]
+    }
+    if scIdent(s, i) {
+        return [scText1(s, i), i + 1]
+    }
+    return ["", i]
+}
+
+fn cdHasWord(s, p, w) {
+    let j = p[0]
+    while j <= p[1] {
+        if scIs(s, j, w) {
+            return true
+        }
+        j = j + 1
+    }
+    return false
+}
+
+# the '(' right after `name` in a body-less in-class declaration, or 0
+fn cdProtoParen(s, p, name) {
+    if !scIs(s, p[1], ";") {
+        return 0
+    }
+    let j = p[0]
+    while j < p[1] {
+        if scIs(s, j, "{") or scIs(s, j, "=") {
+            return 0
+        }
+        let nm = cdMemberNameAt(s, j)
+        if nm[0] == name and !scIs(s, j - 1, "::") and scIs(s, nm[1], "(") {
+            return nm[1]
+        }
+        if scIs(s, j, "(") {
+            return 0
+        }
+        j = j + 1
+    }
+    return 0
+}
+
+fn cdPairKey(p) {
+    return str(p[0]) + "," + str(p[1])
+}
+
+fn cdListEq(a, b) {
+    if len(a) != len(b) {
+        return false
+    }
+    let i = 0
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}
+
+# out-of-class member definitions move into their class; [changed, src]
+fn cdMergeOutOfClassMembers(src) {
+    let s = cdScannedCached(src)
+    let classes = cdFindClasses(s)
+    if len(classes) == 0 {
+        return [false, src]
+    }
+    let edits = []
+    let moved = {}
+    let removedProtos = {}
+    let removedList = []
+
+    for st in cdSplitStatements(s, 0, s["n"]) {
+        # "Cls::member" (or "Cls<T>::member") at the statement's own level
+        let q = -1
+        let colons = 0
+        let j = st[0]
+        while j + 2 <= st[1] {
+            if scIs(s, j, "(") or scIs(s, j, "{") or scIs(s, j, "=") or scIs(s, j, ";") {
+                break
+            }
+            if !scIdent(s, j) or !(scText1(s, j) in classes) or scIs(s, j - 1, "::") {
+                j = j + 1
+                continue
+            }
+            let c = j + 1
+            if scIs(s, c, "<") {
+                let angle = 0
+                while c <= st[1] {
+                    if scIs(s, c, "<") {
+                        angle = angle + 1
+                    } else if scIs(s, c, ">") {
+                        angle = angle - 1
+                        if angle == 0 {
+                            break
+                        }
+                    }
+                    c = c + 1
+                }
+                c = c + 1
+            }
+            if !scIs(s, c, "::") {
+                j = j + 1
+                continue
+            }
+            # skip a class-qualified return type: "Cls::Inner Cls::f()"
+            let nm = cdMemberNameAt(s, c + 1)
+            if nm[0] == "" or scIs(s, nm[1], "::") {
+                j = j + 1
+                continue
+            }
+            q = j
+            colons = c
+            break
+        }
+        if q == -1 or s["depth"][q] != 0 {
+            continue
+        }
+        let cls = scText1(s, q)
+        let ci = classes[cls]
+        if st[0] > ci[0] and st[0] < ci[1] {
+            continue
+        }
+        let mn = cdMemberNameAt(s, colons + 1)
+        let member = mn[0]
+        let after = mn[1]
+        # a class lowered out of a namespace (geo__Point) keeps its short
+        # name in an out-of-class constructor / destructor
+        let name = member
+        let dtor = len(member) > 0 and member[0] == "~"
+        let bare = member
+        if dtor {
+            bare = member.slice(1)
+        }
+        if bare != cls and len(cls) > len(bare) + 2 and cls.endsWith("__" + bare) {
+            if dtor {
+                name = "~" + cls
+            } else {
+                name = cls
+            }
+        }
+
+        let protos = cdSplitStatements(s, ci[0] + 1, ci[1])
+        let local = []
+        local.push([scBegin(s, q), scEnd(s, colons), ""])
+        # `template <typename T>` before a class template's member
+        if scIs(s, st[0], "template") and scIs(s, st[0] + 1, "<") {
+            let gt = st[0] + 1
+            let angle = 0
+            while gt < q {
+                if scIs(s, gt, "<") {
+                    angle = angle + 1
+                } else if scIs(s, gt, ">") {
+                    angle = angle - 1
+                    if angle == 0 {
+                        break
+                    }
+                }
+                gt = gt + 1
+            }
+            if gt < q {
+                local.push([scBegin(s, st[0]), scEnd(s, gt), ""])
+            }
+        }
+        if name != member {
+            let nameTok = colons + 1
+            if scIs(s, colons + 1, "~") {
+                nameTok = colons + 2
+            }
+            local.push([scBegin(s, nameTok), scEnd(s, nameTok), cls])
+        }
+        let qualifiers = ""
+        let end = 0
+
+        if scIs(s, after, "(") {
+            # member function: params, qualifiers, optional ctor-initialiser, body
+            let k = cdBodyAfterParams(s, after)
+            if k == 0 {
+                continue
+            }
+            end = s["match"][k]
+            # the in-class declaration this defines: same parameter types,
+            # else the same parameter count
+            let defSig = cdParamSig(s, after)
+            let defCount = len(cdSplitParams(s, after, s["match"][after]))
+            let pick = nil
+            let pickParen = 0
+            let pass = 0
+            while pass < 2 and pickParen == 0 {
+                for p in protos {
+                    let pp = cdProtoParen(s, p, name)
+                    if pp == 0 or cdPairKey(p) in removedProtos {
+                        continue
+                    }
+                    let fits = false
+                    if pass == 0 {
+                        if defSig != nil {
+                            let protoSig = cdParamSig(s, pp)
+                            fits = protoSig != nil and cdListEq(protoSig, defSig)
+                        }
+                    } else {
+                        fits = len(cdSplitParams(s, pp, s["match"][pp])) == defCount
+                    }
+                    if fits {
+                        pick = p
+                        pickParen = pp
+                        break
+                    }
+                }
+                pass = pass + 1
+            }
+            if pickParen != 0 {
+                cdInheritDefaults(s, pickParen, after, local)
+                if cdHasWord(s, pick, "static") {
+                    qualifiers = "static "
+                }
+                removedProtos[cdPairKey(pick)] = true
+                removedList.push(pick)
+            }
+        } else if scIs(s, after, "=") or scIs(s, after, ";") or scIs(s, after, "{") {
+            # static data member definition: T Cls::count = 0;
+            end = st[1]
+            let merged = false
+            for p in protos {
+                if !scIs(s, p[1], ";") or !cdHasWord(s, p, "static") {
+                    continue
+                }
+                let j2 = p[0]
+                while j2 < p[1] {
+                    if scIs(s, j2, member) and (scIs(s, j2 + 1, ";") or scIs(s, j2 + 1, "[") or scIs(s, j2 + 1, "=") or scIs(s, j2 + 1, "{")) {
+                        # only a declaration without a value takes the definition's
+                        if !scIs(s, after, ";") and (scIs(s, j2 + 1, ";") or scIs(s, j2 + 1, "[")) {
+                            let initEnd = end
+                            if scIs(s, end, ";") {
+                                initEnd = end - 1
+                            }
+                            let init = ""
+                            if scIs(s, after, "=") {
+                                init = scText(s, after, initEnd)
+                            } else {
+                                init = "= " + scText(s, after, initEnd)
+                            }
+                            edits.push([scBegin(s, p[1]), scBegin(s, p[1]), " " + init])
+                        }
+                        merged = true
+                        break
+                    }
+                    j2 = j2 + 1
+                }
+                if merged {
+                    break
+                }
+            }
+            edits.push([scBegin(s, st[0]), scEnd(s, end), ""])
+            if !merged {
+                let text = scText(s, st[0], end)
+                let base0 = scBegin(s, st[0])
+                text = cdApplyEdits(text, [[scBegin(s, q) - base0, scEnd(s, colons) - base0, ""]])
+                if !(cls in moved) {
+                    moved[cls] = ""
+                }
+                moved[cls] = moved[cls] + "\n    static " + text
+            }
+            continue
+        } else {
+            continue
+        }
+
+        let base = scBegin(s, st[0])
+        let text = scText(s, st[0], end)
+        let rebased = []
+        for e in local {
+            rebased.push([e[0] - base, e[1] - base, e[2]])
+        }
+        if !(cls in moved) {
+            moved[cls] = ""
+        }
+        moved[cls] = moved[cls] + "\n" + qualifiers + cdApplyEdits(text, rebased) + "\n"
+        edits.push([scBegin(s, st[0]), scEnd(s, end), ""])
+    }
+
+    if len(moved) == 0 and len(edits) == 0 {
+        return [false, src]
+    }
+    # std::set order: by first, then second
+    let sortedProtos = []
+    for p in removedList {
+        let k = len(sortedProtos)
+        sortedProtos.push(p)
+        while k > 0 and (sortedProtos[k - 1][0] > p[0] or (sortedProtos[k - 1][0] == p[0] and sortedProtos[k - 1][1] > p[1])) {
+            sortedProtos[k] = sortedProtos[k - 1]
+            k = k - 1
+        }
+        sortedProtos[k] = p
+    }
+    for p in sortedProtos {
+        edits.push([scBegin(s, p[0]), scEnd(s, p[1]), ""])
+    }
+    for cls in cdSortedKeys(moved) {
+        let at = scBegin(s, classes[cls][1])
+        # members land in the public section the definitions came from
+        edits.push([at, at, "\npublic:" + moved[cls]])
+    }
+    return [true, cdApplyEdits(src, edits)]
+}
+
+# ── free operator functions ──────────────────────────────────────────────────
+
+let CD_OPERATOR_STEMS = {"<<": "lshift", ">>": "rshift", "+": "add", "-": "sub", "*": "mul", "/": "div",
+                         "%": "mod", "==": "eq", "!=": "ne", "<": "lt", ">": "gt", "<=": "le", ">=": "ge"}
+
+fn cdOperatorStem(op) {
+    if op in CD_OPERATOR_STEMS {
+        return CD_OPERATOR_STEMS[op]
+    }
+    return ""
+}
+
+# the type a parameter is declared as: `const Item& item` -> Item
+fn cdParamClass(s, p) {
+    let idents = []
+    let angle = 0
+    let j = p[0]
+    while j <= p[1] {
+        if scIs(s, j, "=") {
+            break
+        }
+        if scIs(s, j, "<") {
+            angle = angle + 1
+        } else if scIs(s, j, ">") and angle > 0 {
+            angle = angle - 1
+        } else if angle == 0 and scIdent(s, j) and !scIs(s, j + 1, "::") {
+            let w = scText1(s, j)
+            if w != "const" and w != "volatile" and w != "struct" and w != "class" {
+                idents.push(w)
+            }
+        }
+        j = j + 1
+    }
+    if len(idents) >= 2 {
+        return idents[len(idents) - 2]
+    }
+    if len(idents) == 0 {
+        return ""
+    }
+    return idents[0]
+}
+
+# free (or friend) binary operators become __op__<stem>__<Class>; [changed, src]
+fn cdLowerFreeOperators(src) {
+    if sFind(src, "operator", 0) == -1 {
+        return [false, src]
+    }
+    let s = cdScannedCached(src)
+    let n = s["n"]
+    let classes = cdFindClasses(s)
+    let classNames = cdSortedKeys(classes)
+    let edits = []
+    let movedOut = {}
+    let movedKeys = []
+    let i = 0
+    while i < n {
+        if !scIs(s, i, "operator") or scIs(s, i - 1, "::") or scIs(s, i - 1, ".") or scIs(s, i - 1, "->") {
+            i = i + 1
+            continue
+        }
+        let j = i + 1
+        let op = ""
+        while j < n and j < i + 3 and s["t"][j][0] == TK_PUNCT and !scIs(s, j, "(") {
+            op = op + scText1(s, j)
+            j = j + 1
+        }
+        if !scIs(s, j, "(") or s["match"][j] < 0 {
+            i = i + 1
+            continue
+        }
+        let stem = cdOperatorStem(op)
+        let params = cdSplitParams(s, j, s["match"][j])
+        if stem == "" or len(params) != 2 {
+            i = i + 1
+            continue
+        }
+        let which = 0
+        if stem == "lshift" or stem == "rshift" {
+            which = 1
+        }
+        let cls = cdParamClass(s, params[which])
+        if cls == "" {
+            i = i + 1
+            continue
+        }
+        let newName = "__op__" + stem + "__" + cls
+        let rename = [scBegin(s, i), scEnd(s, j - 1), newName]
+        # inside a class body: only a friend is a free function
+        let owner = nil
+        for cname in classNames {
+            let ci = classes[cname]
+            if i > ci[0] and i < ci[1] and (owner == nil or ci[0] > owner[0]) {
+                owner = ci
+            }
+        }
+        if owner == nil {
+            if s["depth"][i] == 0 {
+                edits.push(rename)
+            }
+            i = i + 1
+            continue
+        }
+        for st in cdSplitStatements(s, owner[0] + 1, owner[1]) {
+            if i < st[0] or i > st[1] {
+                continue
+            }
+            let fr = st[0]
+            while fr < i and !scIs(s, fr, "friend") {
+                fr = fr + 1
+            }
+            if fr == i {
+                break
+            }
+            edits.push([scBegin(s, st[0]), scEnd(s, st[1]), ""])
+            if scIs(s, st[1], "}") {
+                # a friend defined in the class: the same function, after it
+                let text = scText(s, st[0], st[1])
+                let base = scBegin(s, st[0])
+                text = cdApplyEdits(text, [[scBegin(s, fr) - base, scEnd(s, fr) - base, ""], [rename[0] - base, rename[1] - base, newName]])
+                let after = owner[1]
+                if scIs(s, after + 1, ";") {
+                    after = after + 1
+                }
+                let at = scEnd(s, after)
+                let key = str(at)
+                if !(key in movedOut) {
+                    movedOut[key] = ""
+                    movedKeys.push(at)
+                }
+                movedOut[key] = movedOut[key] + "\n" + text + "\n"
+            }
+            break
+        }
+        i = i + 1
+    }
+    movedKeys.sort()
+    for at in movedKeys {
+        edits.push([at, at, movedOut[str(at)]])
+    }
+    if len(edits) == 0 {
+        return [false, src]
+    }
+    return [true, cdApplyEdits(src, edits)]
+}
+
+# ── free-function prototypes ─────────────────────────────────────────────────
+
+let CD_BUILTIN_TYPE_WORDS = {"int": true, "char": true, "double": true, "float": true, "long": true,
+                             "short": true, "unsigned": true, "signed": true, "bool": true, "void": true,
+                             "auto": true, "size_t": true, "wchar_t": true}
+
+# a parameter list's type signature (each parameter's tokens before its
+# default, without its name), or nil when a parameter isn't a declaration
+fn cdParamSig(s, open) {
+    let sig = []
+    for p in cdSplitParams(s, open, s["match"][open]) {
+        let last = p[1]
+        let eq = cdParamDefaultEq(s, p)
+        if eq != 0 {
+            if eq == p[0] {
+                return nil
+            }
+            last = eq - 1
+        }
+        if last == p[0] and !(scText1(s, last) in CD_BUILTIN_TYPE_WORDS) and !scIs(s, last, "...") {
+            return nil
+        }
+        if last > p[0] and scIdent(s, last) and !(scText1(s, last) in CD_BUILTIN_TYPE_WORDS) {
+            last = last - 1
+        }
+        let t = ""
+        let j = p[0]
+        while j <= last {
+            t = t + scText1(s, j) + " "
+            j = j + 1
+        }
+        sig.push(t)
+    }
+    return sig
+}
+
+let CD_SPECIFIERS = {"static": true, "inline": true, "extern": true, "virtual": true, "friend": true,
+                     "constexpr": true, "explicit": true}
+
+fn cdReturnTypeText(s, first, paren) {
+    let t = ""
+    let j = first
+    while j + 1 < paren {
+        if !(scText1(s, j) in CD_SPECIFIERS) {
+            t = t + scText1(s, j) + " "
+        }
+        j = j + 1
+    }
+    return t
+}
+
+# prototypes of functions the file defines are dropped, their default
+# arguments moving onto the definition
+fn cdReconcilePrototypes(src) {
+    if sFind(src, ";", 0) == -1 {
+        return src
+    }
+    let s = cdScannedCached(src)
+    let defs = {}
+    let protos = []
+    for st in cdSplitStatements(s, 0, s["n"]) {
+        let paren = cdFunctionParen(s, st)
+        if paren == 0 or s["match"][paren] < 0 or paren < st[0] + 2 {
+            continue
+        }
+        let memberAccess = scIs(s, paren - 2, "::")
+        let j = st[0]
+        while j < paren {
+            memberAccess = memberAccess or scIs(s, j, ".") or scIs(s, j, "->")
+            j = j + 1
+        }
+        if memberAccess {
+            continue
+        }
+        let sig = cdParamSig(s, paren)
+        if sig == nil {
+            continue
+        }
+        let fnInfo = {"st": st, "paren": paren, "ret": cdReturnTypeText(s, st[0], paren), "sig": sig}
+        let nm = scText1(s, paren - 1)
+        if scIs(s, st[1], "}") {
+            if !(nm in defs) {
+                defs[nm] = []
+            }
+            defs[nm].push(fnInfo)
+        } else if scIs(s, st[1], ";") and scIs(s, s["match"][paren] + 1, ";") {
+            protos.push([nm, fnInfo])
+        }
+    }
+    let edits = []
+    for entry in protos {
+        let nm = entry[0]
+        let proto = entry[1]
+        if !(nm in defs) {
+            continue
+        }
+        for d in defs[nm] {
+            if d["ret"] != proto["ret"] or !cdListEq(d["sig"], proto["sig"]) {
+                continue
+            }
+            cdInheritDefaults(s, proto["paren"], d["paren"], edits)
+            edits.push([scBegin(s, proto["st"][0]), scEnd(s, proto["st"][1]), ""])
+            break
+        }
+    }
+    if len(edits) > 0 {
+        return cdApplyEdits(src, edits)
+    }
+    return src
+}
+
+# ── entry points ─────────────────────────────────────────────────────────────
+
+# The C++ structure passes over a source; [text, multiFile].
+fn applyCppDialect(source, path) {
+    let out = source
+    let multiFile = false
+    if sFind(out, "#include", 0) != -1 and sFind(out, "\"", 0) != -1 and path != "" and path[0] != "<" {
+        let st = {"seen": {}, "impls": [], "queued": {}}
+        st["seen"][cdPathKey(path)] = true
+        st["queued"][cdPathKey(path)] = true
+        let expanded = cdExpandIncludes(out, path, st)
+        let k = 0
+        while k < len(st["impls"]) {
+            let impl = st["impls"][k]
+            let key = cdPathKey(impl)
+            if !(key in st["seen"]) {
+                st["seen"][key] = true
+                expanded = expanded + "\n" + cdExpandIncludes(cdReadTextFile(impl), impl, st) + "\n"
+            }
+            k = k + 1
+        }
+        if len(st["seen"]) > 1 {
+            out = expanded
+            multiFile = true
+        }
+    }
+    let ext = fileExtLower(path)
+    if ext == ".c" or ext == ".cpp" {
+        out = renameKeywordClashes(out)
+    }
+    if sFind(out, "namespace", 0) != -1 and cdHasToken(out, "namespace") {
+        out = cdSplitNestedNamespaces(out)
+        # each round lowers one namespace (nested ones resurface renamed)
+        let guard = 0
+        while guard < 64 {
+            let r = cdLowerNamespace(out)
+            out = r[1]
+            if !r[0] {
+                break
+            }
+            guard = guard + 1
+        }
+    }
+    if sFind(out, "enum", 0) != -1 and cdHasToken(out, "enum") {
+        out = cdHoistNestedEnums(out)[1]
+    }
+    if sFind(out, "::", 0) != -1 and cdHasToken(out, "::") {
+        let guard = 0
+        while guard < 4 {
+            let r = cdMergeOutOfClassMembers(out)
+            out = r[1]
+            if !r[0] {
+                break
+            }
+            guard = guard + 1
+        }
+    }
+    if sFind(out, "operator", 0) != -1 and cdHasToken(out, "operator") {
+        out = cdLowerFreeOperators(out)[1]
+    }
+    if sFind(out, ";", 0) != -1 and cdHasToken(out, ";") {
+        out = cdReconcilePrototypes(out)
+    }
+    return [out, multiFile]
+}
+
+let CD_MAIN_DEF_RE = "(^|\\n)[ \\t]*(static[ \\t]+)?(int|void|auto)[ \\t]+main[ \\t]*\\("
+
+# a C-style `int main(` (or void/auto) that the file never calls itself
+fn definesCStyleMain(src) {
+    if !reTest(src, CD_MAIN_DEF_RE) {
+        return false
+    }
+    let s = cdScannedCached(src)
+    let i = 0
+    while i + 1 < s["n"] {
+        if scIs(s, i, "main") and scIs(s, i + 1, "(") and s["depth"][i] == 0 and !scIdent(s, i - 1) and !scIs(s, i - 1, "*") and !scIs(s, i - 1, "&") and !scIs(s, i - 1, "::") {
+            return false
+        }
+        i = i + 1
+    }
+    return true
+}

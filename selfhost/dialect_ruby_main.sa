@@ -1,0 +1,1103 @@
+# The Ruby dialect, written in Quantum — part 2, the main pass: a port of
+# applyRubyDialect in src/dialect/RubyDialect.cpp. Ruby-style syntax becomes
+# the brace syntax the parser reads; in a .sa file (strict = false) a
+# construct converts only where it cannot be valid in another dialect.
+# @use "./dialect_ruby.sa"
+
+# frame kinds
+let FK_OTHER = 0
+let FK_DEF = 1
+let FK_CLOSURE_DO = 2
+let FK_CLOSURE_LAMBDA = 3
+let FK_BRANCH = 4
+let FK_LOOP = 5
+let FK_CLASS = 6
+let FK_BRACE = 7
+
+# tail kinds
+let TL_NONE = 0
+let TL_STATEMENT = 1
+let TL_CHAIN = 2
+
+fn rmTail(kind, stmtIndex, chainGroup) {
+    return {"kind": kind, "stmtIndex": stmtIndex, "chainGroup": chainGroup}
+}
+
+fn rmNoTail() {
+    return rmTail(TL_NONE, -1, -1)
+}
+
+fn rmFrame(kind, chainGroupId, last) {
+    return {"kind": kind, "chainGroupId": chainGroupId, "last": last, "signatureLineIndex": -1,
+            "usesImplicitBlock": false, "declaredLocals": {}, "assignTarget": "", "openerLineIndex": -1}
+}
+
+fn rmTop(R) {
+    let stack = R["stack"]
+    return stack[len(stack) - 1]
+}
+
+fn rmGroup(R, gid) {
+    let key = str(gid)
+    if !(key in R["branchGroups"]) {
+        R["branchGroups"][key] = []
+    }
+    return R["branchGroups"][key]
+}
+
+fn rmMarkStatement(R, idx) {
+    if len(R["stack"]) > 0 {
+        rmTop(R)["last"] = rmTail(TL_STATEMENT, idx, -1)
+    }
+}
+
+# a statement using the implicit block makes the enclosing def take __block__
+fn rmMarkImplicitBlockUse(R, text) {
+    if sFind(text, "__block__", 0) == -1 {
+        return nil
+    }
+    let stack = R["stack"]
+    let i = len(stack) - 1
+    while i >= 0 {
+        if stack[i]["kind"] == FK_DEF {
+            stack[i]["usesImplicitBlock"] = true
+            break
+        }
+        i = i - 1
+    }
+    return nil
+}
+
+fn rmEmit(R, indentation, code, track) {
+    R["outLines"].push(indentation + code)
+    if track {
+        rmMarkStatement(R, len(R["outLines"]) - 1)
+    }
+    rmMarkImplicitBlockUse(R, code)
+}
+
+# whether the last emitted line could continue into the next one
+fn rmPrevCanContinue(R) {
+    let lines = R["outLines"]
+    let i = len(lines) - 1
+    while i >= 0 {
+        let t = trimCopy(lines[i])
+        if t == "" or t.startsWith("//") {
+            i = i - 1
+            continue
+        }
+        let last = sLast(t)
+        return last != "{" and last != "}" and last != ";"
+    }
+    return false
+}
+
+fn rmResolveTail(R, info) {
+    if info["kind"] == TL_STATEMENT {
+        let lines = R["outLines"]
+        let ln = lines[info["stmtIndex"]]
+        # `if (cond) { stmt` shares its line with an opener: the statement
+        # is the text after the last "{ " (but a line *starting* with `{`
+        # is a hash literal being returned)
+        let firstNonSpace = sFindFirstNotOf(ln, " \t", 0)
+        let braceSpace = sRFind(ln, "{ ")
+        let stmtStart = firstNonSpace
+        if braceSpace != -1 and firstNonSpace != -1 and braceSpace > firstNonSpace {
+            stmtStart = braceSpace + 2
+        }
+        if stmtStart == -1 {
+            stmtStart = len(ln)
+        }
+        if stmtStart < len(ln) and ln[stmtStart] == ";" {
+            ln = ln.slice(0, stmtStart) + ln.slice(stmtStart + 1)
+        }
+        let stmtText = ln.slice(stmtStart)
+        let isBlockOpener = sLast(stmtText) == "{" and sFind(stmtText, "(fn(", 0) != -1 and !stmtText.startsWith("return ")
+        if isBlockOpener or rbLooksLikeReturnable(stmtText) {
+            ln = ln.slice(0, stmtStart) + "return " + ln.slice(stmtStart)
+        }
+        lines[info["stmtIndex"]] = ln
+    } else if info["kind"] == TL_CHAIN {
+        for b in rmGroup(R, info["chainGroup"]) {
+            rmResolveTail(R, b)
+        }
+    }
+}
+
+let RM_FUNC_KW_RE = "^func(\\s+[A-Za-z_])"
+let RM_FROM_IMPORT_RE = "^from\\s+\\S+\\s+import\\b.*$"
+let RM_ARROW_ALIAS_RE = "\\s*->\\s*[A-Za-z_]\\w*\\s*$"
+let RM_BARE_ACCESS_RE = "^(public|private|protected)\\s*:?\\s*$"
+let RM_ACCESS_LABEL_RE = "^(public|private|protected)\\s*:\\s*(?=\\S)"
+let RM_ASYNC_RE = "^async\\s+"
+let RM_AWAIT_RE = "\\bawait\\s+"
+let RM_ASYNC_AFTER_PARAMS_RE = "\\)\\s*async\\s*\\{"
+let RM_GENERIC_RE = "^(class|struct)\\s+([A-Za-z_]\\w*)<[^<>]*>"
+let RM_TYPED_VAR_RE = "^([A-Za-z_]\\w*)\\s*:\\s*[A-Za-z_][A-Za-z0-9_:<>,*&\\[\\] ]*?\\s*=\\s*(.+)$"
+let RM_REQUIRE_RE = "^require(?:_relative)?\\s+['\"].*['\"]\\s*$"
+let RM_BARE_CALL_RE = "^([A-Za-z_][A-Za-z0-9_]*[?!]?)$"
+let RM_MOD_IF_RE = "^(.*\\S)\\s+(if|unless|while|until)\\s+(.+)$"
+let RM_DOT_PUTS_RE = "^(.+\\.puts)\\s+([^(].*)$"
+let RM_ARRAY_NEW_BLOCK_RE = "Array\\.new\\(([^()]*)\\)\\s*\\{\\s*(?:\\|([^|]*)\\|)?\\s*([^{}]*?)\\s*\\}"
+let RM_ENUM_FOR_RE = "return\\s+enum_for\\(\\s*:?\"?([A-Za-z_][A-Za-z0-9_]*)\"?\\s*\\)"
+let RM_SAFE_NAV_LEFT_STOPS = " \t\n\r=+-*/([,{"
+let RM_SAFE_NAV_RIGHT_STOPS = " \t\n\r=+-*/)],}"
+
+fn rmIsStop(c, stops) {
+    if c == chr(11) or c == chr(12) {
+        return true
+    }
+    return sFind(stops, c, 0) != -1
+}
+
+# `STMT if COND` (and unless / while / until) as a modifier: the converted
+# line, or nil when `code` is not one
+fn rmModifier(R, code) {
+    let strict = R["strict"]
+    if code.startsWith("if ") or code.startsWith("unless ") or code.startsWith("while ") or code.startsWith("until ") {
+        return nil
+    }
+    if !rbUnambiguous(code) or (code != "" and code[0] == "}") or rbFindTopLevel(code, "else if ", 0) != -1 {
+        return nil
+    }
+    if !(rbHas(code, "if") or rbHas(code, "unless") or rbHas(code, "while") or rbHas(code, "until")) {
+        return nil
+    }
+    let m = reMatch(code, RM_MOD_IF_RE)
+    if m == nil {
+        return nil
+    }
+    let kw = m[2]
+    # the loop modifiers stay Ruby-only (`x; while (c) s` is C)
+    if !(strict or (kw != "while" and kw != "until") or rbIsRubyLoopModifier(m[1], m[3])) {
+        return nil
+    }
+    # likewise `x = 1;  if (c) y` is two C statements
+    if !(strict or kw == "while" or kw == "until" or rbIsRubyIfModifier(m[1], m[3])) {
+        return nil
+    }
+    if rbFindTopLevel(code, " " + kw + " ", 0) == -1 {
+        return nil
+    }
+    # a Python inline ternary has a top-level ` else `
+    if rbFindTopLevel(m[3], " else ", 0) != -1 {
+        return nil
+    }
+    # `x = if cond` is an if-expression
+    if sLast(trimCopy(m[1])) == "=" {
+        return nil
+    }
+    let stmt = rmTransformCore(R, trimCopy(m[1]))
+    let cond = rbSubstituteMainGuard(rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(trimCopy(m[3]), strict), R["symbols"]), R["symbols"], strict, R["inClassBody"]))
+    let isLoop = kw == "while" or kw == "until"
+    let wrappedCond = cond
+    if kw == "unless" or kw == "until" {
+        wrappedCond = "!(" + cond + ")"
+    }
+    let opener = "if ("
+    if isLoop {
+        opener = "while ("
+    }
+    if stmt == "" {
+        return ""
+    }
+    return opener + wrappedCond + ") { " + stmt + " }"
+}
+
+# Transforms one leaf statement: raise-comma, puts/print, inline blocks,
+# `<<` push, interpolation, bare split, atom normalization.
+fn rmTransformCore(R, codeIn) {
+    let strict = R["strict"]
+    let symbols = R["symbols"]
+    let inClassBody = R["inClassBody"]
+    let code = codeIn
+
+    # `func name(...)` -> `function name(...)`
+    if code.startsWith("func") {
+        code = reReplace(code, RM_FUNC_KW_RE, "function$1")
+    }
+    if !strict {
+        code = rbConvertLiteralKeyRockets(rbConvertClosureLiterals(code))
+    }
+    if code.startsWith("from") and reFull(code, RM_FROM_IMPORT_RE) {
+        if strict {
+            return ""
+        }
+        code = reReplace(code, RM_ARROW_ALIAS_RE, "")
+    }
+    if code.startsWith("p") {
+        if reFull(code, RM_BARE_ACCESS_RE) {
+            return ""
+        }
+        code = reReplace(code, RM_ACCESS_LABEL_RE, "")
+    }
+    if rbHas(code, "async") {
+        code = reReplace(code, RM_ASYNC_RE, "")
+    }
+    if rbHas(code, "await") {
+        code = reReplace(code, RM_AWAIT_RE, "")
+    }
+    if rbHas(code, "async") {
+        code = reReplace(code, RM_ASYNC_AFTER_PARAMS_RE, ") {")
+    }
+    if code.startsWith("class") or code.startsWith("struct") {
+        code = reReplace(code, RM_GENERIC_RE, "$1 $2")
+    }
+    if rbHas(code, ":") and rbHas(code, "=") {
+        let tvm = reMatch(code, RM_TYPED_VAR_RE)
+        if tvm != nil {
+            code = tvm[1] + " = " + tvm[2]
+        }
+    }
+
+    # multiple assignment as a modifier's statement: a `;`-joined sequence
+    if strict {
+        let expanded = rbTryMultiAssign(code)
+        if expanded != nil {
+            let parts = []
+            for e in expanded {
+                parts.push(rbNormalizeAtoms(rbConvertRanges(e, strict), symbols, strict, inClassBody))
+            }
+            return parts.join("; ")
+        }
+    }
+
+    if code.startsWith("attr_reader") or code.startsWith("attr_accessor") or code.startsWith("attr_writer") {
+        return ""
+    }
+    if (strict and (code.startsWith("require ") or code.startsWith("require_relative "))) or (code.startsWith("require") and reFull(code, RM_REQUIRE_RE)) {
+        return ""
+    }
+
+    # a bare call of a method this file defines
+    if strict {
+        let m = reMatch(code, RM_BARE_CALL_RE)
+        if m != nil {
+            let base = m[1]
+            if sLast(base) == "?" or sLast(base) == "!" {
+                base = base.slice(0, len(base) - 1)
+            }
+            if base in symbols["methods"] {
+                code = base + "()"
+            }
+        }
+    }
+
+    # `obj&.method` -> `(obj != nil ? obj.method : nil)`
+    if strict {
+        while true {
+            let pos = sFind(code, "&.", 0)
+            if pos == -1 {
+                break
+            }
+            let start = pos - 1
+            let parens = 0
+            let brackets = 0
+            while start >= 0 {
+                let c = code[start]
+                if c == ")" {
+                    parens = parens + 1
+                } else if c == "(" {
+                    parens = parens - 1
+                } else if c == "]" {
+                    brackets = brackets + 1
+                } else if c == "[" {
+                    brackets = brackets - 1
+                }
+                if parens == 0 and brackets == 0 and rmIsStop(c, RM_SAFE_NAV_LEFT_STOPS) {
+                    start = start + 1
+                    break
+                }
+                start = start - 1
+            }
+            if start < 0 {
+                start = 0
+            }
+            let receiver = trimCopy(code.slice(start, pos))
+            let end = pos + 2
+            parens = 0
+            brackets = 0
+            while end < len(code) {
+                let c = code[end]
+                if c == "(" {
+                    parens = parens + 1
+                } else if c == ")" {
+                    parens = parens - 1
+                } else if c == "[" {
+                    brackets = brackets + 1
+                } else if c == "]" {
+                    brackets = brackets - 1
+                }
+                if parens == 0 and brackets == 0 and rmIsStop(c, RM_SAFE_NAV_RIGHT_STOPS) {
+                    break
+                }
+                end = end + 1
+            }
+            let methodChain = code.slice(pos + 2, end)
+            code = code.slice(0, start) + "(" + receiver + " != nil ? " + receiver + "." + methodChain + " : nil)" + code.slice(end)
+        }
+    }
+
+    # a defaulting Hash: record it and declare `{}`; its reads redirect
+    if strict {
+        let dh = rbMatchDefaultHashDecl(code)
+        if dh != nil {
+            R["defaultHashes"][dh[0]] = dh[1]
+            code = dh[0] + " = {}"
+        } else {
+            code = rbApplyDefaultHashReads(code, R["defaultHashes"])
+        }
+    }
+
+    # a modifier inside a block body
+    let modified = rmModifier(R, code)
+    if modified != nil and modified != "" {
+        return modified
+    }
+
+    code = rbConvertRaiseComma(code)
+
+    if code.startsWith("puts(") {
+        code = "print" + code.slice(4)
+    } else if code.startsWith("puts ") {
+        code = "print(" + trimCopy(code.slice(5)) + ")"
+    } else if code.startsWith("print ") {
+        code = "print(" + trimCopy(code.slice(6)) + ")"
+    } else if rbHas(code, ".puts") {
+        let m = reMatch(code, RM_DOT_PUTS_RE)
+        if m != nil {
+            code = m[1] + "(" + m[2] + ")"
+        }
+    }
+
+    # `next`: `continue` in a native loop, `return` in a closure
+    if strict and (code == "next" or code.startsWith("next ")) {
+        let keyword = "return"
+        let stack = R["stack"]
+        let i = len(stack) - 1
+        while i >= 0 {
+            let kind = stack[i]["kind"]
+            if kind == FK_LOOP {
+                keyword = "continue"
+                break
+            }
+            if kind == FK_CLOSURE_DO or kind == FK_CLOSURE_LAMBDA or kind == FK_DEF {
+                break
+            }
+            i = i - 1
+        }
+        code = keyword + code.slice(4)
+    }
+
+    if code.startsWith("yield(") {
+        code = "__block__" + code.slice(5)
+    } else if code.startsWith("yield ") {
+        code = "__block__(" + trimCopy(code.slice(6)) + ")"
+    } else if code == "yield" {
+        code = "__block__()"
+    }
+
+    if rbHas(code, "Array.new" + "(") {
+        code = reReplace(code, RM_ARRAY_NEW_BLOCK_RE, "range(0, $1).map(fn($2) { return $3 })")
+    }
+
+    let block = rbTryInlineBraceBlock(code, symbols)
+    if block != nil {
+        let prefix = rbNormalizeAtoms(rbConvertRanges(block["prefix"], strict), symbols, strict, inClassBody)
+        let d = rbApplyBlockDestructuring(prefix, block["params"])
+        let body = rmTransformCore(R, block["body"])
+        if rbLooksLikeReturnable(body) {
+            body = "return " + body
+        }
+        code = rbBuildBlockOpenText(prefix, d[1]) + " " + d[0] + body + " })" + block["suffix"]
+    }
+
+    let pushed = rbTryPushAppend(code)
+    if pushed != nil {
+        code = pushed
+    }
+
+    if strict {
+        code = reReplace(code, RM_ENUM_FOR_RE, "let __e = []; self.$1(fn(__x) { __e.push(__x) }); return __e")
+    }
+
+    code = rbConvertBareSplit(code)
+    code = rbConvertRanges(code, strict)
+    code = rbConvertBlockCapture(code, strict)
+    code = rbConvertInterpolation(code, symbols)
+    code = rbNormalizeAtoms(code, symbols, strict, inClassBody)
+    if strict and inClassBody {
+        code = reReplace(code, R["selfCallRe"], "$1self.$2(")
+    }
+    if code == "nil" {
+        code = "null"
+    }
+    # a statement starting with an array literal that a previous line could
+    # swallow as an index gets a leading `;`
+    if code != "" and code[0] == "[" and rmPrevCanContinue(R) {
+        let close = rbMatchBracket(code, 0)
+        if close != -1 and close + 1 < len(code) and code[close + 1] == "." {
+            code = ";" + code
+        }
+    }
+    return code
+}
+
+# closes the innermost open block (a Ruby `end`, or in mixed mode a `}`
+# closing a Ruby-opened block)
+fn rmCloseTopFrame(R, indentation, trailer) {
+    let stack = R["stack"]
+    let lines = R["outLines"]
+    let top = stack.pop()
+    let kind = top["kind"]
+    if kind == FK_BRANCH {
+        rmGroup(R, top["chainGroupId"]).push(top["last"])
+        lines.push(indentation + "}" + trailer)
+        if top["assignTarget"] != "" {
+            # if-as-expression: each branch's tail is assigned to the target
+            for b in rmGroup(R, top["chainGroupId"]) {
+                if b["kind"] != TL_STATEMENT or b["stmtIndex"] < 0 {
+                    continue
+                }
+                let ln = lines[b["stmtIndex"]]
+                let p = sFindFirstNotOf(ln, " \t", 0)
+                if p == -1 {
+                    continue
+                }
+                if p < len(ln) and ln[p] == ";" {
+                    ln = ln.slice(0, p) + ln.slice(p + 1)
+                }
+                if rbLooksLikeReturnable(ln.slice(p)) {
+                    ln = ln.slice(0, p) + top["assignTarget"] + " = " + ln.slice(p)
+                }
+                lines[b["stmtIndex"]] = ln
+            }
+            if len(stack) > 0 {
+                rmTop(R)["last"] = rmNoTail()
+            }
+        } else if len(stack) > 0 {
+            rmTop(R)["last"] = rmTail(TL_CHAIN, -1, top["chainGroupId"])
+        }
+    } else if kind == FK_CLOSURE_DO {
+        lines.push(indentation + "})" + trailer)
+        rmResolveTail(R, top["last"])
+        # the block call is itself a statement of the enclosing frame
+        if len(stack) > 0 {
+            rmTop(R)["last"] = rmTail(TL_STATEMENT, top["openerLineIndex"], -1)
+        }
+    } else if kind == FK_CLOSURE_LAMBDA {
+        lines.push(indentation + "}" + trailer)
+        rmResolveTail(R, top["last"])
+        if len(stack) > 0 {
+            rmTop(R)["last"] = rmNoTail()
+        }
+    } else if kind == FK_DEF {
+        lines.push(indentation + "}" + trailer)
+        # a constructor returns the new instance, never its last expression
+        let isConstructor = top["signatureLineIndex"] >= 0 and sFind(lines[top["signatureLineIndex"]], "function init(", 0) != -1
+        if !isConstructor {
+            rmResolveTail(R, top["last"])
+        }
+        # yield / block_given? in the body: the method takes a trailing __block__
+        if top["usesImplicitBlock"] and top["signatureLineIndex"] >= 0 {
+            let sigLine = lines[top["signatureLineIndex"]]
+            let lastParen = sRFind(sigLine, ")")
+            if lastParen != -1 {
+                let add = ", __block__"
+                if lastParen > 0 and sigLine[lastParen - 1] == "(" {
+                    add = "__block__"
+                }
+                lines[top["signatureLineIndex"]] = sigLine.slice(0, lastParen) + add + sigLine.slice(lastParen)
+            }
+        }
+        if len(stack) > 0 {
+            rmTop(R)["last"] = rmNoTail()
+        }
+    } else {
+        lines.push(indentation + "}" + trailer)
+        if len(stack) > 0 {
+            rmTop(R)["last"] = rmNoTail()
+        }
+    }
+}
+
+# mixed mode: native `{`/`}` a passed-through line opens or closes
+fn rmTrackNativeBraces(R, text) {
+    if R["strict"] {
+        return nil
+    }
+    let stack = R["stack"]
+    let net = rbNetBraces(text)
+    while net > 0 {
+        stack.push(rmFrame(FK_BRACE, -1, rmNoTail()))
+        net = net - 1
+    }
+    while net < 0 and len(stack) > 1 and rmTop(R)["kind"] == FK_BRACE {
+        stack.pop()
+        rmTop(R)["last"] = rmNoTail()
+        net = net + 1
+    }
+    return nil
+}
+
+# rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(text))), the
+# usual treatment of a condition
+fn rmCond(R, text) {
+    let strict = R["strict"]
+    return rbNormalizeAtoms(rbConvertInterpolation(rbConvertRanges(text, strict), R["symbols"]), R["symbols"], strict, R["inClassBody"])
+}
+
+# whether a Ruby block opener converts here: always in a .rb file, in a .sa
+# file only bare Ruby syntax closed by a matching `end`
+fn rmOpenerAllowed(R, code, li) {
+    return R["strict"] or (rbUnambiguousAllowingColon(code) and rbHasMatchingEnd(R["rawLines"], li))
+}
+
+let RM_END_THEN_DECL_RE = "^(\\s*)end\\s+((?:def|class|function|fn)\\b.*)$"
+let RM_BRACE_ELSE_RE = "^\\}\\s*else\\s*\\{?\\s*$"
+let RM_BRACE_ELSIF_CHAIN_RE = "^\\}\\s*(?:elsif|else\\s+if)\\s+(.*?)\\s*\\{?\\s*$"
+let RM_BRACE_ELSIF_RE = "^\\}\\s*elsif\\s+(.+)$"
+let RM_ASSIGN_IF_RE = "^(.+?)\\s*=\\s*(if|unless)\\s+(.+)$"
+let RM_RESCUE_RE = "^rescue(\\s+[A-Za-z_][A-Za-z0-9_:]*)?\\s*(=>\\s*(\\w+))?\\s*$"
+let RM_WHEN_RE = "^when\\s+(.+?)(\\s+then\\s+(.+))?$"
+let RM_CLASS_RE = "^([A-Za-z_][A-Za-z0-9_]*)\\s*(<\\s*([A-Za-z_][A-Za-z0-9_]*))?\\s*$"
+let RM_INCLUDE_MARKER_RE = "^include\\s+[A-Za-z_][A-Za-z0-9_]*$"
+let RM_INIT_RE = "^initialize(\\s*\\(.*)?$"
+let RM_ARRAY_NEW_DO_RE = "^(.*)Array\\.new\\(([^()]*)\\)$"
+let RM_LAMBDA_DO_RE = "^(.*?)\\b(?:lambda|proc|Proc\\.new)\\s*$"
+let RM_EACH_CALL_RE = "^(.*)\\.each$"
+let RM_TYPE_RENAMES = [["\\bstring\\b", "_string_"], ["\\bint\\b", "_int_"], ["\\bfloat\\b", "_float_"],
+                       ["\\bdouble\\b", "_double_"], ["\\bchar\\b", "_char_"], ["\\blong\\b", "_long_"],
+                       ["\\bshort\\b", "_short_"]]
+
+fn applyRubyDialect(source, strict) {
+    # `end def next_method()` is split into an `end` line and the declaration
+    let rawLines = []
+    for line in sGetLines(source) {
+        let m = nil
+        if rbHas(line, "end") {
+            m = reMatch(line, RM_END_THEN_DECL_RE)
+        }
+        if m != nil {
+            rawLines.push(m[1] + "end")
+            rawLines.push(m[1] + m[2])
+        } else {
+            rawLines.push(line)
+        }
+    }
+    if strict {
+        rawLines = rbExpandHeredocs(rawLines)
+    }
+    rawLines = rbFlattenModules(rawLines)
+    rawLines = rbConvertBracePipeBlocks(rawLines)
+
+    let symbols = rbNewSymbols()
+    rbCollectSymbols(rawLines, symbols)
+    rbSetLines(rawLines)
+
+    # implicit-self calls of this file's methods (std::set order)
+    let names = []
+    for name in Object.keys(symbols["methods"]) {
+        if name != "initialize" and name != "init" {
+            names.push(name)
+        }
+    }
+    names.sort()
+    let selfCallRe = "(?!)"
+    if len(names) > 0 {
+        selfCallRe = "(^|[^\\w.])(" + names.join("|") + ")\\s*\\("
+    }
+
+    let R = {"strict": strict, "symbols": symbols, "outLines": [], "stack": [rmFrame(FK_OTHER, -1, rmNoTail())],
+             "branchGroups": {}, "nextChainGroup": 0, "defaultHashes": {}, "caseSubjects": {},
+             "caseSubjectByGroup": {}, "selfCallRe": selfCallRe, "inClassBody": false, "rawLines": rawLines}
+    let outLines = R["outLines"]
+    let stack = R["stack"]
+
+    let inBlockComment = false
+    let tripleQuote = ""
+    let li = 0
+    while li < len(rawLines) {
+        let rawLine = rawLines[li]
+        let lineIndex = li
+        li = li + 1
+        # are we lexically inside a `class ... end`?
+        R["inClassBody"] = false
+        for f in stack {
+            if f["kind"] == FK_CLASS {
+                R["inClassBody"] = true
+                break
+            }
+        }
+        let first = sFindFirstNotOf(rawLine, " \t", 0)
+        if first == -1 {
+            outLines.push("")
+            continue
+        }
+        let indentation = rawLine.slice(0, first)
+        let code = trimCopy(rawLine.slice(first))
+
+        # mixed mode: comment-bearing lines, docstrings and preprocessor
+        # lines pass through verbatim
+        if !strict {
+            if inBlockComment {
+                if sFind(code, "*/", 0) != -1 {
+                    inBlockComment = false
+                }
+                outLines.push(rawLine)
+                continue
+            }
+            let tripleBefore = tripleQuote
+            tripleQuote = rbScanTripleQuotes(rawLine, tripleQuote)
+            if tripleBefore != "" or tripleQuote != "" {
+                outLines.push(rawLine)
+                continue
+            }
+            if rbHasCStyleComment(code) {
+                if rbOpensBlockComment(code) {
+                    inBlockComment = true
+                }
+                outLines.push(indentation + rbRenameBareInput(code))
+                rmTrackNativeBraces(R, code)
+                continue
+            }
+            if code[0] == "#" and rbIsPreprocessorLine(code) {
+                outLines.push(rawLine)
+                continue
+            }
+            let hashAt = rbFindHashComment(code)
+            if hashAt != -1 {
+                code = trimCopy(code.slice(0, hashAt))
+                if code == "" {
+                    outLines.push(rawLine)
+                    continue
+                }
+            }
+        }
+
+        if code[0] == "#" {
+            outLines.push(indentation + "//" + code.slice(1))
+            continue
+        }
+
+        if code.startsWith("async") {
+            code = reReplace(code, RM_ASYNC_RE, "")
+        }
+
+        if code == "private" or code == "protected" or code == "public" {
+            outLines.push(indentation + "// " + code)
+            continue
+        }
+
+        if strict and len(R["defaultHashes"]) > 0 {
+            code = rbApplyDefaultHashReads(code, R["defaultHashes"])
+        }
+
+        # strict: drop a trailing `#` comment
+        if strict {
+            let inSQuote = false
+            let inDQuote = false
+            let i = 0
+            while i < len(code) {
+                let c = code[i]
+                let escaped = i > 0 and code[i - 1] == "\\"
+                if c == "'" and !inDQuote and !escaped {
+                    inSQuote = !inSQuote
+                } else if c == "\"" and !inSQuote and !escaped {
+                    inDQuote = !inDQuote
+                } else if c == "#" and !inSQuote and !inDQuote {
+                    code = trimCopy(code.slice(0, i))
+                    break
+                }
+                i = i + 1
+            }
+            if code == "" {
+                outLines.push(indentation)
+                continue
+            }
+        }
+
+        # ── multiple assignment (whole-statement only) ──
+        let expanded = rbTryMultiAssign(code)
+        if expanded != nil {
+            let k = 0
+            while k < len(expanded) {
+                let ln = rbConvertInterpolation(rbConvertRanges(expanded[k], strict), symbols)
+                ln = rbNormalizeAtoms(ln, symbols, strict, R["inClassBody"])
+                rmEmit(R, indentation, ln, k + 1 == len(expanded))
+                k = k + 1
+            }
+            continue
+        }
+
+        # ── modifier if / unless / while / until ──
+        let modified = rmModifier(R, code)
+        if modified != nil {
+            if modified != "" {
+                rmEmit(R, indentation, modified, true)
+            }
+            continue
+        }
+
+        # mixed mode: a `}` closing a Ruby-opened block
+        if !strict and code[0] == "}" and len(stack) > 1 and rmTop(R)["kind"] != FK_BRACE {
+            let isBranch = rmTop(R)["kind"] == FK_BRANCH
+            let em = nil
+            if isBranch {
+                em = reMatch(code, RM_BRACE_ELSIF_CHAIN_RE)
+            }
+            if isBranch and reFull(code, RM_BRACE_ELSE_RE) {
+                code = "else"
+            } else if em != nil {
+                code = "elsif " + em[1]
+            } else {
+                let trailer = code.slice(1)
+                rmCloseTopFrame(R, indentation, trailer)
+                rmTrackNativeBraces(R, trailer)
+                continue
+            }
+        }
+
+        # `} elsif COND` on a native brace if
+        let rubyBranch = len(stack) > 1 and rmTop(R)["kind"] == FK_BRANCH
+        if !rubyBranch and code[0] == "}" {
+            let m = reMatch(code, RM_BRACE_ELSIF_RE)
+            if m != nil {
+                let cond = rmCond(R, rbStripTrailingThen(trimCopy(m[1])))
+                outLines.push(indentation + "} else if (" + cond + ") {")
+                continue
+            }
+        }
+
+        if code.startsWith("elsif ") and len(stack) > 1 and rmTop(R)["kind"] == FK_BRANCH {
+            let top = rmTop(R)
+            rmGroup(R, top["chainGroupId"]).push(top["last"])
+            stack.pop()
+            let cond = rmCond(R, rbStripTrailingThen(trimCopy(code.slice(6))))
+            outLines.push(indentation + "} else if (" + cond + ") {")
+            let f = rmFrame(FK_BRANCH, top["chainGroupId"], rmNoTail())
+            f["assignTarget"] = top["assignTarget"]
+            stack.push(f)
+            continue
+        }
+        if code == "else" and len(stack) > 1 and rmTop(R)["kind"] == FK_BRANCH {
+            let top = rmTop(R)
+            rmGroup(R, top["chainGroupId"]).push(top["last"])
+            stack.pop()
+            outLines.push(indentation + "} else {")
+            let f = rmFrame(FK_BRANCH, top["chainGroupId"], rmNoTail())
+            f["assignTarget"] = top["assignTarget"]
+            stack.push(f)
+            continue
+        }
+        if code == "end" and len(stack) > 1 {
+            rmCloseTopFrame(R, indentation, "")
+            continue
+        }
+
+        # `x = if cond` ... `end`: each branch assigns its value
+        if strict and (rbHas(code, "if") or rbHas(code, "unless")) {
+            let m = reMatch(code, RM_ASSIGN_IF_RE)
+            if m != nil and rbFindTopLevelAssign(code) != -1 and rbHasMatchingEnd(rawLines, lineIndex) {
+                let target = rbNormalizeAtoms(rbConvertRanges(trimCopy(m[1]), strict), symbols, strict, R["inClassBody"])
+                let cond = rmCond(R, trimCopy(m[3]))
+                if m[2] == "unless" {
+                    cond = "!(" + cond + ")"
+                }
+                outLines.push(indentation + "if (" + cond + ") {")
+                let f = rmFrame(FK_BRANCH, R["nextChainGroup"], rmNoTail())
+                R["nextChainGroup"] = R["nextChainGroup"] + 1
+                f["assignTarget"] = target
+                stack.push(f)
+                continue
+            }
+        }
+
+        if code.startsWith("unless ") and rmOpenerAllowed(R, code, lineIndex) {
+            let cond = rbSubstituteMainGuard(rmCond(R, rbStripTrailingThen(trimCopy(code.slice(7)))))
+            outLines.push(indentation + "if (!(" + cond + ")) {")
+            stack.push(rmFrame(FK_BRANCH, R["nextChainGroup"], rmNoTail()))
+            R["nextChainGroup"] = R["nextChainGroup"] + 1
+            continue
+        }
+        if code.startsWith("if ") and rmOpenerAllowed(R, code, lineIndex) {
+            let cond = rbSubstituteMainGuard(rmCond(R, rbStripTrailingThen(trimCopy(code.slice(3)))))
+            outLines.push(indentation + "if (" + cond + ") {")
+            stack.push(rmFrame(FK_BRANCH, R["nextChainGroup"], rmNoTail()))
+            R["nextChainGroup"] = R["nextChainGroup"] + 1
+            continue
+        }
+        if code.startsWith("until ") and rmOpenerAllowed(R, code, lineIndex) {
+            let cond = rmCond(R, rbStripTrailingThen(trimCopy(code.slice(6))))
+            outLines.push(indentation + "while (!(" + cond + ")) {")
+            stack.push(rmFrame(FK_LOOP, -1, rmNoTail()))
+            continue
+        }
+        if code.startsWith("while ") and rmOpenerAllowed(R, code, lineIndex) {
+            let cond = rmCond(R, rbStripTrailingThen(trimCopy(code.slice(6))))
+            outLines.push(indentation + "while (" + cond + ") {")
+            stack.push(rmFrame(FK_LOOP, -1, rmNoTail()))
+            continue
+        }
+        # mixed mode: a Python `for x in xs:` closed by `end` or `}`
+        if !strict and code.startsWith("for ") and rbIsColonOpener(code) and rbClosedAtSameIndent(rawLines, lineIndex, true) {
+            let header = rbNormalizeAtoms(rbConvertRanges(trimCopy(code.slice(0, len(code) - 1)), strict), symbols, strict, R["inClassBody"])
+            outLines.push(indentation + header + " {")
+            stack.push(rmFrame(FK_LOOP, -1, rmNoTail()))
+            continue
+        }
+        if (code == "loop" or code == "loop do") and rmOpenerAllowed(R, code, lineIndex) {
+            outLines.push(indentation + "while (true) {")
+            stack.push(rmFrame(FK_LOOP, -1, rmNoTail()))
+            continue
+        }
+        if code.startsWith("begin") and trimCopy(code) == "begin" and rmOpenerAllowed(R, code, lineIndex) {
+            outLines.push(indentation + "try {")
+            stack.push(rmFrame(FK_OTHER, -1, rmNoTail()))
+            continue
+        }
+        # rescue / ensure continue a Ruby-opened begin
+        if len(stack) > 1 and code.startsWith("rescue") {
+            let m = reMatch(code, RM_RESCUE_RE)
+            if m != nil {
+                let v = "e"
+                if reHas(m, 3) {
+                    v = m[3]
+                }
+                stack.pop()
+                outLines.push(indentation + "} catch (" + v + ") {")
+                stack.push(rmFrame(FK_OTHER, -1, rmNoTail()))
+                continue
+            }
+        }
+        if code == "ensure" and len(stack) > 1 {
+            stack.pop()
+            outLines.push(indentation + "} finally {")
+            stack.push(rmFrame(FK_OTHER, -1, rmNoTail()))
+            continue
+        }
+
+        if code.startsWith("case ") and rmOpenerAllowed(R, code, lineIndex) {
+            let subject = rmCond(R, trimCopy(code.slice(5)))
+            # the first `when` opens the branch; the subject waits by depth
+            outLines.push("")
+            R["caseSubjects"][str(len(stack))] = subject
+            stack.push(rmFrame(FK_OTHER, -2, rmNoTail()))
+            continue
+        }
+        let wm = nil
+        if code.startsWith("when") {
+            wm = reMatch(code, RM_WHEN_RE)
+        }
+        if wm != nil and len(stack) > 1 and (rmTop(R)["chainGroupId"] == -2 or rmTop(R)["kind"] == FK_BRANCH) {
+            let isFirst = rmTop(R)["chainGroupId"] == -2
+            let subject = ""
+            if isFirst {
+                let key = str(len(stack) - 1)
+                if key in R["caseSubjects"] {
+                    subject = R["caseSubjects"][key]
+                } else {
+                    R["caseSubjects"][key] = ""
+                }
+            }
+            let gid = 0
+            if isFirst {
+                stack.pop()
+                gid = R["nextChainGroup"]
+                R["nextChainGroup"] = gid + 1
+            } else {
+                let top = rmTop(R)
+                rmGroup(R, top["chainGroupId"]).push(top["last"])
+                gid = top["chainGroupId"]
+                stack.pop()
+            }
+            let values = rbSplitTopLevel(rmCond(R, wm[1]), ",")
+            let subj = subject
+            if !isFirst {
+                let key = str(gid)
+                if key in R["caseSubjectByGroup"] {
+                    subj = R["caseSubjectByGroup"][key]
+                } else {
+                    subj = ""
+                }
+            }
+            R["caseSubjectByGroup"][str(gid)] = subj
+            let cond = ""
+            let k = 0
+            while k < len(values) {
+                if k > 0 {
+                    cond = cond + " || "
+                }
+                cond = cond + "(" + subj + " == " + values[k] + ")"
+                k = k + 1
+            }
+            let opener = "} else if (" + cond + ") {"
+            if isFirst {
+                opener = "if (" + cond + ") {"
+            }
+            if reHas(wm, 3) {
+                let stmt = rmTransformCore(R, trimCopy(wm[3]))
+                outLines.push(indentation + opener + " " + stmt)
+                rmMarkImplicitBlockUse(R, stmt)
+                stack.push(rmFrame(FK_BRANCH, gid, rmTail(TL_STATEMENT, len(outLines) - 1, -1)))
+            } else {
+                outLines.push(indentation + opener)
+                stack.push(rmFrame(FK_BRANCH, gid, rmNoTail()))
+            }
+            continue
+        }
+
+        if code.startsWith("class ") and rmOpenerAllowed(R, code, lineIndex) {
+            let rest = trimCopy(code.slice(6))
+            if sLast(rest) == ":" {
+                rest = trimCopy(rest.slice(0, len(rest) - 1))
+            }
+            let m = reMatch(rest, RM_CLASS_RE)
+            let header = "class " + rest
+            if m != nil {
+                if reHas(m, 3) {
+                    header = "class " + m[1] + " extends " + m[3]
+                } else {
+                    header = "class " + m[1]
+                }
+            }
+            outLines.push(indentation + header + " {")
+            stack.push(rmFrame(FK_CLASS, -1, rmNoTail()))
+            continue
+        }
+        # `include ModuleName` (already spliced in) is dropped
+        if code.startsWith("include") and reFull(code, RM_INCLUDE_MARKER_RE) {
+            continue
+        }
+
+        if code.startsWith("def ") and rmOpenerAllowed(R, code, lineIndex) {
+            let signature = trimCopy(code.slice(4))
+            if sLast(signature) == ":" {
+                signature = trimCopy(signature.slice(0, len(signature) - 1))
+            }
+            signature = reReplace(signature, RM_INIT_RE, "init$1")
+            signature = rbConvertBlockCapture(signature, strict)
+            signature = rbNormalizeAtoms(signature, symbols, strict, false)
+            if sFind(signature, "(", 0) == -1 {
+                signature = signature + "()"
+            }
+            outLines.push(indentation + "function " + signature + " {")
+            let defFrame = rmFrame(FK_DEF, -1, rmNoTail())
+            defFrame["signatureLineIndex"] = len(outLines) - 1
+            # parameters count as declared locals
+            let lp = sFind(signature, "(", 0)
+            let rp = sRFind(signature, ")")
+            if lp != -1 and rp != -1 and rp > lp {
+                for p in rbSplitTopLevel(signature.slice(lp + 1, rp), ",") {
+                    let pn = trimCopy(p)
+                    let eq = sFind(pn, "=", 0)
+                    if eq != -1 {
+                        pn = trimCopy(pn.slice(0, eq))
+                    }
+                    if pn != "" {
+                        defFrame["declaredLocals"][pn] = true
+                    }
+                }
+            }
+            stack.push(defFrame)
+            continue
+        }
+
+        let opener = nil
+        if rbHas(code, "do") {
+            opener = rbTryTrailingDoOpener(code)
+        }
+        if opener != nil and opener[0] != "" and rmOpenerAllowed(R, code, lineIndex) {
+            let prefix = opener[0]
+            let params = opener[1]
+            if strict {
+                prefix = rbApplyDefaultHashReads(prefix, R["defaultHashes"])
+                let anm = reMatch(prefix, RM_ARRAY_NEW_DO_RE)
+                if anm != nil {
+                    prefix = anm[1] + "range(0, " + anm[2] + ").map"
+                }
+                # `f = lambda do |x|` is a closure literal, not a block call
+                let lm = reMatch(prefix, RM_LAMBDA_DO_RE)
+                if lm != nil {
+                    outLines.push(indentation + lm[1] + "fn(" + params + ") {")
+                    stack.push(rmFrame(FK_CLOSURE_LAMBDA, -1, rmNoTail()))
+                    continue
+                }
+            }
+            let convertedPrefix = rbNormalizeAtoms(rbConvertRanges(prefix, strict), symbols, strict, R["inClassBody"])
+            # loop control in the body: a native for-in loop instead
+            if strict and rbBlockBodyUsesLoopControl(rawLines, lineIndex) {
+                let em = reMatch(convertedPrefix, RM_EACH_CALL_RE)
+                let pnames = rbSplitTopLevel(params, ",")
+                if em != nil and len(pnames) == 1 and trimCopy(pnames[0]) != "" {
+                    outLines.push(indentation + "for " + trimCopy(pnames[0]) + " in " + em[1] + " {")
+                    stack.push(rmFrame(FK_LOOP, -1, rmNoTail()))
+                    continue
+                }
+            }
+            let d = rbApplyBlockDestructuring(convertedPrefix, params)
+            params = d[1]
+            if convertedPrefix != "" and convertedPrefix[0] == "[" and rmPrevCanContinue(R) {
+                let close = rbMatchBracket(convertedPrefix, 0)
+                if close != -1 and close + 1 < len(convertedPrefix) and convertedPrefix[close + 1] == "." {
+                    convertedPrefix = ";" + convertedPrefix
+                }
+            }
+            outLines.push(indentation + rbBuildBlockOpenText(convertedPrefix, params))
+            let openerIdx = len(outLines) - 1
+            if d[0] != "" {
+                outLines.push(indentation + "  " + d[0])
+            }
+            let doFrame = rmFrame(FK_CLOSURE_DO, -1, rmNoTail())
+            doFrame["openerLineIndex"] = openerIdx
+            stack.push(doFrame)
+            continue
+        }
+
+        let finalCode = rmTransformCore(R, code)
+        if finalCode == "" {
+            outLines.push("")
+            continue
+        }
+        # strict: a method-body local's first assignment becomes a `let`
+        if strict {
+            let i = len(stack) - 1
+            while i >= 0 {
+                if stack[i]["kind"] == FK_DEF {
+                    let declName = rbLocalDeclName(finalCode, stack[i]["declaredLocals"])
+                    if declName != "" {
+                        stack[i]["declaredLocals"][declName] = true
+                        finalCode = "let " + finalCode
+                    }
+                    break
+                }
+                i = i - 1
+            }
+        }
+        rmEmit(R, indentation, finalCode, true)
+        rmTrackNativeBraces(R, finalCode)
+    }
+
+    # Ruby names that are Quantum type keywords (`string`, `int`, ...)
+    if strict {
+        let k = 0
+        while k < len(outLines) {
+            let line = outLines[k]
+            let fns = sFindFirstNotOf(line, " \t", 0)
+            if !(fns != -1 and line.slice(fns, fns + 2) == "//") {
+                for tr in RM_TYPE_RENAMES {
+                    line = reReplace(line, tr[0], tr[1])
+                }
+                outLines[k] = line
+            }
+            k = k + 1
+        }
+    }
+
+    let result = []
+    for l in outLines {
+        result.push(l)
+        result.push("\n")
+    }
+    return result.join("")
+}

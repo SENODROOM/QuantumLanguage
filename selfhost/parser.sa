@@ -19,8 +19,26 @@ let P_PYFILE = false         # pythonFile_
 let P_DESTRUCT_N = 0
 let P_SW_N = 0
 
+# Errors are raised as {"kind", "message", "line", "col"}; a parse error's
+# column is the current token's, as with the C++ parser's ParseError.
+fn parseErrorAt(msg, ln, col) {
+    raise {"kind": "ParseError", "message": msg, "line": ln, "col": col}
+}
+
 fn parseError(msg, ln) {
-    raise "ParseError: " + msg + " (line " + str(ln) + ")"
+    let col = 0
+    if P_POS < P_N {
+        col = P_TOKS[P_POS][3]
+    }
+    parseErrorAt(msg, ln, col)
+}
+
+# an error value as one line of text: "ParseError: msg (line N)"
+fn errorText(e) {
+    if typeof(e) == "object" and "kind" in e {
+        return e["kind"] + ": " + e["message"] + " (line " + str(e["line"]) + ")"
+    }
+    return str(e)
 }
 
 # ── token helpers ────────────────────────────────────────────────────────────

@@ -2,9 +2,12 @@
  *
  * Entry point only: this file selects the build mode and dispatches the
  * command line. Everything it calls lives in its own translation unit —
- *   src/dialect/  the multi-language source-to-source front-end
+ *   selfhost/     the compiler, written in Quantum (dialect passes, lexer,
+ *                 parser, module resolution, code generation), embedded
+ *                 as bytecode and run by src/HostedCompiler
  *   src/cli/      file runners, REPL, batch test runner, .exe bundler
- *   src/Pipeline  source -> Chunk (lexer/parser/type-checker/compiler)
+ *   src/Pipeline  source -> Chunk (the self-hosted compiler, or the C/C++
+ *                 and Java front-ends feeding its code generator)
  *
  * Build defines (set by CMakeLists.txt):
  *   QUANTUM_MODE_COMPILER  → quantum.exe      (compiles .sa → .exe, then runs it)
@@ -14,7 +17,7 @@
 
 #include "Cli.h"
 #include "Pipeline.h"
-#include "Dialect.h"
+#include "SourceFiles.h"
 #include "Disassembler.h"
 #include "Vm.h"
 #include "Error.h"
@@ -119,7 +122,7 @@ int main(int argc, char *argv[])
         std::ifstream f(argv[2]);
         std::ostringstream ss;
         ss << f.rdbuf();
-        disassembleChunk(*compileSource(applyDialect(ss.str(), argv[2]), argv[2], false), std::cout);
+        disassembleChunk(*compileSource(ss.str(), argv[2], false), std::cout);
         return 0;
     }
     if (a1 == "--test")
@@ -127,13 +130,12 @@ int main(int argc, char *argv[])
     // Hidden: run one file in this process for the batch runner (child worker).
     if (a1 == "--__runone" && argc >= 3)
         return runSingleFileForTest(argv[2]);
-    // Self-hosting support (selfhost/): the C++ front-end's tokens and
-    // bytecode, to check the Quantum-written compiler against, and a runner
-    // for bytecode files that compiler writes.
-    if (a1 == "--dump-tokens" && argc >= 3)
-        return dumpTokens(argv[2]);
+    // Bytecode files: a program compiled to one (how selfhost/compiler.qbc,
+    // the compiler qrun embeds, is rebuilt), and a runner for them.
     if (a1 == "--emit-qbc" && argc >= 4)
         return emitBytecodeFile(argv[2], argv[3]);
+    if (a1 == "--emit-qbc-raw" && argc >= 4)
+        return emitBytecodeFile(argv[2], argv[3], false);
     if (a1 == "--exec" && argc >= 3)
     {
         g_scriptArgv.assign(argv + 2, argv + argc);
@@ -218,7 +220,7 @@ int main(int argc, char *argv[])
         ss << f.rdbuf();
         try
         {
-            disassembleChunk(*compileSource(applyDialect(ss.str(), argv[2]), argv[2], false), std::cout);
+            disassembleChunk(*compileSource(ss.str(), argv[2], false), std::cout);
         }
         catch (const std::exception &e)
         {

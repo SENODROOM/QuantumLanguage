@@ -1,9 +1,7 @@
 #include "Cli.h"
 #include "Pipeline.h"
-#include "Dialect.h"
-#include "Lexer.h"
-#include "Parser.h"
-#include "TypeChecker.h"
+#include "HostedCompiler.h"
+#include "SourceFiles.h"
 #include "Vm.h"
 #include "Error.h"
 
@@ -230,8 +228,7 @@ void runFile(const std::string &path, bool debug)
     std::string compiled;
     try
     {
-        compiled = applyDialect(ss.str(), path);
-        auto chunk = compileSource(compiled, path, debug);
+        auto chunk = compileSource(ss.str(), path, debug, &compiled);
         if (g_stageMarker)
         {
             std::cerr << kStageMarker;
@@ -308,20 +305,7 @@ int checkFile(const std::string &path)
     std::string compiled;
     try
     {
-        compiled = applyDialect(ss.str(), path);
-        Lexer l(compiled);
-        auto tok = l.tokenize();
-        Parser p(std::move(tok));
-        auto ast = p.parse();
-        try
-        {
-            TypeChecker tc;
-            tc.check(ast);
-        }
-        catch (const StaticTypeError &e)
-        {
-            std::cerr << path << ":" << e.line << ":1: warning: " << e.what() << "\n";
-        }
+        hosted::checkSource(ss.str(), path, &compiled);
         std::cout << Colors::GREEN << "[OK] " << Colors::RESET << path << "\n";
         return 0;
     }

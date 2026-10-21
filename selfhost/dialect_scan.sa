@@ -1,0 +1,378 @@
+# Shared helpers for the dialect passes, written in Quantum: a port of
+# src/dialect/DialectScan.cpp and CDialect.cpp, plus std::string-style
+# searching and <regex> wrappers. Positions are byte indices; "not found"
+# (std::string::npos) is -1.
+
+let DS_NPOS = 18446744073709551615
+
+# ── std::string searching (exact <string> semantics, via the VM) ───────────
+
+fn dsNpos(r) {
+    if r >= DS_NPOS {
+        return -1
+    }
+    return r
+}
+
+fn sFind(s, sub, startAt) {
+    if startAt < 0 {
+        return -1
+    }
+    return dsNpos(__cpp_str_find__("find", s, sub, startAt))
+}
+
+fn sRFind(s, sub) {
+    return dsNpos(__cpp_str_find__("rfind", s, sub, nil))
+}
+
+fn sFindFirstOf(s, chars, startAt) {
+    return dsNpos(__cpp_str_find__("find_first_of", s, chars, startAt))
+}
+
+fn sFindLastOf(s, chars) {
+    return dsNpos(__cpp_str_find__("find_last_of", s, chars, nil))
+}
+
+fn sFindFirstNotOf(s, chars, startAt) {
+    return dsNpos(__cpp_str_find__("find_first_not_of", s, chars, startAt))
+}
+
+fn sFindLastNotOf(s, chars) {
+    return dsNpos(__cpp_str_find__("find_last_not_of", s, chars, nil))
+}
+
+# s.substr(pos, n) (n < 0: to the end)
+fn sSub(s, pos, n) {
+    if n < 0 {
+        return s.slice(pos)
+    }
+    return s.slice(pos, pos + n)
+}
+
+# s.compare(pos, len(t), t) == 0
+fn sAt(s, pos, t) {
+    return s.slice(pos, pos + len(t)) == t
+}
+
+fn sLast(s) {
+    if len(s) == 0 {
+        return ""
+    }
+    return s[len(s) - 1]
+}
+
+fn sChar(s, i) {
+    if i < 0 or i >= len(s) {
+        return ""
+    }
+    return s[i]
+}
+
+fn sRepeat(c, n) {
+    let out = ""
+    let i = 0
+    while i < n {
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
+# std::getline over a string: the lines, without a trailing empty one
+fn sGetLines(text) {
+    let lines = text.split("\n")
+    if len(lines) > 0 and lines[len(lines) - 1] == "" {
+        lines.pop()
+    }
+    return lines
+}
+
+# ── <cctype> ─────────────────────────────────────────────────────────────────
+
+fn cIsDigit(c) {
+    return c != "" and c >= "0" and c <= "9"
+}
+
+fn cIsAlpha(c) {
+    return c != "" and ((c >= "a" and c <= "z") or (c >= "A" and c <= "Z"))
+}
+
+fn cIsAlnum(c) {
+    return cIsDigit(c) or cIsAlpha(c)
+}
+
+fn cIsSpace(c) {
+    return c == " " or c == "\t" or c == "\n" or c == "\r" or c == chr(11) or c == chr(12)
+}
+
+fn cIsUpper(c) {
+    return c != "" and c >= "A" and c <= "Z"
+}
+
+# ── <regex> (ECMAScript, through the VM's std::regex) ───────────────────────
+
+# std::regex_match: the groups ("" for an unmatched one), or nil
+fn reMatch(s, re) {
+    return __re_match__(s, re)
+}
+
+# std::regex_search: [pos, len, g0, g1, ...] or nil
+fn reSearch(s, re) {
+    return __re_search__(s, re)
+}
+
+fn reTest(s, re) {
+    return __re_search__(s, re) != nil
+}
+
+fn reFull(s, re) {
+    return __re_match__(s, re) != nil
+}
+
+fn reReplace(s, re, fmt) {
+    return __re_replace__(s, re, fmt)
+}
+
+fn reAll(s, re) {
+    return __re_all__(s, re)
+}
+
+# group i of a regex_match result (m[i].str(): "" when unmatched)
+fn reG(m, i) {
+    if i >= len(m) or m[i] == nil {
+        return ""
+    }
+    return m[i]
+}
+
+# whether group i of a regex_match result took part
+fn reHas(m, i) {
+    return i < len(m) and m[i] != nil
+}
+
+# group i of a regex_search / regex_all result
+fn reSG(m, i) {
+    return reG(m, i + 2)
+}
+
+fn reSHas(m, i) {
+    return reHas(m, i + 2)
+}
+
+# ── DialectScan.cpp ──────────────────────────────────────────────────────────
+
+# trims " \t\r\n" from both ends
+fn trimCopy(value) {
+    let first = sFindFirstNotOf(value, " \t\r\n", 0)
+    if first == -1 {
+        return ""
+    }
+    let last = sFindLastNotOf(value, " \t\r\n")
+    return value.slice(first, last + 1)
+}
+
+fn rbIsQuote(c) {
+    return c == "\"" or c == "'" or c == "`"
+}
+
+fn rbIsIdentStart(c) {
+    return cIsAlpha(c) or c == "_"
+}
+
+fn rbIsIdentChar(c) {
+    return cIsAlnum(c) or c == "_"
+}
+
+# The scanners below visit only the characters that can change their state
+# (quotes, brackets, the character sought), jumping over the rest with the
+# VM's find_first_of; each gives exactly the C++ scanners' results.
+
+let DS_QUOTES_BRACKETS = "\"'`()[]{}"
+
+# the index just past the string literal starting at s[pos]
+fn rbSkipString(s, pos) {
+    let quote = s[pos]
+    let n = len(s)
+    let stops = quote + "\\"
+    let i = pos + 1
+    while true {
+        let q = sFindFirstOf(s, stops, i)
+        if q == -1 {
+            return n
+        }
+        if s[q] == "\\" {
+            if q + 1 < n {
+                i = q + 2
+                continue
+            }
+            # a backslash ending the text: the literal runs to the end
+            return n
+        }
+        return q + 1
+    }
+}
+
+# `needle` at bracket depth 0, outside string literals
+fn rbFindTopLevel(s, needle, startAt) {
+    if sFind(s, needle, startAt) == -1 {
+        return -1
+    }
+    let interesting = DS_QUOTES_BRACKETS + needle[0]
+    let depth = 0
+    let n = len(s)
+    let nl = len(needle)
+    let i = startAt
+    while i < n {
+        i = sFindFirstOf(s, interesting, i)
+        if i == -1 {
+            return -1
+        }
+        let c = s[i]
+        if c == "\"" or c == "'" or c == "`" {
+            i = rbSkipString(s, i)
+            continue
+        }
+        # the needle is checked before this character's depth change, so a
+        # bracket needle ("{") matches at its own level
+        if depth <= 0 and s.slice(i, i + nl) == needle {
+            return i
+        }
+        if c == "(" or c == "[" or c == "{" {
+            depth = depth + 1
+        } else if c == ")" or c == "]" or c == "}" {
+            depth = depth - 1
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# the index of the bracket matching s[openPos]
+fn rbMatchBracket(s, openPos) {
+    if openPos < 0 {
+        return -1
+    }
+    let depth = 0
+    let n = len(s)
+    let i = openPos
+    while i < n {
+        i = sFindFirstOf(s, DS_QUOTES_BRACKETS, i)
+        if i == -1 {
+            return -1
+        }
+        let c = s[i]
+        if c == "\"" or c == "'" or c == "`" {
+            i = rbSkipString(s, i)
+            continue
+        }
+        if c == "(" or c == "[" or c == "{" {
+            depth = depth + 1
+        } else {
+            depth = depth - 1
+            if depth == 0 {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# splits on `sep` at depth 0, outside strings; trims the pieces
+fn rbSplitTopLevel(s, sep) {
+    if sFind(s, sep, 0) == -1 {
+        return [trimCopy(s)]
+    }
+    let interesting = DS_QUOTES_BRACKETS + sep
+    let parts = []
+    let depth = 0
+    let start = 0
+    let n = len(s)
+    let i = 0
+    while i < n {
+        i = sFindFirstOf(s, interesting, i)
+        if i == -1 {
+            break
+        }
+        let c = s[i]
+        if c == "\"" or c == "'" or c == "`" {
+            i = rbSkipString(s, i)
+            continue
+        }
+        if c == "(" or c == "[" or c == "{" {
+            depth = depth + 1
+        } else if c == ")" or c == "]" or c == "}" {
+            depth = depth - 1
+        } else if depth == 0 {
+            parts.push(s.slice(start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    parts.push(s.slice(start))
+    let out = []
+    for p in parts {
+        out.push(trimCopy(p))
+    }
+    return out
+}
+
+let DS_ASSIGN_PREV_OPS = {"=": true, "!": true, "<": true, ">": true, "+": true, "-": true, "*": true,
+                          "/": true, "%": true, "&": true, "|": true, "^": true}
+
+# a bare top-level '=' (assignment), not ==, !=, <=, >=, +=, ...
+fn rbFindTopLevelAssign(s) {
+    if sFind(s, "=", 0) == -1 {
+        return -1
+    }
+    let interesting = DS_QUOTES_BRACKETS + "="
+    let depth = 0
+    let n = len(s)
+    let i = 0
+    while i < n {
+        i = sFindFirstOf(s, interesting, i)
+        if i == -1 {
+            return -1
+        }
+        let c = s[i]
+        if c == "\"" or c == "'" or c == "`" {
+            i = rbSkipString(s, i)
+            continue
+        }
+        if c == "(" or c == "[" or c == "{" {
+            depth = depth + 1
+        } else if c == ")" or c == "]" or c == "}" {
+            depth = depth - 1
+        } else if depth == 0 {
+            let prev = sChar(s, i - 1)
+            let next = sChar(s, i + 1)
+            if next != "=" and !(prev in DS_ASSIGN_PREV_OPS) {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+# ── CDialect.cpp ─────────────────────────────────────────────────────────────
+
+# whether the source defines a function named main ("main" then "(")
+fn definesMainFunction(src) {
+    let p = 0
+    while true {
+        p = sFind(src, "main", p)
+        if p == -1 {
+            return false
+        }
+        let leftOk = p == 0 or (!cIsAlnum(src[p - 1]) and src[p - 1] != "_")
+        let q = p + 4
+        while q < len(src) and cIsSpace(src[q]) {
+            q = q + 1
+        }
+        if leftOk and q < len(src) and src[q] == "(" {
+            return true
+        }
+        p = p + 4
+    }
+}

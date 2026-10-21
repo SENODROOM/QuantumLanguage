@@ -1,6 +1,6 @@
 // Lexer + preprocessor for the typed C/C++ front-end (see Cpp.h).
 #include "Cpp.h"
-#include "Dialect.h"
+#include "SourceFiles.h"
 
 #include <algorithm>
 #include <cctype>

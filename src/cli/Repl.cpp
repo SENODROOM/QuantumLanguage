@@ -1,6 +1,5 @@
 #include "Cli.h"
 #include "Pipeline.h"
-#include "Parser.h"
 #include "Vm.h"
 #include "Error.h"
 

@@ -21,8 +21,8 @@ list(FILTER QUANTUM_SOURCES EXCLUDE REGEX ".*main_vm\\.cpp$")
 # qpm is a standalone tool (its own main(), no VM/lexer/parser/compiler needed)
 # built from src/qpm/ separately — keep it out of the other 3 targets' sources.
 list(FILTER QUANTUM_SOURCES EXCLUDE REGEX ".*/src/qpm/.*\\.cpp$")
-# ...except its self-contained manifest readers: `# @use` package resolution
-# (src/ModuleResolver.cpp) reads package.qon / package.json / requirements.txt.
+# ...except its self-contained manifest readers: the batch test runner
+# (src/cli/TestRunner.cpp) looks for package.qon / package.json / requirements.txt.
 list(APPEND QUANTUM_SOURCES
     "${CMAKE_SOURCE_DIR}/src/qpm/QpmJson.cpp"
     "${CMAKE_SOURCE_DIR}/src/qpm/QpmManifest.cpp"
@@ -41,9 +41,24 @@ add_custom_command(
 add_custom_target(java_prelude DEPENDS ${JAVA_PRELUDE_CPP})
 list(APPEND QUANTUM_SOURCES ${JAVA_PRELUDE_CPP})
 
+# ── The compiler, written in Quantum (selfhost/), embedded as bytecode ────────
+# selfhost/compiler.qbc is the compiler compiled by itself; regenerate it
+# with `qrun --emit-qbc selfhost/compiler.sa selfhost/compiler.qbc` after
+# changing selfhost/*.sa (see selfhost/README.md).
+set(HOSTED_COMPILER_QBC "${CMAKE_SOURCE_DIR}/selfhost/compiler.qbc")
+set(HOSTED_COMPILER_CPP "${CMAKE_BINARY_DIR}/generated/HostedCompilerData.cpp")
+add_custom_command(
+    OUTPUT ${HOSTED_COMPILER_CPP}
+    COMMAND ${CMAKE_COMMAND} -DIN=${HOSTED_COMPILER_QBC} -DOUT=${HOSTED_COMPILER_CPP}
+            -P ${CMAKE_SOURCE_DIR}/cmake/EmbedBytecode.cmake
+    DEPENDS ${HOSTED_COMPILER_QBC} ${CMAKE_SOURCE_DIR}/cmake/EmbedBytecode.cmake
+    COMMENT "Embedding the self-hosted compiler")
+add_custom_target(hosted_compiler DEPENDS ${HOSTED_COMPILER_CPP})
+list(APPEND QUANTUM_SOURCES ${HOSTED_COMPILER_CPP})
+
 # ── quantum  — compiler + bundler ─────────────────────────────────────────────
 add_executable(quantum ${QUANTUM_SOURCES})
-add_dependencies(quantum java_prelude)
+add_dependencies(quantum java_prelude hosted_compiler)
 target_compile_definitions(quantum PRIVATE QUANTUM_MODE_COMPILER=1)
 if(WIN32)
     target_link_libraries(quantum advapi32)
@@ -51,7 +66,7 @@ endif()
 
 # ── qrun  — pure interpreter ──────────────────────────────────────────────────
 add_executable(qrun ${QUANTUM_SOURCES})
-add_dependencies(qrun java_prelude)
+add_dependencies(qrun java_prelude hosted_compiler)
 target_compile_definitions(qrun PRIVATE QRUN_MODE=1)
 if(WIN32)
     target_link_libraries(qrun advapi32)
@@ -59,7 +74,7 @@ endif()
 
 # ── quantum_stub  — standalone runtime template ───────────────────────────────
 add_executable(quantum_stub ${QUANTUM_SOURCES})
-add_dependencies(quantum_stub java_prelude)
+add_dependencies(quantum_stub java_prelude hosted_compiler)
 if(WIN32)
     target_link_libraries(quantum_stub advapi32)
 endif()

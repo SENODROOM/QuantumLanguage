@@ -51,6 +51,16 @@ public:
         : QuantumError("CompileError", report) {}
 };
 
+// A syntax error in a program of the multi-syntax family, at line:col of
+// the text after the dialect passes (selfhost/parser.sa raises these).
+class ParseError : public std::runtime_error
+{
+public:
+    int line, col;
+    ParseError(const std::string &msg, int l, int c)
+        : std::runtime_error(msg), line(l), col(c) {}
+};
+
 namespace Colors
 {
     inline const char *RED = "\033[31m";

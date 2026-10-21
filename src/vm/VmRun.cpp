@@ -125,7 +125,7 @@ void VM::runFrame(size_t stopDepth)
         {
             // Names for the next CALL's arguments ("" = positional).
             pendingKwNames_.clear();
-            const std::string joined = std::get<std::string>(consts[instr.operand].data);
+            const std::string joined = consts[instr.operand].strRef();
             size_t startPos = 0;
             while (true)
             {
@@ -141,7 +141,7 @@ void VM::runFrame(size_t stopDepth)
         // ── Globals ───────────────────────────────────────────────────────
         case Op::DEFINE_GLOBAL:
         {
-            const std::string &name = std::get<std::string>(consts[instr.operand].data);
+            const std::string &name = consts[instr.operand].strRef();
             globals->define(name, pop());
             weakGlobals_.erase(name); // a user definition replaces a weak builtin
             if (name.compare(0, 6, "__op__") == 0)
@@ -150,7 +150,7 @@ void VM::runFrame(size_t stopDepth)
         }
         case Op::DEFINE_CONST:
         {
-            const std::string &name = std::get<std::string>(consts[instr.operand].data);
+            const std::string &name = consts[instr.operand].strRef();
             globals->define(name, pop(), true);
             weakGlobals_.erase(name);
             break;
@@ -166,14 +166,14 @@ void VM::runFrame(size_t stopDepth)
                     slots.assign(consts.size(), nullptr);
                 QuantumValue *&p = slots[instr.operand];
                 if (!p)
-                    p = globals->slot(std::get<std::string>(consts[instr.operand].data));
+                    p = globals->slot(consts[instr.operand].strRef());
                 if (p)
                 {
                     stack_.push_back(*p);
                     break;
                 }
             }
-            const std::string &name = std::get<std::string>(consts[instr.operand].data);
+            const std::string &name = consts[instr.operand].strRef();
             // A weak builtin (e.g. the STL `next`) yields to a same-named
             // member of `this` inside a method: a node's own `next` field.
             if (!weakGlobals_.empty() && weakGlobals_.count(name))
@@ -279,14 +279,14 @@ void VM::runFrame(size_t stopDepth)
                     slots.assign(consts.size(), nullptr);
                 QuantumValue *&p = slots[instr.operand];
                 if (!p)
-                    p = globals->slot(std::get<std::string>(consts[instr.operand].data));
+                    p = globals->slot(consts[instr.operand].strRef());
                 if (p)
                 {
                     *p = stack_.back();
                     break;
                 }
             }
-            const std::string &name = std::get<std::string>(consts[instr.operand].data);
+            const std::string &name = consts[instr.operand].strRef();
             // Implicit self: only inside a method (params[0] == "self"),
             // and only when the name is not already a known global.
             auto &params = frame.closure->chunk->params;
@@ -771,7 +771,7 @@ void VM::runFrame(size_t stopDepth)
             }
             else if (obj.isString())
             {
-                const std::string &s = obj.asString();
+                const std::string &s = obj.strRef();
                 int i = (int)toNumber(idx, "index", line);
                 if (i < 0)
                     i += (int)s.size();
@@ -883,7 +883,7 @@ void VM::runFrame(size_t stopDepth)
 
         case Op::GET_MEMBER:
         {
-            const std::string &name = std::get<std::string>(consts[instr.operand].data);
+            const std::string &name = consts[instr.operand].strRef();
             QuantumValue obj = pop();
 
             if (obj.isNil())
@@ -1057,7 +1057,7 @@ void VM::runFrame(size_t stopDepth)
 
         case Op::SET_MEMBER:
         {
-            const std::string &name = std::get<std::string>(consts[instr.operand].data);
+            const std::string &name = consts[instr.operand].strRef();
             QuantumValue val = pop();
             QuantumValue obj = peek(0);
 
@@ -1102,15 +1102,19 @@ void VM::runFrame(size_t stopDepth)
 
             auto state = std::make_shared<QuantumNative>();
             state->name = "__iter__";
-            state->fn = [cap_src, cap_idx](std::vector<QuantumValue> args) -> QuantumValue
+            // Exhaustion is signalled by returning the iterator itself, which
+            // can never be an element of its source (nil can: `for x in [nil, 1]`).
+            std::weak_ptr<QuantumNative> self = state;
+            state->fn = [cap_src, cap_idx, self](std::vector<QuantumValue> args) -> QuantumValue
             {
-                // Called with no args: return {done, value} pair
                 if (cap_idx && *cap_idx < cap_src->size())
                 {
                     QuantumValue v = (*cap_src)[(*cap_idx)++];
                     return v; // return next element
                 }
-                return QuantumValue(); // exhausted: nil signals done
+                if (auto me = self.lock())
+                    return QuantumValue(me);
+                return QuantumValue();
             };
             push(QuantumValue(state));
             break;
@@ -1133,7 +1137,7 @@ void VM::runFrame(size_t stopDepth)
             }
             // Call fn() with no args to get next value
             QuantumValue next = nat->fn({});
-            if (next.isNil())
+            if (next.isNative() && next.asNative() == nat)
             {
                 // Exhausted — jump past loop
                 frame.ip += instr.operand;
@@ -1165,7 +1169,7 @@ void VM::runFrame(size_t stopDepth)
 
         case Op::BIND_METHOD:
         {
-            const std::string &methodName = std::get<std::string>(consts[instr.operand].data);
+            const std::string &methodName = consts[instr.operand].strRef();
             QuantumValue fn = pop();
             QuantumValue &classVal = peek(0);
             if (!classVal.isClass())
@@ -1265,7 +1269,7 @@ void VM::runFrame(size_t stopDepth)
         }
 
         case Op::GET_SUPER:
-            getSuper(std::get<std::string>(consts[instr.operand].data), line);
+            getSuper(consts[instr.operand].strRef(), line);
             break;
 
         // ── Exceptions ────────────────────────────────────────────────────
@@ -1442,12 +1446,12 @@ void VM::runFrame(size_t stopDepth)
             break;
         }
         case Op::J_GETF:
-            stack_.back() = javaGetField(stack_.back(), std::get<std::string>(consts[instr.operand].data));
+            stack_.back() = javaGetField(stack_.back(), consts[instr.operand].strRef());
             break;
         case Op::J_PUTF:
         {
             QuantumValue v = pop();
-            javaPutField(stack_.back(), std::get<std::string>(consts[instr.operand].data), v);
+            javaPutField(stack_.back(), consts[instr.operand].strRef(), v);
             stack_.back() = std::move(v);
             break;
         }
@@ -1467,10 +1471,10 @@ void VM::runFrame(size_t stopDepth)
             break;
         }
         case Op::J_INSTOF:
-            stack_.back() = QuantumValue(javaInstanceOf(stack_.back(), std::get<std::string>(consts[instr.operand].data)));
+            stack_.back() = QuantumValue(javaInstanceOf(stack_.back(), consts[instr.operand].strRef()));
             break;
         case Op::J_CAST:
-            javaCheckCast(stack_.back(), std::get<std::string>(consts[instr.operand].data));
+            javaCheckCast(stack_.back(), consts[instr.operand].strRef());
             break;
 
         // ── Unhandled ─────────────────────────────────────────────────────

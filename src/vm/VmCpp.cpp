@@ -105,7 +105,7 @@ std::string *cbuf(const QV &p, long &off)
             return nullptr;
         c[k] = QV(std::string());
     }
-    return &std::get<std::string>(c[k].data);
+    return &c[k].strMut();
 }
 
 long coff(const QV &p) { return isCRef(p) ? (long)p.asArray()->at(2).asNumber() : 0; }
@@ -115,7 +115,7 @@ std::string cstr(const QV &v)
 {
     if (v.isString())
     {
-        const std::string &s = std::get<std::string>(v.data);
+        const std::string &s = v.strRef();
         size_t z = s.find('\0');
         return z == std::string::npos ? s : s.substr(0, z);
     }
@@ -142,7 +142,7 @@ std::string cbytes(const QV &v, long n)
     const std::string *b = nullptr;
     long off = 0;
     if (v.isString())
-        b = &std::get<std::string>(v.data);
+        b = &v.strRef();
     else if (isCRef(v))
         b = cbuf(v, off);
     out.assign((size_t)n, '\0');
@@ -1406,7 +1406,7 @@ void VM::registerCppNatives()
         long i = (long)num(arg(a, 1));
         const std::string *x = nullptr;
         long off = 0;
-        if (s.isString()) x = &std::get<std::string>(s.data);
+        if (s.isString()) x = &s.strRef();
         else if (isCRef(s)) x = cbuf(s, off);
         i += off;
         return N(x && i >= 0 && i < (long)x->size() ? (unsigned char)(*x)[(size_t)i] : 0); });
@@ -1432,7 +1432,7 @@ void VM::registerCppNatives()
         size_t k = (size_t)num(a[1]);
         long i = (long)num(a[2]);
         if (k >= c.size() || !c[k].isString()) return N(0);
-        const std::string &x = std::get<std::string>(c[k].data);
+        const std::string &x = c[k].strRef();
         return N(i >= 0 && i < (long)x.size() ? (unsigned char)x[(size_t)i] : 0); });
     reg("__cpp_str_put__", [](std::vector<QV> a) -> QV
         {
@@ -1441,7 +1441,7 @@ void VM::registerCppNatives()
         size_t k = (size_t)num(a[1]);
         if (k >= c.size()) return a[3];
         if (c[k].isNil()) c[k] = S("");
-        if (c[k].isString()) putChar(std::get<std::string>(c[k].data), (long)num(a[2]), (char)(long long)num(a[3]));
+        if (c[k].isString()) putChar(c[k].strMut(), (long)num(a[2]), (char)(long long)num(a[3]));
         return a[3]; });
     // char* (a reference into a buffer, or a literal)
     reg("__cpp_cs_put__", [](std::vector<QV> a) -> QV
@@ -1462,7 +1462,7 @@ void VM::registerCppNatives()
         QV p = arg(a, 0);
         const std::string *b = nullptr;
         long off = 0;
-        if (p.isString()) b = &std::get<std::string>(p.data);
+        if (p.isString()) b = &p.strRef();
         else if (isCRef(p)) b = cbuf(p, off);
         if (!b || off >= (long)b->size() || off < 0) return N(0);
         size_t z = b->find('\0', (size_t)off);
@@ -1665,7 +1665,11 @@ void VM::registerCppNatives()
         return S(out); });
     reg("__cpp_str_find__", [](std::vector<QV> a) -> QV
         {
-        std::string op = str(arg(a, 0)), s = str(arg(a, 1)), nd = str(arg(a, 2));
+        std::string op = str(arg(a, 0)), nd = str(arg(a, 2));
+        // the searched text by reference: it may be a whole program's source
+        const QV subject = arg(a, 1);
+        const std::string held = subject.isString() ? std::string() : str(subject);
+        const std::string &s = subject.isString() ? subject.strRef() : held;
         QV posv = arg(a, 3);
         bool hasPos = !posv.isNil();
         double posd = hasPos ? num(posv) : 0;

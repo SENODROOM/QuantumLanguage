@@ -1,0 +1,597 @@
+# Static types, program entities and the Quantum AST builders of the typed
+# C/C++ front-end (the first part of src/cpp/CppLower.cpp and CppLower.h).
+#
+# Type: {"k", "name", "isUnsigned", "sorted", "multi", "a", "n", "cls", "en",
+# "lambda"}; k is one of Dyn Void Bool Char Int Float Str CStr Nullptr Ptr
+# Class Enum Vector Array Map Set Pair Tuple Optional Variant UPtr Func Stream
+# Iter Monostate Nullopt InitList (see cxTypeStr).
+# @use "./parse.sa"
+# @use "../ast.sa"
+
+fn mkT(k, name) {
+    return {"k": k, "name": name, "isUnsigned": false, "sorted": true, "multi": false, "a": [], "n": -1,
+            "cls": nil, "en": nil, "lambda": false}
+}
+
+fn cxMkUnsigned(name) {
+    let t = mkT("Int", name)
+    t["isUnsigned"] = true
+    return t
+}
+
+let CXT_INT = mkT("Int", "int")
+let CXT_LL = mkT("Int", "long long")
+let CXT_SIZE = cxMkUnsigned("unsigned long long")
+let CXT_DOUBLE = mkT("Float", "double")
+let CXT_BOOL = mkT("Bool", "bool")
+let CXT_CHAR = mkT("Char", "char")
+let CXT_STR = mkT("Str", "string")
+let CXT_CSTR = mkT("CStr", "const char*")
+let CXT_VOID = mkT("Void", "void")
+let CXT_DYN = mkT("Dyn", "")
+let CXT_MANIP = mkT("Dyn", "manip")
+
+fn tInt() {
+    return CXT_INT
+}
+
+fn tLL() {
+    return CXT_LL
+}
+
+fn tSize() {
+    return CXT_SIZE
+}
+
+fn tDouble() {
+    return CXT_DOUBLE
+}
+
+fn tBool() {
+    return CXT_BOOL
+}
+
+fn tChar() {
+    return CXT_CHAR
+}
+
+fn tStr() {
+    return CXT_STR
+}
+
+fn tCStr() {
+    return CXT_CSTR
+}
+
+fn tVoid() {
+    return CXT_VOID
+}
+
+fn tDyn() {
+    return CXT_DYN
+}
+
+# char buf[N]: a C char buffer (a Str held in a slot)
+fn tBuf(n) {
+    let t = mkT("Str", "char[]")
+    t["n"] = n
+    return t
+}
+
+fn cxClassT(c) {
+    let t = mkT("Class", "")
+    t["cls"] = c
+    return t
+}
+
+fn cxTypeArgsStr(t) {
+    let parts = []
+    for x in t["a"] {
+        if x != nil {
+            parts.push(cxTypeStr(x))
+        } else {
+            parts.push("?")
+        }
+    }
+    return "<" + parts.join(",") + ">"
+}
+
+fn cxTypeStr(t) {
+    let k = t["k"]
+    if k == "Dyn" {
+        if t["name"] == "" {
+            return "?"
+        }
+        return "?" + t["name"]
+    }
+    if k == "Void" {
+        return "void"
+    }
+    if k == "Bool" {
+        return "bool"
+    }
+    if k == "Char" or k == "Int" or k == "Float" {
+        return t["name"]
+    }
+    if k == "Str" {
+        return "string"
+    }
+    if k == "CStr" {
+        return "cstr"
+    }
+    if k == "Nullptr" {
+        return "nullptr_t"
+    }
+    if k == "Ptr" {
+        if len(t["a"]) == 0 {
+            return "?*"
+        }
+        return cxTypeStr(t["a"][0]) + "*"
+    }
+    if k == "Class" {
+        if t["cls"] != nil {
+            return t["cls"]["qname"]
+        }
+        return "class?"
+    }
+    if k == "Enum" {
+        if t["en"] != nil {
+            return t["en"]["qname"]
+        }
+        return "enum?"
+    }
+    if k == "Vector" {
+        return t["name"] + cxTypeArgsStr(t)
+    }
+    if k == "Array" {
+        return "array" + cxTypeArgsStr(t) + cxI64Str(t["n"])
+    }
+    if k == "Map" or k == "Set" {
+        let s = ""
+        if k == "Map" {
+            if t["sorted"] {
+                s = "map"
+            } else {
+                s = "umap"
+            }
+        } else {
+            if t["sorted"] {
+                s = "set"
+            } else {
+                s = "uset"
+            }
+        }
+        if t["multi"] {
+            s = s + "m"
+        }
+        return s + cxTypeArgsStr(t)
+    }
+    if k == "Pair" {
+        return "pair" + cxTypeArgsStr(t)
+    }
+    if k == "Tuple" {
+        return "tuple" + cxTypeArgsStr(t)
+    }
+    if k == "Optional" {
+        return "optional" + cxTypeArgsStr(t)
+    }
+    if k == "Variant" {
+        return "variant" + cxTypeArgsStr(t)
+    }
+    if k == "UPtr" {
+        return t["name"] + cxTypeArgsStr(t)
+    }
+    if k == "Func" {
+        return "function" + cxTypeArgsStr(t)
+    }
+    if k == "Stream" {
+        return t["name"]
+    }
+    if k == "Iter" {
+        return "iter" + cxTypeArgsStr(t)
+    }
+    if k == "Monostate" {
+        return "monostate"
+    }
+    if k == "Nullopt" {
+        return "nullopt_t"
+    }
+    if k == "InitList" {
+        return "initlist" + cxTypeArgsStr(t)
+    }
+    return "?"
+}
+
+# char, ints, bool, enums
+fn isIntegral(t) {
+    if t == nil {
+        return false
+    }
+    let k = t["k"]
+    return k == "Int" or k == "Char" or k == "Bool" or k == "Enum"
+}
+
+fn isFloatT(t) {
+    return t != nil and t["k"] == "Float"
+}
+
+fn isArith(t) {
+    return isIntegral(t) or isFloatT(t)
+}
+
+# Str or CStr
+fn isStringy(t) {
+    return t != nil and (t["k"] == "Str" or t["k"] == "CStr")
+}
+
+# a C char array
+fn isCBuf(t) {
+    return t != nil and t["k"] == "Str" and t["name"] == "char[]"
+}
+
+# long long / unsigned long long: exact int64 at run time
+fn isI64(t) {
+    return t != nil and t["k"] == "Int" and (t["name"] == "long long" or t["name"] == "unsigned long long")
+}
+
+# a mutable runtime object (class, containers, streams)
+fn isObjectRep(t) {
+    if t == nil {
+        return false
+    }
+    let k = t["k"]
+    return k == "Class" or k == "Vector" or k == "Array" or k == "Map" or k == "Set" or k == "Pair" or k == "Tuple" or k == "Stream"
+}
+
+fn needsCopy(t) {
+    if t == nil {
+        return false
+    }
+    let k = t["k"]
+    return k == "Class" or k == "Vector" or k == "Array" or k == "Map" or k == "Set" or k == "Pair" or k == "Tuple" or k == "Optional" or k == "Variant"
+}
+
+fn sameType(a, b) {
+    if a == nil or b == nil {
+        return false
+    }
+    if a["k"] != b["k"] {
+        return false
+    }
+    if a["k"] == "Class" {
+        return cxSameEntity(a["cls"], b["cls"])
+    }
+    if a["k"] == "Enum" {
+        return cxSameEntity(a["en"], b["en"])
+    }
+    return cxTypeStr(a) == cxTypeStr(b)
+}
+
+# pointer identity of two entities (classes, enums, functions...): each
+# carries a unique "id"
+fn cxSameEntity(a, b) {
+    if a == nil or b == nil {
+        return a == nil and b == nil
+    }
+    return a["id"] == b["id"]
+}
+
+# ── Quantum AST builders ────────────────────────────────────────────────────
+
+fn qNum(v, ln) {
+    return nNumber(v, ln)
+}
+
+fn qStr(s, ln) {
+    return nString(s, ln)
+}
+
+fn qBool(b, ln) {
+    return nBool(b, ln)
+}
+
+fn qNil(ln) {
+    return nNil(ln)
+}
+
+fn qId(n, ln) {
+    return nIdent(n, ln)
+}
+
+fn qCall(callee, args, ln) {
+    return nCall(callee, args, ln)
+}
+
+fn qCallN(fname, args, ln) {
+    return nCall(nIdent(fname, ln), args, ln)
+}
+
+fn qIndex(obj, key, ln) {
+    return nIndex(obj, key, ln)
+}
+
+fn qAssign(target, value, ln) {
+    return nAssign("=", target, value, ln)
+}
+
+fn qBin(op, l, r, ln) {
+    return nBinary(op, l, r, ln)
+}
+
+fn qUn(op, x, ln) {
+    return nUnary(op, x, ln)
+}
+
+fn qTernary(c, a, b, ln) {
+    return nTernary(c, a, b, ln)
+}
+
+fn qArr(elems, ln) {
+    return nArray(elems, ln)
+}
+
+fn qBlock(stmts, ln) {
+    return nBlock(stmts, ln)
+}
+
+fn qExprStmt(e, ln) {
+    return nExprStmt(e, ln)
+}
+
+fn qVar(n, init, ln) {
+    return nVarDecl(false, n, init, "", ln)
+}
+
+fn qRet(e, ln) {
+    return nReturn(e, ln)
+}
+
+fn qIfs(c, t, e, ln) {
+    let thenB = t
+    if thenB == nil {
+        thenB = qBlock([], ln)
+    }
+    return nIf(c, thenB, e, ln)
+}
+
+fn qWhiles(c, body, post, ln) {
+    let b = body
+    if b == nil {
+        b = qBlock([], ln)
+    }
+    return nWhile(c, b, post, ln)
+}
+
+fn qBrk(ln) {
+    return nBreak(ln)
+}
+
+fn qCont(ln) {
+    return nContinue(ln)
+}
+
+fn qFunc(name, params, body, ln) {
+    let f = nFunctionDecl(name, ln)
+    f["params"] = params
+    let refs = []
+    for p in params {
+        refs.push(false)
+    }
+    f["paramIsRef"] = refs
+    f["body"] = body
+    return f
+}
+
+fn qLambda(params, body, ln) {
+    return nLambda(params, body, ln)
+}
+
+fn qRaise(v, ln) {
+    return nRaise(v, ln)
+}
+
+# try { body } catch (alias) { handler }
+fn qTry(body, alias, handler, ln) {
+    let t = nTry(body, ln)
+    t["handlers"].push({"errorType": "", "alias": alias, "body": handler})
+    return t
+}
+
+fn qClone(n) {
+    if n == nil {
+        return nil
+    }
+    let ln = n["line"]
+    let k = n["k"]
+    if k == "Number" {
+        return qNum(n["value"], ln)
+    }
+    if k == "String" {
+        return qStr(n["value"], ln)
+    }
+    if k == "Bool" {
+        return qBool(n["value"], ln)
+    }
+    if k == "Nil" {
+        return qNil(ln)
+    }
+    if k == "Ident" {
+        return qId(n["name"], ln)
+    }
+    if k == "Index" {
+        return qIndex(qClone(n["object"]), qClone(n["index"]), ln)
+    }
+    if k == "Binary" {
+        return qBin(n["op"], qClone(n["left"]), qClone(n["right"]), ln)
+    }
+    if k == "Unary" {
+        return qUn(n["op"], qClone(n["operand"]), ln)
+    }
+    if k == "Ternary" {
+        return qTernary(qClone(n["condition"]), qClone(n["thenExpr"]), qClone(n["elseExpr"]), ln)
+    }
+    if k == "Call" {
+        let args = []
+        for a in n["args"] {
+            args.push(qClone(a))
+        }
+        return qCall(qClone(n["callee"]), args, ln)
+    }
+    if k == "Array" {
+        let els = []
+        for a in n["elements"] {
+            els.push(qClone(a))
+        }
+        return qArr(els, ln)
+    }
+    if k == "Assign" {
+        return nAssign(n["op"], qClone(n["target"]), qClone(n["value"]), ln)
+    }
+    if k == "Member" {
+        return nMember(qClone(n["object"]), n["member"], ln)
+    }
+    raise cxUnsupported("internal: clone of an unexpected node", "", 0)
+}
+
+fn qIsSimple(n) {
+    if n == nil {
+        return true
+    }
+    let k = n["k"]
+    if k == "Number" or k == "String" or k == "Bool" or k == "Nil" or k == "Ident" {
+        return true
+    }
+    if k == "Index" {
+        return qIsSimple(n["object"]) and qIsSimple(n["index"])
+    }
+    return false
+}
+
+fn qIsNumber(n) {
+    return n != nil and n["k"] == "Number"
+}
+
+fn qIsString(n) {
+    return n != nil and n["k"] == "String"
+}
+
+# ── program entities ────────────────────────────────────────────────────────
+
+fn cxNewFunc() {
+    return {"id": cxNextId(), "name": "", "mangled": "", "decl": nil, "def": nil, "params": [], "paramRef": [],
+            "paramConstRef": [], "defaults": [], "ret": nil, "retRef": false, "variadic": false, "cls": nil,
+            "isStatic": false, "isVirtual": false, "isConst": false, "isCtor": false, "isDtor": false,
+            "isPure": false, "isTemplate": false, "builtinExcCtor": false, "scope": nil, "vkey": "",
+            "lowered": false, "tu": 0, "access": "public"}
+}
+
+# a copy of a FuncInfo (FuncInfo(*f)): a new entity with the same fields
+fn cxFuncCopy(f) {
+    let g = {}
+    for k in Object.keys(f) {
+        let v = f[k]
+        if typeof(v) == "array" {
+            v = v.slice(0)
+        }
+        g[k] = v
+    }
+    g["id"] = cxNextId()
+    return g
+}
+
+fn cxNewField() {
+    return {"name": "", "type": nil, "slot": 0, "init": cxVarDecl(), "hasInit": false, "isStatic": false,
+            "global": "", "decl": nil, "isConst": false, "access": "public"}
+}
+
+fn cxNewClass() {
+    return {"id": cxNextId(), "name": "", "qname": "", "bases": [], "fields": [], "nslots": 1, "methods": [],
+            "ctors": [], "convOps": [], "polymorphic": false, "hasUserCtor": false, "aggregate": true,
+            "isUnion": false, "builtin": false, "resolved": false, "resolving": false, "isTemplate": false,
+            "decl": nil, "scope": nil, "outer": nil, "lowered": false, "inheritCtorsFrom": [], "friends": {},
+            "dtor": nil}
+}
+
+fn cxDtorFn(c) {
+    return c["qname"] + "#dtor"
+}
+
+fn cxAggFn(c) {
+    return c["qname"] + "#agg"
+}
+
+fn cxDefaultCtorFn(c) {
+    return c["qname"] + "#ctor"
+}
+
+fn cxDesc(c) {
+    return c["qname"] + "#desc"
+}
+
+fn cxNewEnum() {
+    return {"id": cxNextId(), "qname": "", "scoped": false, "values": [], "underlying": nil, "scope": nil}
+}
+
+# Symbol kinds: None Namespace Type Funcs Var Enumerator
+fn cxSym(kind) {
+    return {"kind": kind, "ns": nil, "type": nil, "funcs": [], "global": "", "value": 0, "aliasDecl": nil,
+            "aliasScope": nil, "isConst": false}
+}
+
+# `*u = *target`
+fn cxSymAssign(u, target) {
+    u["kind"] = target["kind"]
+    u["ns"] = target["ns"]
+    u["type"] = target["type"]
+    u["funcs"] = target["funcs"].slice(0)
+    u["global"] = target["global"]
+    u["value"] = target["value"]
+    u["aliasDecl"] = target["aliasDecl"]
+    u["aliasScope"] = target["aliasScope"]
+    u["isConst"] = target["isConst"]
+}
+
+# `sc->syms[name]`: the symbol, created empty when missing
+fn cxSymRef(sc, name) {
+    let syms = sc["syms"]
+    if !(name in syms) {
+        syms[name] = cxSym("None")
+    }
+    return syms[name]
+}
+
+fn cxNewScopeRaw(qname, parent) {
+    return {"id": cxNextId(), "qname": qname, "parent": parent, "cls": nil, "syms": {}, "usings": [],
+            "usingDecls": {}, "isStd": false}
+}
+
+# ── lowered expressions ─────────────────────────────────────────────────────
+
+# XV: {"v", "t", "lk" (RV Var Idx StrCh), "var", "obj", "key", "base", "temp",
+# "moved", "isFuncName", "overloads", "self", "constLv", "constName", "alloc"}
+fn cxXV() {
+    return {"v": nil, "t": nil, "lk": "RV", "var": "", "obj": nil, "key": nil, "base": nil, "temp": false,
+            "moved": false, "isFuncName": false, "overloads": [], "self": nil, "constLv": false, "constName": "",
+            "alloc": nil}
+}
+
+# Local: {"q", "t", "boxed", "refSlot", "alias", "aliasOf", "name", "isConst"}
+fn cxNewLocal() {
+    return {"q": "", "t": nil, "boxed": false, "refSlot": false, "alias": false, "aliasOf": nil, "name": "",
+            "isConst": false}
+}
+
+fn cxLocalCopy(l) {
+    return {"q": l["q"], "t": l["t"], "boxed": l["boxed"], "refSlot": l["refSlot"], "alias": l["alias"],
+            "aliasOf": l["aliasOf"], "name": l["name"], "isConst": l["isConst"]}
+}
+
+fn cxNewLoop() {
+    return {"isSwitch": false, "contFlag": "", "scopeDepth": 0}
+}
+
+fn cxNewFnCtx() {
+    return {"ret": nil, "retRef": false, "retIsRef": false, "cls": nil, "hasThis": false, "isLambda": false,
+            "deducedRet": nil, "scopes": [], "owned": [], "boxed": {}, "wantBox": {}, "nameCount": {},
+            "loops": [], "excVars": [], "scope": nil, "parent": nil}
+}

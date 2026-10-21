@@ -33,6 +33,29 @@ struct QuantumNative
 
 struct QuantumValue;
 
+// A string value's text, shared by every copy of the value: copying a value
+// (pushing it, passing it, storing it) copies a pointer, not the text. A
+// write goes through mut(), which first gives this value its own copy of the
+// text when another value still shares it — so values keep their by-value
+// meaning (a C char buffer written in place changes no other value).
+class QStr
+{
+public:
+    QStr() : p_(std::make_shared<std::string>()) {}
+    QStr(const std::string &s) : p_(std::make_shared<std::string>(s)) {}
+    QStr(std::string &&s) : p_(std::make_shared<std::string>(std::move(s))) {}
+    const std::string &str() const { return *p_; }
+    std::string &mut()
+    {
+        if (p_.use_count() > 1)
+            p_ = std::make_shared<std::string>(*p_);
+        return *p_;
+    }
+
+private:
+    std::shared_ptr<std::string> p_;
+};
+
 using Array = std::vector<QuantumValue>;
 class Dict; // insertion-ordered string → value map, defined below
 
@@ -62,7 +85,7 @@ struct QuantumValue
         QuantumNil,
         bool,
         double,
-        std::string,
+        QStr,
         std::shared_ptr<Array>,
         std::shared_ptr<Dict>,
         std::shared_ptr<Closure>,
@@ -81,8 +104,8 @@ struct QuantumValue
     QuantumValue() : data(QuantumNil{}) {}
     explicit QuantumValue(bool b) : data(b) {}
     explicit QuantumValue(double d) : data(d) {}
-    explicit QuantumValue(const std::string &s) : data(s) {}
-    explicit QuantumValue(std::string &&s) : data(std::move(s)) {}
+    explicit QuantumValue(const std::string &s) : data(QStr(s)) {}
+    explicit QuantumValue(std::string &&s) : data(QStr(std::move(s))) {}
     explicit QuantumValue(std::shared_ptr<Array> a) : data(std::move(a)) {}
     explicit QuantumValue(std::shared_ptr<Dict> d) : data(std::move(d)) {}
     explicit QuantumValue(std::shared_ptr<Closure> f) : data(std::move(f)) {}
@@ -104,7 +127,7 @@ struct QuantumValue
     bool isNil() const { return std::holds_alternative<QuantumNil>(data); }
     bool isBool() const { return std::holds_alternative<bool>(data); }
     bool isNumber() const { return std::holds_alternative<double>(data); }
-    bool isString() const { return std::holds_alternative<std::string>(data); }
+    bool isString() const { return std::holds_alternative<QStr>(data); }
     bool isArray() const { return std::holds_alternative<std::shared_ptr<Array>>(data); }
     bool isDict() const { return std::holds_alternative<std::shared_ptr<Dict>>(data); }
     bool isFunction() const { return std::holds_alternative<std::shared_ptr<Closure>>(data) || std::holds_alternative<std::shared_ptr<QuantumNative>>(data); }
@@ -118,7 +141,17 @@ struct QuantumValue
     // Accessors
     bool asBool() const { return std::get<bool>(data); }
     double asNumber() const { return std::get<double>(data); }
-    std::string asString() const { return std::get<std::string>(data); }
+    std::string asString() const { return std::get<QStr>(data).str(); }
+    // The text without a copy: valid while this value is alive and unchanged.
+    const std::string &strRef() const { return std::get<QStr>(data).str(); }
+    // The text for writing in place (copied first if another value shares it).
+    std::string &strMut() { return std::get<QStr>(data).mut(); }
+    // The text without a copy, or nullptr when the value is not a string.
+    const std::string *strPtr() const
+    {
+        auto q = std::get_if<QStr>(&data);
+        return q ? &q->str() : nullptr;
+    }
     std::shared_ptr<Array> asArray() const { return std::get<std::shared_ptr<Array>>(data); }
     std::shared_ptr<Dict> asDict() const { return std::get<std::shared_ptr<Dict>>(data); }
     std::shared_ptr<Closure> asFunction() const { return std::get<std::shared_ptr<Closure>>(data); }

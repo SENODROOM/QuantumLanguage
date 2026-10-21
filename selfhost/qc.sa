@@ -1,0 +1,41 @@
+# Command-line front end of the self-hosted compiler: source -> bytecode file.
+#   qrun selfhost/qc.sa [--raw] <source> <out.qbc>     then   qrun --exec <out.qbc>
+# --raw skips the dialect passes on the program itself.
+# @use "./compiler.sa"
+
+fn qcMain(argv) {
+    let args = argv.slice(1)
+    let dialect = true
+    if len(args) > 0 and args[0] == "--raw" {
+        dialect = false
+        args = args.slice(1)
+    }
+    if len(args) < 2 {
+        print("usage: qrun selfhost/qc.sa [--raw] <source> <out.qbc>")
+        return 2
+    }
+    let path = args[0]
+    let outPath = args[1]
+    let source = read_file(path)
+    if source == nil {
+        fprintf("stderr", "%s\n", "[Error] Cannot open file: " + path)
+        return 1
+    }
+    # text mode, as the C++ runner reads a program
+    source = source.split("\r\n").join("\n")
+    let r = hostedCompile(source, path, dialect)
+    if !r["ok"] {
+        fprintf("stderr", "%s\n", path + ": " + errorText(r))
+        return 1
+    }
+    if !write_file(outPath, r["bytes"]) {
+        fprintf("stderr", "%s\n", "[Error] Cannot write " + outPath)
+        return 1
+    }
+    return 0
+}
+
+let QC_STATUS = qcMain(sys.argv)
+if QC_STATUS != 0 {
+    __cpp_exit__(QC_STATUS)
+}

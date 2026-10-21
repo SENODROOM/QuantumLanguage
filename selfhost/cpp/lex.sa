@@ -1,0 +1,1354 @@
+# Lexer + preprocessor of the typed C/C++ front-end: a port of
+# src/cpp/CppLex.cpp. Tokens are dicts:
+#   {"kind", "text", "value", "file", "line", "col", "bol", "sp", "tu"}
+# "text" is the token as written (or the literal's spelling), "value" the
+# decoded bytes of a string / char literal, "bol" first on its line, "sp"
+# whitespace before it (for # stringification), "tu" its translation unit.
+# @use "../dialect_cpp.sa"
+
+let CX_IDENT = 0
+let CX_INT = 1
+let CX_FLOAT = 2
+let CX_CHAR = 3
+let CX_STRING = 4
+let CX_PUNCT = 5
+let CX_END = 6
+
+# Prefix of the text of a C++-keyword token in a C program (a plain
+# identifier there): `class` -> chr(1) + "class". cxPlainName() strips it.
+let CX_PLAIN = chr(1)
+
+fn cxPlainName(s) {
+    if sFind(s, CX_PLAIN, 0) < 0 {
+        return s
+    }
+    return s.split(CX_PLAIN).join("")
+}
+
+# An error the front-end reports: {"cx": true, "msg", "file", "line", "col",
+# "syntax"}; "link" marks a LinkError (a real error, not a gap in the subset).
+fn cxUnsupported(msg, file, line) {
+    return {"cx": true, "msg": msg, "file": file, "line": line, "col": 0, "syntax": false, "link": false}
+}
+
+fn cxIsUnsupported(e) {
+    return typeof(e) == "object" and "cx" in e
+}
+
+# a unique id for each entity (declaration, class, function, scope...):
+# entities compare by identity, never with == (dicts compare deeply)
+let CX_NEXT_ID = 0
+
+fn cxNextId() {
+    CX_NEXT_ID = CX_NEXT_ID + 1
+    return CX_NEXT_ID
+}
+
+fn cxTok(kind, text, file, line) {
+    return {"kind": kind, "text": text, "value": "", "file": file, "line": line, "col": 0, "bol": false, "sp": false, "tu": 0}
+}
+
+fn cxTokCopy(t) {
+    return {"kind": t["kind"], "text": t["text"], "value": t["value"], "file": t["file"], "line": t["line"],
+            "col": t["col"], "bol": t["bol"], "sp": t["sp"], "tu": t["tu"]}
+}
+
+# ── characters ──────────────────────────────────────────────────────────────
+
+let CX_SPACE = " \t\n\r" + chr(11) + chr(12)
+let CX_HEX = "0123456789abcdefABCDEF"
+
+fn cxIsDigit(c) {
+    return c >= "0" and c <= "9" and len(c) == 1
+}
+
+fn cxIsAlpha(c) {
+    return len(c) == 1 and ((c >= "a" and c <= "z") or (c >= "A" and c <= "Z"))
+}
+
+fn cxIsXDigit(c) {
+    return len(c) == 1 and sFind(CX_HEX, c, 0) >= 0
+}
+
+fn cxIsSpace(c) {
+    return len(c) == 1 and sFind(CX_SPACE, c, 0) >= 0
+}
+
+fn cxIdentStart(c) {
+    if c == "" {
+        return false
+    }
+    return cxIsAlpha(c) or c == "_" or ord(c) >= 128
+}
+
+fn cxIdentChar(c) {
+    if c == "" {
+        return false
+    }
+    return cxIsAlpha(c) or cxIsDigit(c) or c == "_" or ord(c) >= 128
+}
+
+fn cxHexVal(h) {
+    if cxIsDigit(h) {
+        return ord(h) - 48
+    }
+    return ord(h.lower()) - 97 + 10
+}
+
+fn cxAppendUtf8(cp) {
+    if cp < 128 {
+        return chr(cp)
+    }
+    if cp < 2048 {
+        return chr((192 | (cp >> 6)) & 255) + chr(128 | (cp & 63))
+    }
+    if cp < 65536 {
+        return chr((224 | (cp >> 12)) & 255) + chr(128 | ((cp >> 6) & 63)) + chr(128 | (cp & 63))
+    }
+    return chr((240 | (cp >> 18)) & 255) + chr(128 | ((cp >> 12) & 63)) + chr(128 | ((cp >> 6) & 63)) + chr(128 | (cp & 63))
+}
+
+# ── lexer ───────────────────────────────────────────────────────────────────
+
+let CX_PUNCTS = [">>=", "<<=", "...", "->*", "<=>", "::", "->", "++", "--", "<<", ">>", "<=", ">=", "==", "!=",
+                 "&&", "||", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "##", ".*"]
+
+fn cxPeekc(lx, k) {
+    let j = lx["i"] + k
+    if j < len(lx["s"]) {
+        return lx["s"][j]
+    }
+    return ""
+}
+
+# 1-based column of s[i] on its line (for compiler-style diagnostics)
+fn cxColumn(lx) {
+    let i = lx["i"]
+    if i == 0 {
+        return 1
+    }
+    let nl = dsNpos(__cpp_str_find__("rfind", lx["s"], "\n", i - 1))
+    if nl < 0 {
+        return i + 1
+    }
+    return i - nl
+}
+
+# an escape sequence after the backslash at s[i] (which is consumed)
+fn cxEscape(lx) {
+    let s = lx["s"]
+    let n = len(s)
+    lx["i"] = lx["i"] + 1
+    let c = "\\"
+    if lx["i"] < n {
+        c = s[lx["i"]]
+        lx["i"] = lx["i"] + 1
+    }
+    if c == "n" {
+        return "\n"
+    }
+    if c == "t" {
+        return "\t"
+    }
+    if c == "r" {
+        return "\r"
+    }
+    if c >= "0" and c <= "7" {
+        let v = ord(c) - 48
+        let k = 0
+        while k < 2 and lx["i"] < n and s[lx["i"]] >= "0" and s[lx["i"]] <= "7" {
+            v = v * 8 + (ord(s[lx["i"]]) - 48)
+            lx["i"] = lx["i"] + 1
+            k = k + 1
+        }
+        return chr(v % 256)
+    }
+    if c == "x" {
+        let v = 0
+        while lx["i"] < n and cxIsXDigit(s[lx["i"]]) {
+            v = (v * 16 + cxHexVal(s[lx["i"]])) % 4294967296
+            lx["i"] = lx["i"] + 1
+        }
+        return chr(v % 256)
+    }
+    if c == "u" or c == "U" {
+        let cnt = 8
+        if c == "u" {
+            cnt = 4
+        }
+        let v = 0
+        let k = 0
+        while k < cnt and lx["i"] < n and cxIsXDigit(s[lx["i"]]) {
+            v = v * 16 + cxHexVal(s[lx["i"]])
+            lx["i"] = lx["i"] + 1
+            k = k + 1
+        }
+        return cxAppendUtf8(v)
+    }
+    if c == "a" {
+        return chr(7)
+    }
+    if c == "b" {
+        return chr(8)
+    }
+    if c == "f" {
+        return chr(12)
+    }
+    if c == "v" {
+        return chr(11)
+    }
+    if c == "e" {
+        return chr(27)
+    }
+    return c
+}
+
+fn cxQuoted(lx, t, q) {
+    let s = lx["s"]
+    let n = len(s)
+    let start = lx["i"]
+    lx["i"] = lx["i"] + 1
+    let parts = []
+    while lx["i"] < n and s[lx["i"]] != q and s[lx["i"]] != "\n" {
+        if s[lx["i"]] == "\\" {
+            parts.push(cxEscape(lx))
+        } else {
+            # a run of plain characters at once
+            let stop = sFindFirstOf(s, "\\\n" + q, lx["i"])
+            if stop < 0 {
+                stop = n
+            }
+            parts.push(s.slice(lx["i"], stop))
+            lx["i"] = stop
+        }
+    }
+    if lx["i"] < n and s[lx["i"]] == q {
+        lx["i"] = lx["i"] + 1
+    }
+    if q == "\"" {
+        t["kind"] = CX_STRING
+    } else {
+        t["kind"] = CX_CHAR
+    }
+    t["value"] = parts.join("")
+    t["text"] = s.slice(start, lx["i"])
+}
+
+fn cxLexOne(lx, t) {
+    let s = lx["s"]
+    let n = len(s)
+    let i = lx["i"]
+    let c = s[i]
+    # literal prefixes: u8"..", L'x', R"(...)", u8R"x(...)x"
+    if cxIdentStart(c) {
+        let j = i
+        while j < n and cxIdentChar(s[j]) {
+            j = j + 1
+        }
+        let id = s.slice(i, j)
+        if j < n and (s[j] == "\"" or s[j] == "'") {
+            let raw = len(id) > 0 and id[len(id) - 1] == "R" and s[j] == "\""
+            let pre = id
+            if raw {
+                pre = id.slice(0, len(id) - 1)
+            }
+            if pre == "" or pre == "u8" or pre == "u" or pre == "U" or pre == "L" {
+                lx["i"] = j
+                if raw {
+                    let open = sFind(s, "(", j)
+                    let delim = s.slice(j + 1, open)
+                    let close = ")" + delim + "\""
+                    let e = sFind(s, close, open)
+                    if e < 0 {
+                        e = n
+                    }
+                    let v = s.slice(open + 1, e)
+                    let k = 0
+                    while k < len(v) {
+                        k = sFind(v, "\n", k)
+                        if k < 0 {
+                            break
+                        }
+                        lx["line"] = lx["line"] + 1
+                        k = k + 1
+                    }
+                    t["kind"] = CX_STRING
+                    t["value"] = v
+                    lx["i"] = e + len(close)
+                    if lx["i"] > n {
+                        lx["i"] = n
+                    }
+                    t["text"] = "R\"" + v + "\""
+                    return nil
+                }
+                cxQuoted(lx, t, s[j])
+                return nil
+            }
+        }
+        t["kind"] = CX_IDENT
+        t["text"] = id
+        lx["i"] = j
+        return nil
+    }
+    if cxIsDigit(c) or (c == "." and cxIsDigit(cxPeekc(lx, 1))) {
+        let j = i
+        let isFloat = false
+        let hex = c == "0" and (cxPeekc(lx, 1) == "x" or cxPeekc(lx, 1) == "X")
+        while j < n {
+            let d = s[j]
+            if cxIdentChar(d) or d == "." or (d == "'" and j + 1 < n and cxIdentChar(s[j + 1])) {
+                if d == "." {
+                    isFloat = true
+                }
+                if !hex and (d == "e" or d == "E") and j + 1 < n and (s[j + 1] == "+" or s[j + 1] == "-") {
+                    isFloat = true
+                    j = j + 2
+                    continue
+                }
+                if !hex and (d == "e" or d == "E") {
+                    isFloat = true
+                }
+                if hex and (d == "p" or d == "P") {
+                    isFloat = true
+                    if j + 1 < n and (s[j + 1] == "+" or s[j + 1] == "-") {
+                        j = j + 1
+                    }
+                }
+                j = j + 1
+            } else {
+                break
+            }
+        }
+        let txt = s.slice(i, j)
+        if sFind(txt, "'", 0) >= 0 {
+            txt = txt.split("'").join("")
+        }
+        t["text"] = txt
+        if isFloat {
+            t["kind"] = CX_FLOAT
+        } else {
+            t["kind"] = CX_INT
+        }
+        lx["i"] = j
+        return nil
+    }
+    if c == "\"" or c == "'" {
+        cxQuoted(lx, t, c)
+        return nil
+    }
+    for p in CX_PUNCTS {
+        if s.slice(i, i + len(p)) == p {
+            t["kind"] = CX_PUNCT
+            t["text"] = p
+            lx["i"] = i + len(p)
+            return nil
+        }
+    }
+    t["kind"] = CX_PUNCT
+    t["text"] = c
+    lx["i"] = i + 1
+}
+
+fn cxLex(src, file) {
+    let lx = {"s": src, "i": 0, "line": 1}
+    let s = src
+    let n = len(s)
+    let out = []
+    let bol = true
+    let space = false
+    while true {
+        # whitespace, comments, line continuations
+        let progressed = true
+        while progressed and lx["i"] < n {
+            progressed = false
+            let i = lx["i"]
+            let c = s[i]
+            if c == "\\" and (cxPeekc(lx, 1) == "\n" or (cxPeekc(lx, 1) == "\r" and cxPeekc(lx, 2) == "\n")) {
+                if cxPeekc(lx, 1) == "\n" {
+                    lx["i"] = i + 2
+                } else {
+                    lx["i"] = i + 3
+                }
+                lx["line"] = lx["line"] + 1
+                progressed = true
+            } elif c == "\n" {
+                lx["i"] = i + 1
+                lx["line"] = lx["line"] + 1
+                bol = true
+                space = true
+                progressed = true
+            } elif cxIsSpace(c) {
+                lx["i"] = i + 1
+                space = true
+                progressed = true
+            } elif c == "/" and cxPeekc(lx, 1) == "/" {
+                while lx["i"] < n and s[lx["i"]] != "\n" {
+                    if s[lx["i"]] == "\\" and cxPeekc(lx, 1) == "\n" {
+                        lx["line"] = lx["line"] + 1
+                        lx["i"] = lx["i"] + 1
+                    }
+                    lx["i"] = lx["i"] + 1
+                }
+                space = true
+                progressed = true
+            } elif c == "/" and cxPeekc(lx, 1) == "*" {
+                let j = i + 2
+                while j < n and !(s[j] == "*" and j + 1 < n and s[j + 1] == "/") {
+                    if s[j] == "\n" {
+                        lx["line"] = lx["line"] + 1
+                    }
+                    j = j + 1
+                }
+                lx["i"] = j + 2
+                if lx["i"] > n {
+                    lx["i"] = n
+                }
+                space = true
+                progressed = true
+            }
+        }
+        if lx["i"] >= n {
+            break
+        }
+        let t = cxTok(CX_END, "", file, lx["line"])
+        t["col"] = cxColumn(lx)
+        t["bol"] = bol
+        t["sp"] = space
+        bol = false
+        space = false
+        cxLexOne(lx, t)
+        out.push(t)
+    }
+    let end = cxTok(CX_END, "", file, lx["line"])
+    end["bol"] = true
+    out.push(end)
+    return out
+}
+
+# ── preprocessor ────────────────────────────────────────────────────────────
+
+fn cxReadFile(p) {
+    return cdReadTextFile(p)
+}
+
+fn cxPathKey(p) {
+    return cdPathKey(p)
+}
+
+# fs::path's `a / b` on Windows: the preferred separator joins them
+fn cxJoin(a, b) {
+    if len(b) >= 2 and b[1] == ":" {
+        return b
+    }
+    if len(b) > 0 and cdIsSep(b[0]) {
+        if len(a) >= 2 and a[1] == ":" {
+            return a.slice(0, 2) + b
+        }
+        return b
+    }
+    if a == "" {
+        return b
+    }
+    if cdIsSep(a[len(a) - 1]) {
+        return a + b
+    }
+    return a + "\\" + b
+}
+
+fn cxIsFile(p) {
+    return cdIsFile(p)
+}
+
+# fs::absolute on Windows: backslash-separated
+fn cxAbsolute(p) {
+    let a = cdAbsolute(p)
+    if len(a) >= 2 and a[1] == ":" {
+        return a.split("/").join("\\")
+    }
+    return a
+}
+
+# `#include "x"`: next to the including file, then in each folder above it
+# and that folder's include/, up to the project root (cppResolveInclude)
+fn cxResolveInclude(name, fromFile) {
+    let dir = cdParent(cxAbsolute(fromFile))
+    if cxIsFile(cxJoin(dir, name)) {
+        return cxJoin(dir, name)
+    }
+    let up = 0
+    while up < 8 and dir != "" {
+        if up > 0 and cxIsFile(cxJoin(dir, name)) {
+            return cxJoin(dir, name)
+        }
+        if cxIsFile(cxJoin(cxJoin(dir, "include"), name)) {
+            return cxJoin(cxJoin(dir, "include"), name)
+        }
+        let parent = cdParent(dir)
+        if cdIsProjectRoot(dir) or parent == dir {
+            break
+        }
+        dir = parent
+        up = up + 1
+    }
+    return ""
+}
+
+# x.h -> x.cpp next to it, or src/x.cpp under the project (cppImplementationOf)
+fn cxImplementationOf(header) {
+    if !cdIsHeaderExt(header) {
+        return ""
+    }
+    for ext in CD_IMPL_EXTS {
+        let impl = cdReplaceExtension(header, ext)
+        if cxIsFile(impl) {
+            return impl
+        }
+    }
+    let abs = cxAbsolute(header)
+    let dir = cdParent(abs)
+    let root = ""
+    let belowInclude = ""
+    let up = 0
+    while up < 8 and dir != "" {
+        if belowInclude == "" and cdFileName(dir) == "include" {
+            belowInclude = abs.slice(len(dir) + 1)
+        }
+        let parent = cdParent(dir)
+        if cdIsProjectRoot(dir) or parent == dir {
+            root = dir
+            break
+        }
+        dir = parent
+        up = up + 1
+    }
+    if root == "" or belowInclude == "" {
+        return ""
+    }
+    let stems = [belowInclude, cdFileName(belowInclude)]
+    for base in ["src", "source", "lib", ""] {
+        for stem in stems {
+            for ext in CD_IMPL_EXTS {
+                let dirBase = root
+                if base != "" {
+                    dirBase = cxJoin(root, base)
+                }
+                let impl = cxJoin(dirBase, cdReplaceExtension(stem, ext))
+                if cxIsFile(impl) {
+                    return impl
+                }
+            }
+        }
+    }
+    return ""
+}
+
+let CX_PREDEFINED = [["__cplusplus", "201703L"], ["_WIN32", "1"], ["_WIN64", "1"], ["NULL", "nullptr"],
+    ["EOF", "(-1)"], ["EXIT_SUCCESS", "0"], ["EXIT_FAILURE", "1"], ["RAND_MAX", "32767"], ["CHAR_BIT", "8"],
+    ["SCHAR_MAX", "127"], ["CHAR_MAX", "127"], ["UCHAR_MAX", "255"], ["SHRT_MAX", "32767"],
+    ["INT_MAX", "2147483647"], ["INT_MIN", "(-2147483647-1)"], ["UINT_MAX", "4294967295u"],
+    ["LONG_MAX", "2147483647L"], ["LONG_MIN", "(-2147483647L-1)"], ["LLONG_MAX", "9223372036854775807LL"],
+    ["LLONG_MIN", "(-9223372036854775807LL-1)"], ["ULLONG_MAX", "18446744073709551615ULL"],
+    ["SIZE_MAX", "18446744073709551615ULL"], ["INT32_MAX", "2147483647"], ["INT32_MIN", "(-2147483647-1)"],
+    ["INT64_MAX", "9223372036854775807LL"], ["INT64_MIN", "(-9223372036854775807LL-1)"],
+    ["UINT32_MAX", "4294967295u"], ["DBL_MAX", "1.7976931348623157e308"], ["DBL_MIN", "2.2250738585072014e-308"],
+    ["DBL_EPSILON", "2.220446049250313e-16"], ["FLT_MAX", "3.402823466e38"], ["FLT_EPSILON", "1.192092896e-07"],
+    ["M_PI", "3.14159265358979323846"], ["M_E", "2.71828182845904523536"], ["M_SQRT2", "1.41421356237309504880"],
+    ["INFINITY", "(1.0/0.0)"], ["NAN", "(0.0/0.0)"]]
+
+let CX_CPP_ONLY = {}
+for w in ["catch", "class", "concept", "consteval", "constinit", "const_cast", "co_await", "co_return",
+          "co_yield", "decltype", "delete", "dynamic_cast", "explicit", "export", "friend", "mutable",
+          "namespace", "new", "noexcept", "operator", "private", "protected", "public",
+          "reinterpret_cast", "requires", "static_cast", "template", "this", "throw", "try", "typeid",
+          "typename", "using", "virtual", "and", "and_eq", "bitand", "bitor", "compl", "not", "not_eq",
+          "or", "or_eq", "xor", "xor_eq", "char16_t", "char32_t", "char8_t", "wchar_t"] {
+    CX_CPP_ONLY[w] = true
+}
+
+let CX_C_HEADERS = {}
+for h in ["assert.h", "complex.h", "ctype.h", "errno.h", "fenv.h", "float.h", "inttypes.h", "iso646.h",
+          "limits.h", "locale.h", "math.h", "setjmp.h", "signal.h", "stdalign.h", "stdarg.h",
+          "stdatomic.h", "stdbit.h", "stdbool.h", "stdckdint.h", "stddef.h", "stdint.h", "stdio.h",
+          "stdlib.h", "stdnoreturn.h", "string.h", "tgmath.h", "threads.h", "time.h", "uchar.h",
+          "wchar.h", "wctype.h",
+          "unistd.h", "strings.h", "fcntl.h", "dirent.h", "malloc.h", "memory.h", "conio.h", "windows.h",
+          "process.h", "io.h", "direct.h", "getopt.h", "pthread.h", "libgen.h", "search.h", "utime.h",
+          "alloca.h", "sys/types.h", "sys/stat.h", "sys/time.h", "sys/timeb.h", "sys/utime.h"] {
+    CX_C_HEADERS[h] = true
+}
+
+# pp: {"macros", "included", "queued", "impls", "tu", "cMode", "out": {"tokens",
+# "files", "cMode", "systemHeaders"}}; a macro: {"func", "variadic", "params", "body"}
+fn cxNewPreprocessor() {
+    let pp = {"macros": {}, "included": {}, "queued": {}, "impls": [], "tu": 0, "cMode": false,
+              "out": {"tokens": [], "files": [], "cMode": false, "systemHeaders": {}}}
+    for d in CX_PREDEFINED {
+        let body = cxLex(d[1], 0)
+        body.pop()
+        pp["macros"][d[0]] = {"func": false, "variadic": false, "params": [], "body": body}
+    }
+    return pp
+}
+
+fn cxFileOf(pp, t) {
+    let files = pp["out"]["files"]
+    if t["file"] < len(files) {
+        return files[t["file"]]
+    }
+    return ""
+}
+
+fn cxPpFail(pp, msg, t) {
+    raise cxUnsupported(msg, cxFileOf(pp, t), t["line"])
+}
+
+fn cxRunMain(pp, path, source) {
+    pp["out"]["cMode"] = pp["cMode"]
+    let mainKey = cxPathKey(path)
+    pp["included"][mainKey] = true
+    pp["queued"][mainKey] = true
+    cxProcessFile(pp, path, source, 0)
+    let k = 0
+    while k < len(pp["impls"]) {
+        let impl = pp["impls"][k]
+        k = k + 1
+        let key = cxPathKey(impl)
+        if key in pp["included"] {
+            continue
+        }
+        pp["included"][key] = true
+        pp["tu"] = pp["tu"] + 1
+        cxProcessFile(pp, impl, cxReadFile(impl), 0)
+    }
+    let end = cxTok(CX_END, "", 0, 0)
+    end["tu"] = pp["tu"]
+    pp["out"]["tokens"].push(end)
+    if pp["cMode"] {
+        cxToCTokens(pp)
+    }
+}
+
+# C has none of C++'s extra keywords, and no `::` operator: `class`, `new`,
+# `this`, ... are ordinary identifiers (int class = 3; is C), so C++
+# constructs fail exactly as they do in a C compiler.
+fn cxToCTokens(pp) {
+    let toks = []
+    for t in pp["out"]["tokens"] {
+        if t["kind"] == CX_IDENT and t["text"] in CX_CPP_ONLY {
+            t["text"] = CX_PLAIN + t["text"]
+        }
+        if t["kind"] == CX_PUNCT and t["text"] == "::" {
+            let a = cxTokCopy(t)
+            let b = cxTokCopy(t)
+            a["text"] = ":"
+            b["text"] = ":"
+            b["col"] = t["col"] + 1
+            b["bol"] = false
+            b["sp"] = false
+            toks.push(a)
+            toks.push(b)
+            continue
+        }
+        toks.push(t)
+    }
+    pp["out"]["tokens"] = toks
+}
+
+fn cxCondActive(conds) {
+    return len(conds) == 0 or conds[len(conds) - 1]["active"]
+}
+
+fn cxFlush(pp, chunk) {
+    if len(chunk) == 0 {
+        return nil
+    }
+    let expanded = []
+    cxExpand(pp, chunk, 0, len(chunk), expanded, {})
+    let tu = pp["tu"]
+    let out = pp["out"]["tokens"]
+    for t in expanded {
+        # a token of its own (a macro argument may be expanded twice)
+        let c = cxTokCopy(t)
+        c["tu"] = tu
+        out.push(c)
+    }
+}
+
+fn cxProcessFile(pp, path, source, depth) {
+    if depth > 64 {
+        raise cxUnsupported("#include nested too deeply", "", 0)
+    }
+    let fileIdx = len(pp["out"]["files"])
+    pp["out"]["files"].push(path)
+    let toks = cxLex(source, fileIdx)
+    let conds = []
+    let chunk = []
+    let i = 0
+    while i < len(toks) and toks[i]["kind"] != CX_END {
+        let t = toks[i]
+        if t["bol"] and t["kind"] == CX_PUNCT and t["text"] == "#" {
+            let j = i + 1
+            while j < len(toks) and !toks[j]["bol"] {
+                j = j + 1
+            }
+            let dir = toks.slice(i + 1, j)
+            i = j
+            cxFlush(pp, chunk)
+            chunk = []
+            cxDirective(pp, dir, path, conds, cxCondActive(conds), depth, t)
+            continue
+        }
+        if cxCondActive(conds) {
+            chunk.push(t)
+        }
+        i = i + 1
+    }
+    cxFlush(pp, chunk)
+}
+
+fn cxDirective(pp, d, path, conds, active, depth, hash) {
+    if len(d) == 0 {
+        return nil
+    }
+    let name = d[0]["text"]
+    let macros = pp["macros"]
+    if name == "if" or name == "ifdef" or name == "ifndef" {
+        let v = false
+        if active {
+            if name == "if" {
+                v = cxEvalCondition(pp, d, 1) != 0
+            } else {
+                let defined = len(d) > 1 and d[1]["text"] in macros
+                if name == "ifdef" {
+                    v = defined
+                } else {
+                    v = !defined
+                }
+            }
+        }
+        conds.push({"active": active and v, "taken": v, "parentActive": active})
+        return nil
+    }
+    if name == "elif" {
+        if len(conds) == 0 {
+            return nil
+        }
+        let c = conds[len(conds) - 1]
+        if c["taken"] or !c["parentActive"] {
+            c["active"] = false
+        } else {
+            let v = cxEvalCondition(pp, d, 1) != 0
+            c["active"] = v
+            c["taken"] = v
+        }
+        return nil
+    }
+    if name == "else" {
+        if len(conds) == 0 {
+            return nil
+        }
+        let c = conds[len(conds) - 1]
+        c["active"] = c["parentActive"] and !c["taken"]
+        c["taken"] = true
+        return nil
+    }
+    if name == "endif" {
+        if len(conds) > 0 {
+            conds.pop()
+        }
+        return nil
+    }
+    if !active {
+        return nil
+    }
+    if name == "define" {
+        if len(d) < 2 {
+            return nil
+        }
+        let m = {"func": false, "variadic": false, "params": [], "body": []}
+        let k = 2
+        # function-like only when '(' touches the name
+        if len(d) > 2 and d[2]["text"] == "(" and !d[2]["sp"] {
+            m["func"] = true
+            k = 3
+            while k < len(d) and d[k]["text"] != ")" {
+                if d[k]["text"] == "..." {
+                    m["variadic"] = true
+                    m["params"].push("__VA_ARGS__")
+                } elif d[k]["kind"] == CX_IDENT {
+                    m["params"].push(d[k]["text"])
+                    if k + 1 < len(d) and d[k + 1]["text"] == "..." {
+                        m["variadic"] = true
+                        k = k + 1
+                    }
+                }
+                k = k + 1
+            }
+            k = k + 1
+        }
+        while k < len(d) {
+            m["body"].push(d[k])
+            k = k + 1
+        }
+        macros[d[1]["text"]] = m
+        return nil
+    }
+    if name == "undef" {
+        if len(d) > 1 and d[1]["text"] in macros {
+            # erase: a later #define re-adds it (dict order is not used)
+            let kept = {}
+            for key in Object.keys(macros) {
+                if key != d[1]["text"] {
+                    kept[key] = macros[key]
+                }
+            }
+            pp["macros"] = kept
+        }
+        return nil
+    }
+    if name == "include" {
+        if len(d) < 2 {
+            return nil
+        }
+        if d[1]["kind"] == CX_STRING {
+            let target = cxResolveInclude(d[1]["value"], path)
+            if target == "" {
+                return nil
+            }
+            let key = cxPathKey(target)
+            if !(key in pp["included"]) {
+                pp["included"][key] = true
+                cxProcessFile(pp, target, cxReadFile(target), depth + 1)
+            }
+            let impl = cxImplementationOf(target)
+            if impl != "" {
+                let ik = cxPathKey(impl)
+                if !(ik in pp["queued"]) {
+                    pp["queued"][ik] = true
+                    pp["impls"].push(impl)
+                }
+            }
+        }
+        # <system> headers: the library is built in. Remember which ones the
+        # program asked for; a C program only has C's.
+        let header = ""
+        if d[1]["kind"] == CX_PUNCT and d[1]["text"] == "<" {
+            let k = 2
+            while k < len(d) and !(d[k]["kind"] == CX_PUNCT and d[k]["text"] == ">") {
+                header = header + d[k]["text"]
+                k = k + 1
+            }
+        }
+        if header != "" {
+            pp["out"]["systemHeaders"][header] = true
+            if pp["cMode"] and !(header in CX_C_HEADERS) {
+                let u = cxUnsupported("fatal: " + header + ": No such file or directory", cxFileOf(pp, d[1]), d[1]["line"])
+                u["col"] = d[1]["col"]
+                u["syntax"] = true
+                raise u
+            }
+        }
+        return nil
+    }
+    if name == "error" {
+        cxPpFail(pp, "#error in source", hash)
+    }
+    # pragma, line, warning, ident: nothing to do
+}
+
+# ── macro expansion ─────────────────────────────────────────────────────────
+
+fn cxMakeInt(v, at) {
+    let t = cxTokCopy(at)
+    t["kind"] = CX_INT
+    t["text"] = cxI64Str(v)
+    t["value"] = ""
+    return t
+}
+
+fn cxExpand(pp, src, startAt, stop, out, disabled) {
+    let macros = pp["macros"]
+    let i = startAt
+    while i < stop {
+        let t = src[i]
+        if t["kind"] == CX_IDENT {
+            if t["text"] == "__LINE__" {
+                out.push(cxMakeInt(t["line"], t))
+                i = i + 1
+                continue
+            }
+            if t["text"] == "__FILE__" {
+                let s = cxTokCopy(t)
+                s["kind"] = CX_STRING
+                s["value"] = cxFileOf(pp, t)
+                s["text"] = "\"" + s["value"] + "\""
+                out.push(s)
+                i = i + 1
+                continue
+            }
+            let name = t["text"]
+            if name in macros and !(name in disabled and disabled[name]) {
+                let m = macros[name]
+                if !m["func"] {
+                    let body = []
+                    for b in m["body"] {
+                        let x = cxTokCopy(b)
+                        x["line"] = t["line"]
+                        x["file"] = t["file"]
+                        x["bol"] = false
+                        body.push(x)
+                    }
+                    if len(body) > 0 {
+                        body[0]["sp"] = t["sp"]
+                    }
+                    disabled[name] = true
+                    cxExpand(pp, body, 0, len(body), out, disabled)
+                    disabled[name] = false
+                    i = i + 1
+                    continue
+                }
+                if i + 1 < stop and src[i + 1]["kind"] == CX_PUNCT and src[i + 1]["text"] == "(" {
+                    let args = [[]]
+                    let depth = 0
+                    let k = i + 2
+                    while k < stop {
+                        let a = src[k]
+                        if a["kind"] == CX_PUNCT and (a["text"] == "(" or a["text"] == "[" or a["text"] == "{") {
+                            depth = depth + 1
+                        } elif a["kind"] == CX_PUNCT and (a["text"] == "]" or a["text"] == "}") {
+                            depth = depth - 1
+                        } elif a["kind"] == CX_PUNCT and a["text"] == ")" {
+                            if depth == 0 {
+                                break
+                            }
+                            depth = depth - 1
+                        }
+                        if depth == 0 and a["kind"] == CX_PUNCT and a["text"] == "," and !(m["variadic"] and len(args) >= len(m["params"])) {
+                            args.push([])
+                            k = k + 1
+                            continue
+                        }
+                        args[len(args) - 1].push(a)
+                        k = k + 1
+                    }
+                    if len(m["params"]) == 0 and len(args) == 1 and len(args[0]) == 0 {
+                        args = []
+                    }
+                    let body = cxSubstitute(pp, m, args, t, disabled)
+                    disabled[name] = true
+                    cxExpand(pp, body, 0, len(body), out, disabled)
+                    disabled[name] = false
+                    i = k + 1
+                    continue
+                }
+            }
+        }
+        out.push(t)
+        i = i + 1
+    }
+}
+
+fn cxParamIndex(m, t) {
+    if t["kind"] != CX_IDENT {
+        return -1
+    }
+    let p = 0
+    while p < len(m["params"]) {
+        if m["params"][p] == t["text"] {
+            return p
+        }
+        p = p + 1
+    }
+    return -1
+}
+
+fn cxArgOf(m, args, p, at) {
+    if m["variadic"] and p == len(m["params"]) - 1 {
+        let all = []
+        let a = p
+        while a < len(args) {
+            if a > p {
+                let comma = cxTokCopy(at)
+                comma["kind"] = CX_PUNCT
+                comma["text"] = ","
+                all.push(comma)
+            }
+            for x in args[a] {
+                all.push(x)
+            }
+            a = a + 1
+        }
+        return all
+    }
+    if p < len(args) {
+        return args[p]
+    }
+    return []
+}
+
+fn cxSubstitute(pp, m, args, at, disabled) {
+    let res = []
+    let b = m["body"]
+    let j = 0
+    while j < len(b) {
+        let t = b[j]
+        if t["kind"] == CX_PUNCT and t["text"] == "#" and j + 1 < len(b) and cxParamIndex(m, b[j + 1]) >= 0 {
+            let s = ""
+            for a in cxArgOf(m, args, cxParamIndex(m, b[j + 1]), at) {
+                if s != "" and a["sp"] {
+                    s = s + " "
+                }
+                s = s + a["text"]
+            }
+            let st = cxTokCopy(at)
+            st["kind"] = CX_STRING
+            st["value"] = s
+            st["text"] = "\"" + s + "\""
+            st["bol"] = false
+            st["sp"] = t["sp"]
+            res.push(st)
+            j = j + 2
+            continue
+        }
+        if t["kind"] == CX_PUNCT and t["text"] == "##" and len(res) > 0 and j + 1 < len(b) {
+            let next = b[j + 1]
+            let rhs = ""
+            let p = cxParamIndex(m, next)
+            if p >= 0 {
+                for a in cxArgOf(m, args, p, at) {
+                    rhs = rhs + a["text"]
+                }
+            } else {
+                rhs = next["text"]
+            }
+            let pasted = res.pop()
+            let toks = cxLex(pasted["text"] + rhs, at["file"])
+            toks.pop()
+            for x in toks {
+                x["line"] = at["line"]
+                x["bol"] = false
+                res.push(x)
+            }
+            j = j + 2
+            continue
+        }
+        let p = cxParamIndex(m, t)
+        if p >= 0 {
+            let pasteNext = j + 1 < len(b) and b[j + 1]["text"] == "##"
+            let a = cxArgOf(m, args, p, at)
+            if pasteNext {
+                for x in a {
+                    res.push(x)
+                }
+            } else {
+                let ex = []
+                cxExpand(pp, a, 0, len(a), ex, disabled)
+                if len(ex) > 0 {
+                    # the expansion's first token is a copy carrying the spacing
+                    ex[0] = cxTokCopy(ex[0])
+                    ex[0]["sp"] = t["sp"]
+                }
+                for x in ex {
+                    res.push(x)
+                }
+            }
+            j = j + 1
+            continue
+        }
+        let c = cxTokCopy(t)
+        c["line"] = at["line"]
+        c["file"] = at["file"]
+        c["bol"] = false
+        res.push(c)
+        j = j + 1
+    }
+    return res
+}
+
+# ── #if expressions ─────────────────────────────────────────────────────────
+
+fn cxPrecPP(op) {
+    if op == "*" or op == "/" or op == "%" {
+        return 10
+    }
+    if op == "+" or op == "-" {
+        return 9
+    }
+    if op == "<<" or op == ">>" {
+        return 8
+    }
+    if op == "<" or op == "<=" or op == ">" or op == ">=" {
+        return 7
+    }
+    if op == "==" or op == "!=" {
+        return 6
+    }
+    if op == "&" {
+        return 5
+    }
+    if op == "^" {
+        return 4
+    }
+    if op == "|" {
+        return 3
+    }
+    if op == "&&" {
+        return 2
+    }
+    if op == "||" {
+        return 1
+    }
+    return -1
+}
+
+fn cxEvalCondition(pp, d, startAt) {
+    let pre = []
+    let k = startAt
+    while k < len(d) {
+        if d[k]["kind"] == CX_IDENT and d[k]["text"] == "defined" {
+            let paren = k + 1 < len(d) and d[k + 1]["text"] == "("
+            let n = k + 1
+            if paren {
+                n = k + 2
+            }
+            let def = n < len(d) and d[n]["text"] in pp["macros"]
+            if def {
+                pre.push(cxMakeInt(1, d[k]))
+            } else {
+                pre.push(cxMakeInt(0, d[k]))
+            }
+            if paren {
+                k = n + 2
+            } else {
+                k = n + 1
+            }
+            continue
+        }
+        pre.push(d[k])
+        k = k + 1
+    }
+    let ex = []
+    cxExpand(pp, pre, 0, len(pre), ex, {})
+    let st = {"ex": ex, "pos": 0}
+    return cxPPBin(st, 0)
+}
+
+fn cxPPInt(text) {
+    let s = text
+    while len(s) > 0 and sFind("uUlL", s[len(s) - 1], 0) >= 0 {
+        s = s.slice(0, len(s) - 1)
+    }
+    # std::stoll(s, nullptr, 0): base from the prefix; garbage -> 0
+    let base = 10
+    let i = 0
+    let neg = false
+    if len(s) > 0 and (s[0] == "-" or s[0] == "+") {
+        neg = s[0] == "-"
+        i = 1
+    }
+    if i + 1 < len(s) and s[i] == "0" and (s[i + 1] == "x" or s[i + 1] == "X") {
+        base = 16
+        i = i + 2
+    } elif i < len(s) and s[i] == "0" {
+        base = 8
+    }
+    let v = 0
+    let any = false
+    while i < len(s) {
+        let c = s[i]
+        let dv = 99
+        if cxIsDigit(c) {
+            dv = ord(c) - 48
+        } elif cxIsXDigit(c) {
+            dv = cxHexVal(c)
+        }
+        if dv >= base {
+            break
+        }
+        v = v * base + dv
+        any = true
+        i = i + 1
+    }
+    if !any {
+        return 0
+    }
+    if neg {
+        return -v
+    }
+    return v
+}
+
+fn cxPPUnary(st) {
+    let ex = st["ex"]
+    if st["pos"] >= len(ex) {
+        return 0
+    }
+    let t = ex[st["pos"]]
+    if t["kind"] == CX_PUNCT {
+        if t["text"] == "(" {
+            st["pos"] = st["pos"] + 1
+            let v = cxPPBin(st, 0)
+            if st["pos"] < len(ex) and ex[st["pos"]]["text"] == ")" {
+                st["pos"] = st["pos"] + 1
+            }
+            return v
+        }
+        if t["text"] == "!" {
+            st["pos"] = st["pos"] + 1
+            if cxPPUnary(st) == 0 {
+                return 1
+            }
+            return 0
+        }
+        if t["text"] == "-" {
+            st["pos"] = st["pos"] + 1
+            return -cxPPUnary(st)
+        }
+        if t["text"] == "+" {
+            st["pos"] = st["pos"] + 1
+            return cxPPUnary(st)
+        }
+        if t["text"] == "~" {
+            st["pos"] = st["pos"] + 1
+            return ~cxPPUnary(st)
+        }
+    }
+    st["pos"] = st["pos"] + 1
+    if t["kind"] == CX_INT {
+        return cxPPInt(t["text"])
+    }
+    if t["kind"] == CX_CHAR {
+        if t["value"] == "" {
+            return 0
+        }
+        return ord(t["value"][0])
+    }
+    if t["kind"] == CX_IDENT and t["text"] == "true" {
+        return 1
+    }
+    return 0
+}
+
+fn cxBool01(b) {
+    if b {
+        return 1
+    }
+    return 0
+}
+
+fn cxPPBin(st, minPrec) {
+    let ex = st["ex"]
+    let l = cxPPUnary(st)
+    while st["pos"] < len(ex) {
+        let op = ex[st["pos"]]["text"]
+        if ex[st["pos"]]["kind"] == CX_PUNCT and op == "?" and minPrec == 0 {
+            st["pos"] = st["pos"] + 1
+            let a = cxPPBin(st, 0)
+            if st["pos"] < len(ex) and ex[st["pos"]]["text"] == ":" {
+                st["pos"] = st["pos"] + 1
+            }
+            let b = cxPPBin(st, 0)
+            if l != 0 {
+                l = a
+            } else {
+                l = b
+            }
+            continue
+        }
+        let p = -1
+        if ex[st["pos"]]["kind"] == CX_PUNCT {
+            p = cxPrecPP(op)
+        }
+        if p < 0 or p < minPrec {
+            break
+        }
+        st["pos"] = st["pos"] + 1
+        let r = cxPPBin(st, p + 1)
+        if op == "*" {
+            l = l * r
+        } elif op == "/" {
+            if r != 0 {
+                l = cxTrunc(l / r)
+            } else {
+                l = 0
+            }
+        } elif op == "%" {
+            if r != 0 {
+                l = cxIMod(l, r)
+            } else {
+                l = 0
+            }
+        } elif op == "+" {
+            l = l + r
+        } elif op == "-" {
+            l = l - r
+        } elif op == "<<" {
+            l = l << r
+        } elif op == ">>" {
+            l = l >> r
+        } elif op == "<" {
+            l = cxBool01(l < r)
+        } elif op == "<=" {
+            l = cxBool01(l <= r)
+        } elif op == ">" {
+            l = cxBool01(l > r)
+        } elif op == ">=" {
+            l = cxBool01(l >= r)
+        } elif op == "==" {
+            l = cxBool01(l == r)
+        } elif op == "!=" {
+            l = cxBool01(l != r)
+        } elif op == "&" {
+            l = l & r
+        } elif op == "^" {
+            l = l ^ r
+        } elif op == "|" {
+            l = l | r
+        } elif op == "&&" {
+            l = cxBool01(l != 0 and r != 0)
+        } elif op == "||" {
+            l = cxBool01(l != 0 or r != 0)
+        }
+    }
+    return l
+}
+
+# ── integers ────────────────────────────────────────────────────────────────
+
+fn cxTrunc(x) {
+    if x < 0 {
+        return -floor(-x)
+    }
+    return floor(x)
+}
+
+# C's %: the sign of the dividend
+fn cxIMod(a, b) {
+    return a - b * cxTrunc(a / b)
+}
+
+# the decimal text of an integral double, as std::to_string((long long)v)
+fn cxI64Str(v) {
+    if v != v or v >= 9223372036854775807.0 or v < -9223372036854775808.0 {
+        return "-9223372036854775808"
+    }
+    if v > -1000000000000000.0 and v < 1000000000000000.0 {
+        let t = cxTrunc(v)
+        if t == 0 {
+            return "0"
+        }
+        return str(t)
+    }
+    return __jx_un__(16, __jx_un__(10, v))
+}
+
+fn cxPreprocess(path, source) {
+    let pp = cxNewPreprocessor()
+    pp["cMode"] = fileExtLower(path) == ".c"
+    let src = source
+    if len(src) >= 3 and ord(src[0]) == 239 and ord(src[1]) == 187 and ord(src[2]) == 191 {
+        src = src.slice(3)
+    }
+    cxRunMain(pp, path, src)
+    return pp["out"]
+}

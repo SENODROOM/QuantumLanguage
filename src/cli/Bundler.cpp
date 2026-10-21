@@ -1,8 +1,6 @@
 #include "Cli.h"
 #include "Pipeline.h"
-#include "Dialect.h"
 #include "Serializer.h"
-#include "Parser.h"
 #include "Vm.h"
 #include "Error.h"
 
@@ -194,13 +192,12 @@ int bundleAndRun(const std::string &path, const std::string &exePath, const std:
     std::ostringstream ss;
     ss << src.rdbuf();
 
-    // 2. Compile
-    std::shared_ptr<Chunk> chunk;
+    // 2. Compile to bytecode
+    std::vector<uint8_t> payload;
     std::string compiled;
     try
     {
-        compiled = applyDialect(ss.str(), path);
-        chunk = compileSource(compiled, path, false);
+        payload = compileSourceBytes(ss.str(), path, &compiled);
     }
     catch (const ParseError &e)
     {
@@ -221,8 +218,7 @@ int bundleAndRun(const std::string &path, const std::string &exePath, const std:
         return 1;
     }
 
-    // 3. Serialize bytecode
-    auto payload = Serializer::serialize(chunk);
+    // 3. The payload size
     uint32_t payloadSize = (uint32_t)payload.size();
 
     // 4. Find quantum_stub.exe (the template runtime)

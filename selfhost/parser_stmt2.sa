@@ -64,7 +64,7 @@ fn lowerCtorInitializers(cd, pending, stdExceptionBase) {
                 type = field["typeHint"]
             }
             let value = nil
-            if item["braced"] and P_CONTAINERS.has(type) {
+            if item["braced"] and (type in P_CONTAINERS) {
                 value = nArray(item["args"], ln)
             } else if type != "" and (len(item["args"]) > 1 or (len(item["args"]) == 0 and field["perInstance"])) {
                 let noArgs = len(item["args"]) == 0
@@ -211,7 +211,7 @@ fn parseClassDecl() {
     pSkipNewlines()
     let cd = nClass(name, ln)
     let stdExceptionBase = ""
-    if P_STD_EXCEPTIONS.has(base) {
+    if (base in P_STD_EXCEPTIONS) {
         stdExceptionBase = base
     }
     if stdExceptionBase == "" {
@@ -479,7 +479,7 @@ fn parseOneField(cd, ctx, ln) {
     }
     let typeToken = ctx["typeToken"]
     # a member object / container is constructed for each instance
-    let perInstance = ctx["objectType"] and !fieldIsPtr and !ctx["isStatic"] and !P_NOT_CONSTRUCTED.has(typeToken)
+    let perInstance = ctx["objectType"] and !fieldIsPtr and !ctx["isStatic"] and !(typeToken in P_NOT_CONSTRUCTED)
     if perInstance and init == nil {
         let check = nCall(nIdent("__constructible__", ln), [nIdent(typeToken, ln)], ln)
         let ctor = nCall(nIdent(typeToken, ln), [], ln)
@@ -753,7 +753,7 @@ fn buildOverloadDispatchers(cd, ln) {
         let m = methods[i]
         if m != nil and m["k"] == "FunctionDecl" {
             let name = m["name"]
-            if !groups.has(name) {
+            if !(name in groups) {
                 order.push(name)
                 groups[name] = []
             }

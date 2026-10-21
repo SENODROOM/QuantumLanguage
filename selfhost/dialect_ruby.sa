@@ -1,0 +1,1704 @@
+# The Ruby dialect, written in Quantum — part 1, the line and expression
+# rewrites: a port of the helpers in src/dialect/RubyDialect.cpp and of
+# RubyStdlib.cpp. dialect_ruby_main.sa holds the main line-by-line pass.
+# A symbol table is {"fields": {}, "methods": {}, "blockMethods": {}}.
+# @use "./dialect_scan.sa"
+
+let RB_HASH_BRACE = "#" + "{"
+let RB_BACKSPACE = chr(8)
+
+let RB_QUANTUM_KEYWORDS = {"from": true, "of": true, "is": true, "as": true, "extends": true, "scan": true,
+                           "payload": true, "encrypt": true, "decrypt": true, "hash": true, "cout": true,
+                           "cin": true, "endl": true}
+
+let RB_ZERO_ARG_STRICT = {"reverse": true, "chomp": true, "downcase": true, "upcase": true, "dup": true,
+                          "clone": true, "sort": true, "strip": true, "trim": true, "to_i": true, "to_f": true,
+                          "to_s": true, "zero": true, "chars": true, "length": true, "size": true, "now": true,
+                          "message": true, "shift": true, "pop": true, "empty": true, "keys": true,
+                          "first": true, "last": true, "sum": true, "uniq": true, "flatten": true,
+                          "compact": true, "min": true, "max": true, "count": true, "to_a": true,
+                          "to_sym": true, "abs": true, "round": true, "floor": true, "ceil": true, "even": true,
+                          "odd": true, "positive": true, "negative": true, "capitalize": true, "swapcase": true,
+                          "join": true, "close": true, "lines": true, "split": true, "sort_by": true,
+                          "freeze": true, "inspect": true, "resume": true, "alive": true, "kill": true,
+                          "shutdown": true}
+
+let RB_ZERO_ARG_MIXED = {"reverse": true, "chomp": true, "downcase": true, "upcase": true, "dup": true,
+                         "clone": true, "to_i": true, "to_f": true, "to_s": true, "chars": true}
+
+let RB_BANG_METHODS = {"map": true, "select": true, "filter": true, "reject": true, "sort": true,
+                       "sort_by": true, "reverse": true, "uniq": true, "compact": true, "flatten": true,
+                       "shuffle": true}
+
+fn rbZeroArgMethods(strict) {
+    if strict {
+        return RB_ZERO_ARG_STRICT
+    }
+    return RB_ZERO_ARG_MIXED
+}
+
+fn rbNewSymbols() {
+    return {"fields": {}, "methods": {}, "blockMethods": {}}
+}
+
+let RB_EMPTY_SYMBOLS = rbNewSymbols()
+
+let RB_IDENT_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+# the characters rbNormalizeAtoms has a rule for (quotes, ivars, numbers,
+# symbols, identifiers); runs of anything else are copied unchanged
+let RB_ATOM_SPECIAL = "\"'`@:" + RB_IDENT_CHARS
+let RB_DECORATOR_RE = "^@([A-Za-z_][A-Za-z0-9_]*)[A-Za-z0-9_.]*(\\(.*\\))?$"
+let RB_TEMPLATE_IVAR_RE = "(\\$\\{[^{}]*?)@([A-Za-z_][A-Za-z0-9_]*)"
+
+# Token-level normalization of plain code (string contents untouched):
+# `@ivar` -> `self.ivar`, `name?`/`name!` -> `name`, `()` for bare zero-arg
+# methods, `gets` -> `gets()`, symbols -> strings, `1_000` -> `1000`.
+fn rbNormalizeAtoms(s, st, strict, inClassBody) {
+    # whole-line decorators (`@property`, `@app.route("/x")`) stay as written
+    if !strict and sFind(s, "@", 0) != -1 {
+        let dm = reMatch(trimCopy(s), RB_DECORATOR_RE)
+        if dm != nil and !(dm[1] in st["fields"]) {
+            return s
+        }
+    }
+    let out = []
+    let lastCh = ""
+    let ivarChain = false
+    let n = len(s)
+    let i = 0
+    while i < n {
+        # a run of characters with no rule of their own is copied as is
+        let q = sFindFirstOf(s, RB_ATOM_SPECIAL, i)
+        if q == -1 {
+            q = n
+        }
+        if q > i {
+            let chunk = s.slice(i, q)
+            out.push(chunk)
+            lastCh = chunk[len(chunk) - 1]
+            if sFindFirstNotOf(chunk, ".", 0) != -1 {
+                ivarChain = false
+            }
+            i = q
+            if i >= n {
+                break
+            }
+        }
+        let c = s[i]
+        if c != "." and c != "@" and !rbIsIdentStart(c) {
+            ivarChain = false
+        }
+        if rbIsQuote(c) {
+            let end = rbSkipString(s, i)
+            let lit = s.slice(i, end)
+            # a JS template literal's `${@name}` placeholder is the ivar
+            if c == "`" {
+                let prev = ""
+                while prev != lit {
+                    prev = lit
+                    lit = reReplace(lit, RB_TEMPLATE_IVAR_RE, "$1self.$2")
+                }
+            }
+            out.push(lit)
+            lastCh = sLast(lit)
+            i = end
+            continue
+        }
+        if c == "@" and i + 1 < n and rbIsIdentStart(s[i + 1]) {
+            let j = i + 1
+            while j < n and rbIsIdentChar(s[j]) {
+                j = j + 1
+            }
+            out.push("self." + s.slice(i + 1, j))
+            lastCh = s[j - 1]
+            ivarChain = j < n and s[j] == "."
+            i = j
+            continue
+        }
+        # numeric literals drop `_` separators (1_000_000_007)
+        if cIsDigit(c) {
+            let j = i
+            while j < n and (cIsDigit(s[j]) or s[j] == "_" or (s[j] == "." and j + 1 < n and cIsDigit(s[j + 1]))) {
+                j = j + 1
+            }
+            let k = i
+            while k < j {
+                if s[k] != "_" {
+                    out.push(s[k])
+                    lastCh = s[k]
+                }
+                k = k + 1
+            }
+            i = j
+            continue
+        }
+        # a symbol literal (`:name`) -> a string
+        if c == ":" and i + 1 < n and rbIsIdentStart(s[i + 1]) and (i == 0 or (s[i - 1] != ":" and !rbIsIdentChar(s[i - 1]) and s[i - 1] != ")" and s[i - 1] != "]" and !rbIsQuote(s[i - 1]))) {
+            let j = i + 1
+            while j < n and rbIsIdentChar(s[j]) {
+                j = j + 1
+            }
+            if j < n and (s[j] == "?" or s[j] == "!") {
+                j = j + 1
+            }
+            out.push("\"" + s.slice(i + 1, j) + "\"")
+            lastCh = "\""
+            i = j
+            continue
+        }
+        if rbIsIdentStart(c) {
+            let j = sFindFirstNotOf(s, RB_IDENT_CHARS, i + 1)
+            if j == -1 {
+                j = n
+            }
+            let ident = s.slice(i, j)
+            let hadDotBefore = lastCh == "."
+            let suffixStripped = false
+            let suffixChar = ""
+            # not a suffix: `ch!=EOF`, or C's `c?1:2` ternary
+            let afterSuffix = sChar(s, j + 1)
+            let isNeqOperator = j < n and s[j] == "!" and afterSuffix == "="
+            let isTightTernary = j < n and s[j] == "?" and (rbIsIdentChar(afterSuffix) or rbIsQuote(afterSuffix) or afterSuffix == "-")
+            if j < n and (s[j] == "?" or s[j] == "!") and !isNeqOperator and !isTightTernary {
+                suffixChar = s[j]
+                j = j + 1
+                suffixStripped = true
+            }
+            let followedByParen = j < n and s[j] == "("
+            # mutating bang methods (`arr.reject!`) -> `<name>_bang` natives
+            if suffixChar == "!" and hadDotBefore and ident in RB_BANG_METHODS {
+                out.push(ident + "_bang")
+                lastCh = "g"
+                i = j
+                continue
+            }
+            if ident == "block_given" and suffixStripped {
+                out.push("(__block__ != null)")
+                lastCh = ")"
+                i = j
+                continue
+            }
+            if ident == "yield" and followedByParen {
+                out.push("__block__")
+                lastCh = "_"
+                i = j
+                continue
+            }
+            if ident == "input" and !followedByParen {
+                ident = "__rb_input"
+            } else if strict and !hadDotBefore and ident in RB_QUANTUM_KEYWORDS {
+                ident = "__rb_" + ident
+            }
+            # a receiver-less `name?` inside a class is an implicit-self call
+            if strict and inClassBody and suffixStripped and !hadDotBefore and !followedByParen and ident in st["methods"] {
+                out.push("self." + ident + "()")
+                lastCh = ")"
+                i = j
+                continue
+            }
+            out.push(ident)
+            lastCh = sLast(ident)
+            if !followedByParen and ident == "gets" and !hadDotBefore {
+                out.push("()")
+                lastCh = ")"
+            } else if !followedByParen and hadDotBefore and !(ident in st["fields"]) and (suffixStripped or ident in rbZeroArgMethods(strict or ivarChain) or (strict and ident in st["methods"])) {
+                out.push("()")
+                lastCh = ")"
+            }
+            ivarChain = ivarChain and hadDotBefore and j < n and s[j] == "."
+            i = j
+            continue
+        }
+        out.push(c)
+        lastCh = c
+        i = i + 1
+    }
+    return out.join("")
+}
+
+# no brace-style `{` and no trailing ':' — bare Ruby syntax only
+fn rbUnambiguous(code) {
+    if sLast(code) == ":" {
+        return false
+    }
+    return rbFindTopLevel(code, "{", 0) == -1
+}
+
+# strips a trailing `:`, ` then` or ` do` from a condition
+fn rbStripTrailingThen(cond) {
+    cond = trimCopy(cond)
+    if sLast(cond) == ":" {
+        return trimCopy(cond.slice(0, len(cond) - 1))
+    }
+    for kw in ["then", "do"] {
+        let klen = len(kw)
+        if len(cond) > klen and cond.slice(len(cond) - klen) == kw {
+            let before = cond[len(cond) - klen - 1]
+            if before == " " or before == "\t" {
+                return trimCopy(cond.slice(0, len(cond) - klen))
+            }
+        }
+    }
+    return cond
+}
+
+fn rbUnambiguousAllowingColon(code) {
+    let c = code
+    if sLast(c) == ":" {
+        c = c.slice(0, len(c) - 1)
+    }
+    return rbFindTopLevel(c, "{", 0) == -1
+}
+
+# a C-style comment marker (//, /*, */) outside strings
+fn rbHasCStyleComment(s) {
+    # every marker contains a '/'
+    if sFind(s, "/", 0) == -1 {
+        return false
+    }
+    let n = len(s)
+    let i = 0
+    while i + 1 < n {
+        let c = s[i]
+        if rbIsQuote(c) {
+            i = rbSkipString(s, i)
+            continue
+        }
+        if c == "/" and (s[i + 1] == "/" or s[i + 1] == "*") {
+            return true
+        }
+        if c == "*" and s[i + 1] == "/" {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn rbOpensBlockComment(s) {
+    let open = sRFind(s, "/*")
+    if open == -1 {
+        return false
+    }
+    return sFind(s, "*/", open + 2) == -1
+}
+
+let RB_DO_RE = "\\bdo(\\s*\\|[^|]*\\|)?\\s*$"
+
+fn rbLineIsRubyOpener(code) {
+    if !rbUnambiguousAllowingColon(code) {
+        return false
+    }
+    if code.startsWith("if ") or code.startsWith("unless ") or code.startsWith("while ") or code.startsWith("until ") or code.startsWith("def ") or code.startsWith("class ") or code.startsWith("case ") or code.startsWith("module ") or code == "loop" or code == "loop do" or code == "begin" {
+        return true
+    }
+    return rbHas(code, "do") and reTest(code, RB_DO_RE)
+}
+
+# leading-whitespace width (a tab counts 4)
+fn rbIndentWidth(s) {
+    let w = 0
+    let i = 0
+    while i < len(s) {
+        if s[i] == " " {
+            w = w + 1
+        } else if s[i] == "\t" {
+            w = w + 4
+        } else {
+            break
+        }
+        i = i + 1
+    }
+    return w
+}
+
+# net `{` minus `}` outside strings and trailing comments
+fn rbNetBraces(s) {
+    if sFindFirstOf(s, "{}", 0) == -1 {
+        return 0
+    }
+    let net = 0
+    let n = len(s)
+    let i = 0
+    while i < n {
+        let c = s[i]
+        if rbIsQuote(c) {
+            i = rbSkipString(s, i)
+            continue
+        }
+        if c == "#" or (c == "/" and i + 1 < n and (s[i + 1] == "/" or s[i + 1] == "*")) {
+            break
+        }
+        if c == "{" {
+            net = net + 1
+        } else if c == "}" {
+            net = net - 1
+        }
+        i = i + 1
+    }
+    return net
+}
+
+# The main pass's raw lines, trimmed, and their indentation (rbSetLines):
+# the forward scans below read these instead of re-trimming every line.
+let RB_TRIMMED = []
+let RB_INDENT = []
+let RB_LAST_END = -1     # the index of the last bare `end` line
+
+fn rbSetLines(lines) {
+    RB_TRIMMED = []
+    RB_INDENT = []
+    RB_LAST_END = -1
+    let i = 0
+    for line in lines {
+        let t = trimCopy(line)
+        RB_TRIMMED.push(t)
+        RB_INDENT.push(rbIndentWidth(line))
+        if t == "end" {
+            RB_LAST_END = i
+        }
+        i = i + 1
+    }
+}
+
+# (the C++ pattern spells `\b` in a plain string literal: a backspace byte)
+let RB_CONTINUATION_RE = "^(else|elsif|elif|when|rescue|ensure|except|catch|finally)" + RB_BACKSPACE + ".*$"
+
+# whether the block opened at openerIdx is closed by an `end` (or, allowed,
+# a balanced `}`) back at its own indentation
+fn rbClosedAtSameIndent(lines, openerIdx, allowBraceCloser) {
+    let indent = RB_INDENT[openerIdx]
+    let braces = 0
+    let i = openerIdx + 1
+    while i < len(lines) {
+        let t = RB_TRIMMED[i]
+        if t == "" or t[0] == "#" or t.startsWith("//") {
+            i = i + 1
+            continue
+        }
+        let ind = RB_INDENT[i]
+        if ind == indent and t == "end" {
+            return true
+        }
+        if ind == indent and t[0] == "}" {
+            return allowBraceCloser and braces == 0
+        }
+        if ind < indent {
+            return false
+        }
+        if ind == indent and !reFull(t, RB_CONTINUATION_RE) {
+            return false
+        }
+        braces = braces + rbNetBraces(t)
+        i = i + 1
+    }
+    return false
+}
+
+let RB_COLON_OPENER_RE = "^(if|unless|while|until|for|def|class)\\b.*:$"
+
+fn rbIsColonOpener(t) {
+    return sLast(t) == ":" and reFull(t, RB_COLON_OPENER_RE) and rbUnambiguousAllowingColon(t)
+}
+
+# whether a Ruby-looking opener is really closed by a matching `end`
+fn rbHasMatchingEnd(lines, openerIdx) {
+    let opener = RB_TRIMMED[openerIdx]
+    if rbIsColonOpener(opener) {
+        return rbClosedAtSameIndent(lines, openerIdx, true)
+    }
+    let braceCloses = opener.startsWith("def ") or opener.startsWith("class ")
+    if rbClosedAtSameIndent(lines, openerIdx, braceCloses) {
+        return true
+    }
+    # only an `end` line can close it: none past the last one
+    let depth = 1
+    let i = openerIdx + 1
+    while i <= RB_LAST_END {
+        let t = RB_TRIMMED[i]
+        if t == "end" {
+            depth = depth - 1
+            if depth == 0 {
+                return true
+            }
+        } else if rbIsColonOpener(t) {
+            if rbClosedAtSameIndent(lines, i, true) {
+                depth = depth + 1
+            }
+        } else if rbLineIsRubyOpener(t) {
+            depth = depth + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn rbBlockBodyUsesLoopControl(lines, openerIdx) {
+    let loopStack = []
+    let i = openerIdx + 1
+    while i < len(lines) {
+        let t = RB_TRIMMED[i]
+        if t == "end" {
+            if len(loopStack) == 0 {
+                return false
+            }
+            loopStack.pop()
+            i = i + 1
+            continue
+        }
+        if rbLineIsRubyOpener(t) {
+            let isLoopLike = t.startsWith("while ") or t.startsWith("until ") or t.startsWith("for ") or t == "loop" or t == "loop do" or t.startsWith("def ") or t.startsWith("class ") or t.startsWith("module ") or reTest(t, RB_DO_RE)
+            loopStack.push(isLoopLike)
+            i = i + 1
+            continue
+        }
+        if t == "break" or t == "next" or t.startsWith("break ") or t.startsWith("next ") or t.startsWith("break(") or t.startsWith("next(") {
+            let insideNestedLoop = false
+            for isLoop in loopStack {
+                if isLoop {
+                    insideNestedLoop = true
+                    break
+                }
+            }
+            if !insideNestedLoop {
+                return true
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+let RB_RETURNABLE_SKIP = ["return", "raise", "break", "continue", "if (", "if(", "while (", "while(", "for (", "for(", "//", "function ", "fn(", "class "]
+
+fn rbLooksLikeReturnable(line) {
+    let t = trimCopy(line)
+    if t == "" or t == "}" or t[0] == "}" {
+        return false
+    }
+    for p in RB_RETURNABLE_SKIP {
+        if t.startsWith(p) {
+            return false
+        }
+    }
+    if sLast(t) == "{" {
+        return false
+    }
+    if rbFindTopLevelAssign(t) != -1 {
+        return false
+    }
+    return true
+}
+
+let RB_IVAR_RE = "@([A-Za-z_][A-Za-z0-9_]*)"
+let RB_DEF_RE = "^\\s*def\\s+([A-Za-z_][A-Za-z0-9_]*[?!]?)"
+let RB_YIELD_RE = "\\b(yield|block_given\\?)\\b"
+let RB_EXPLICIT_BLOCK_PARAM_RE = "[(,]\\s*&[A-Za-z_][A-Za-z0-9_]*\\s*\\)"
+
+fn rbCollectSymbols(lines, st) {
+    let currentMethod = ""
+    for line in lines {
+        if rbHas(line, "@") {
+            for m in reAll(line, RB_IVAR_RE) {
+                st["fields"][reSG(m, 1)] = true
+            }
+        }
+        let dm = nil
+        if rbHas(line, "def") {
+            dm = reSearch(line, RB_DEF_RE)
+        }
+        if dm != nil {
+            let name = reSG(dm, 1)
+            if sLast(name) == "?" or sLast(name) == "!" {
+                name = name.slice(0, len(name) - 1)
+            }
+            if name != "initialize" {
+                st["methods"][name] = true
+            }
+            currentMethod = name
+            if reTest(line, RB_EXPLICIT_BLOCK_PARAM_RE) {
+                st["blockMethods"][name] = true
+            }
+        } else if currentMethod != "" and (rbHas(line, "yield") or rbHas(line, "block_given")) and reTest(line, RB_YIELD_RE) {
+            st["blockMethods"][currentMethod] = true
+        }
+        if trimCopy(line) == "end" {
+            currentMethod = ""
+        }
+    }
+}
+
+let RB_CLASS_NAME_RE = "\\b([A-Za-z_][A-Za-z0-9_]*)\\.class\\.name\\b"
+
+# qualifies bare known fields / methods with `self.` inside an expression
+fn rbQualifySelf(expr, st) {
+    let s = reReplace(expr, RB_CLASS_NAME_RE, "classname($1)")
+    let out = []
+    let tail = ""
+    let n = len(s)
+    let i = 0
+    while i < n {
+        let c = s[i]
+        if rbIsQuote(c) {
+            let end = rbSkipString(s, i)
+            out.push(s.slice(i, end))
+            tail = (tail + s.slice(i, end)).slice(-2)
+            i = end
+            continue
+        }
+        if rbIsIdentStart(c) {
+            let j = i + 1
+            while j < n and rbIsIdentChar(s[j]) {
+                j = j + 1
+            }
+            let ident = s.slice(i, j)
+            let afterSuffix = j
+            if afterSuffix < n and (s[afterSuffix] == "?" or s[afterSuffix] == "!") {
+                afterSuffix = afterSuffix + 1
+            }
+            let hadDotBefore = sLast(tail) == "." or tail == "->"
+            let followedByParen = afterSuffix < n and s[afterSuffix] == "("
+            let piece = ident
+            if !hadDotBefore and !followedByParen and ident in st["fields"] {
+                piece = "self." + ident
+            } else if !hadDotBefore and !followedByParen and ident in st["methods"] {
+                piece = "self." + ident + "()"
+            }
+            out.push(piece)
+            tail = (tail + piece).slice(-2)
+            i = j
+            continue
+        }
+        out.push(c)
+        tail = (tail + c).slice(-2)
+        i = i + 1
+    }
+    return out.join("")
+}
+
+# double-quoted strings with interpolation become backtick templates
+fn rbConvertInterpolation(line, st) {
+    if sFind(line, RB_HASH_BRACE, 0) == -1 {
+        return line
+    }
+    let out = ""
+    let n = len(line)
+    let i = 0
+    while i < n {
+        let c = line[i]
+        if c == "\"" {
+            let end = rbSkipString(line, i)
+            let raw = line.slice(i, end)
+            if sFind(raw, RB_HASH_BRACE, 0) == -1 {
+                out = out + raw
+                i = end
+                continue
+            }
+            # a Python f-string prefix has no meaning on the template
+            let last = sLast(out)
+            if (last == "f" or last == "F") and (len(out) == 1 or !rbIsIdentChar(out[len(out) - 2])) {
+                out = out.slice(0, len(out) - 1)
+            }
+            let inner = ""
+            if len(raw) >= 2 {
+                inner = raw.slice(1, len(raw) - 1)
+            }
+            let rebuilt = "`"
+            let p = 0
+            while p < len(inner) {
+                let hashBrace = sFind(inner, RB_HASH_BRACE, p)
+                if hashBrace == -1 {
+                    rebuilt = rebuilt + inner.slice(p)
+                    break
+                }
+                rebuilt = rebuilt + inner.slice(p, hashBrace)
+                let exprStart = hashBrace + 2
+                let depth = 1
+                let q = exprStart
+                while q < len(inner) and depth > 0 {
+                    if inner[q] == "{" {
+                        depth = depth + 1
+                    } else if inner[q] == "}" {
+                        depth = depth - 1
+                        if depth == 0 {
+                            break
+                        }
+                    }
+                    q = q + 1
+                }
+                let exprText = inner.slice(exprStart, q)
+                # normalize first so `@ivar` becomes `self.ivar` before qualifying
+                rebuilt = rebuilt + "${" + rbQualifySelf(rbNormalizeAtoms(trimCopy(exprText), st, true, false), st) + "}"
+                if q < len(inner) {
+                    p = q + 1
+                } else {
+                    p = len(inner)
+                }
+            }
+            out = out + rebuilt + "`"
+            i = end
+            continue
+        }
+        if c == "'" or c == "`" {
+            let end = rbSkipString(line, i)
+            out = out + line.slice(i, end)
+            i = end
+            continue
+        }
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
+# a standalone `(A..B)` / `(A...B)` -> range(...); [changed, line]
+fn rbConvertRangesOnce(line) {
+    if sFind(line, "..", 0) == -1 {
+        return [false, line]
+    }
+    let i = 0
+    while i < len(line) {
+        if line[i] != "(" or (i > 0 and rbIsIdentChar(line[i - 1])) {
+            i = i + 1
+            continue
+        }
+        let close = rbMatchBracket(line, i)
+        if close == -1 {
+            i = i + 1
+            continue
+        }
+        let content = line.slice(i + 1, close)
+        if len(rbSplitTopLevel(content, ",")) != 1 {
+            i = i + 1
+            continue
+        }
+        let dotdot = rbFindTopLevel(content, "..", 0)
+        if dotdot == -1 {
+            i = i + 1
+            continue
+        }
+        let exclusive = dotdot + 2 < len(content) and content[dotdot + 2] == "."
+        let left = trimCopy(content.slice(0, dotdot))
+        let skip = 2
+        if exclusive {
+            skip = 3
+        }
+        let right = trimCopy(content.slice(dotdot + skip))
+        let replacement = ""
+        if exclusive {
+            replacement = "range(" + left + ", " + right + ")"
+        } else {
+            replacement = "range(" + left + ", floor(" + right + ")+1)"
+        }
+        return [true, line.slice(0, i) + replacement + line.slice(close + 1)]
+    }
+    return [false, line]
+}
+
+let RB_IDENT_CHAIN = "[A-Za-z_][A-Za-z0-9_]*(?:\\.[A-Za-z_][A-Za-z0-9_]*)*"
+let RB_NIL_PRED_RE = "(@?" + RB_IDENT_CHAIN + "(?:\\[[^\\[\\]]*\\])?)\\.nil\\?"
+let RB_MIXED_OR_ASSIGN_RE = "((?:@|self\\.)?" + RB_IDENT_CHAIN + "(?:\\[[^\\[\\]]*\\])*)\\s*\\|\\|=\\s*(.+)$"
+let RB_MIXED_AND_ASSIGN_RE = "((?:@|self\\.)?" + RB_IDENT_CHAIN + "(?:\\[[^\\[\\]]*\\])*)\\s*&&=\\s*(.+)$"
+let RB_ARRAY_FILL_RE = "Array\\.new\\(([^(),]*),\\s*([^()]*)\\)"
+let RB_ARRAY_SIZE_RE = "Array\\.new\\(([^(),]*)\\)"
+let RB_MIXED_BUILTINS = "(?!(?:Hash|Array)\\b)"
+let RB_MIXED_NEW_CALL_RE = "\\b" + RB_MIXED_BUILTINS + "([A-Z][A-Za-z0-9_]*)(?:\\.|::)new\\("
+let RB_MIXED_NEW_BARE_RE = "\\b" + RB_MIXED_BUILTINS + "([A-Z][A-Za-z0-9_]*)(?:\\.|::)new\\b(?!\\()"
+let RB_NOT_MATCH_RE = "(\\S+)\\s*!~\\s*(/(?:[^/\\\\]|\\\\.)*/[a-z]*)"
+let RB_MATCH_RE = "(\\S+)\\s*=~\\s*(/(?:[^/\\\\]|\\\\.)*/[a-z]*)"
+let RB_BUILTIN_MODULES = "(?!(?:Thread|Mutex|ConditionVariable|Queue|SizedQueue|File|Time|Ractor|Fiber|TCPServer|TCPSocket|Struct|Set|Dir|IO)\\b)"
+let RB_NEW_CALL_RE = "\\b" + RB_BUILTIN_MODULES + "([A-Za-z_][A-Za-z0-9_]*)\\.new\\("
+let RB_NEW_BARE_RE = "\\b" + RB_BUILTIN_MODULES + "([A-Za-z_][A-Za-z0-9_]*)\\.new\\b(?!\\()"
+let RB_BUILTIN_NEW_BARE_RE = "\\b(Thread|Mutex|ConditionVariable|Queue|SizedQueue|Ractor|Fiber|Set)\\.new\\b(?!\\()"
+let RB_LAMBDA_PARAMS_RE = "->\\s*\\(([^()]*)\\)\\s*\\{"
+let RB_LAMBDA_NO_PARAMS_RE = "->\\s*\\{"
+let RB_SPACESHIP_RE = "([A-Za-z_][A-Za-z0-9_.\\[\\]]*)\\s*<=>\\s*([A-Za-z_][A-Za-z0-9_.\\[\\]]*)"
+let RB_WORD_ARRAY_RE = "%[wi]([\\[({])([^\\])}]*)[\\])}]"
+let RB_SAFE_NAV_RE = "((?:@|self\\.)?" + RB_IDENT_CHAIN + "(?:\\[[^\\[\\]]*\\])*)&\\.([A-Za-z_][A-Za-z0-9_]*[?!]?(?:\\([^()]*\\))?)"
+let RB_NIL_CHECK_RE = "((?:@|self\\.)?" + RB_IDENT_CHAIN + "(?:\\([^()]*\\))?(?:\\[[^\\[\\]]*\\])*)\\.nil\\?"
+let RB_SLICE_RANGE_RE = "(\\([^()]*\\)|(?:@|self\\.)?" + RB_IDENT_CHAIN + "(?:\\([^()]*\\))?)\\[([^\\[\\]]+?)(\\.\\.\\.?)([^\\[\\]]*?)\\]"
+let RB_SLICE2_RE = "((?:@|self\\.)?" + RB_IDENT_CHAIN + ")\\[([^\\[\\],]+),\\s*([^\\[\\],]+)\\]"
+let RB_CAPTURE_RE = "\\$([1-9])"
+
+# splits on runs of whitespace (istringstream >> word)
+fn rbWords(s) {
+    let words = []
+    let cur = ""
+    for c in s.split("") {
+        if cIsSpace(c) {
+            if cur != "" {
+                words.push(cur)
+                cur = ""
+            }
+        } else {
+            cur = cur + c
+        }
+    }
+    if cur != "" {
+        words.push(cur)
+    }
+    return words
+}
+
+# ranges and the Ruby expression forms with no counterpart elsewhere
+# (each regex runs only when the text has a literal its pattern requires)
+fn rbHas(line, part) {
+    return sFind(line, part, 0) != -1
+}
+
+fn rbConvertRanges(line, strict) {
+    if rbHas(line, ".nil?") {
+        line = reReplace(line, RB_NIL_PRED_RE, "($1 == nil)")
+    }
+    let guard = 0
+    while guard < 8 {
+        let r = rbConvertRangesOnce(line)
+        line = r[1]
+        if !r[0] {
+            break
+        }
+        guard = guard + 1
+    }
+    if !strict {
+        if rbHas(line, "||=") {
+            line = reReplace(line, RB_MIXED_OR_ASSIGN_RE, "$1 = $1 || ($2)")
+        }
+        if rbHas(line, "&&=") {
+            line = reReplace(line, RB_MIXED_AND_ASSIGN_RE, "$1 = $1 && ($2)")
+        }
+        if rbHas(line, "Array.new" + "(") {
+            line = reReplace(line, RB_ARRAY_FILL_RE, "range(0, $1).map(fn(__ai) { return $2 })")
+            line = reReplace(line, RB_ARRAY_SIZE_RE, "range(0, $1).map(fn(__ai) { return nil })")
+        }
+        if rbHas(line, "new") {
+            line = reReplace(line, RB_MIXED_NEW_CALL_RE, "$1(")
+            line = reReplace(line, RB_MIXED_NEW_BARE_RE, "$1()")
+        }
+        if rbHas(line, "!~") {
+            line = reReplace(line, RB_NOT_MATCH_RE, "!__rx_match($1, $2)")
+        }
+        if rbHas(line, "=~") {
+            line = reReplace(line, RB_MATCH_RE, "__rx_match($1, $2)")
+        }
+        return line
+    }
+    if rbHas(line, "Array.new" + "(") {
+        line = reReplace(line, RB_ARRAY_FILL_RE, "range(0, $1).map(fn(__ai) { return $2 })")
+        line = reReplace(line, RB_ARRAY_SIZE_RE, "range(0, $1).map(fn(__ai) { return nil })")
+    }
+    if rbHas(line, ".new") {
+        line = reReplace(line, RB_NEW_CALL_RE, "$1(")
+        line = reReplace(line, RB_NEW_BARE_RE, "$1()")
+        line = reReplace(line, RB_BUILTIN_NEW_BARE_RE, "$1.new()")
+    }
+    if rbHas(line, "->") {
+        line = reReplace(line, RB_LAMBDA_PARAMS_RE, "fn($1) {")
+        line = reReplace(line, RB_LAMBDA_NO_PARAMS_RE, "fn() {")
+    }
+    if rbHas(line, " => ") {
+        line = reReplace(line, " => ", ": ")
+    }
+    if rbHas(line, "<=>") {
+        line = reReplace(line, RB_SPACESHIP_RE, "__spaceship__($1, $2)")
+    }
+    # %w[a b c] / %i[a b c] -> an array of strings
+    while rbHas(line, "%") {
+        let m = reSearch(line, RB_WORD_ARRAY_RE)
+        if m == nil {
+            break
+        }
+        let quoted = []
+        for w in rbWords(reSG(m, 2)) {
+            quoted.push("\"" + w + "\"")
+        }
+        line = line.slice(0, m[0]) + "[" + quoted.join(", ") + "]" + line.slice(m[0] + m[1])
+    }
+    # receiver&.method(args) -> (receiver == null ? null : receiver.method(args))
+    while rbHas(line, "&.") {
+        let m = reSearch(line, RB_SAFE_NAV_RE)
+        if m == nil {
+            break
+        }
+        let recv = reSG(m, 1)
+        line = line.slice(0, m[0]) + "(" + recv + " == null ? null : " + recv + "." + reSG(m, 2) + ")" + line.slice(m[0] + m[1])
+    }
+    if rbHas(line, ".nil?") {
+        line = reReplace(line, RB_NIL_CHECK_RE, "($1 == null)")
+    }
+    # obj[a..b] / obj[a...b] -> __slice_range(...)
+    while rbHas(line, "..") {
+        let m = reSearch(line, RB_SLICE_RANGE_RE)
+        if m == nil {
+            break
+        }
+        let upper = trimCopy(reSG(m, 4))
+        let inclusive = "false"
+        if reSG(m, 3) == ".." {
+            inclusive = "true"
+        }
+        if upper == "" {
+            upper = "-1"
+            inclusive = "true"
+        }
+        line = line.slice(0, m[0]) + "__slice_range(" + reSG(m, 1) + ", " + trimCopy(reSG(m, 2)) + ", " + upper + ", " + inclusive + ")" + line.slice(m[0] + m[1])
+    }
+    if rbHas(line, "[") {
+        line = reReplace(line, RB_SLICE2_RE, "__slice2($1, $2, $3)")
+    }
+    if rbHas(line, "||=") {
+        line = reReplace(line, RB_MIXED_OR_ASSIGN_RE, "$1 = $1 || ($2)")
+    }
+    if rbHas(line, "&&=") {
+        line = reReplace(line, RB_MIXED_AND_ASSIGN_RE, "$1 = $1 && ($2)")
+    }
+    if rbHas(line, "Float::") {
+        line = reReplace(line, "Float::INFINITY", "INF")
+        line = reReplace(line, "Float::NAN", "NaN")
+    }
+    if rbHas(line, "!~") {
+        line = reReplace(line, RB_NOT_MATCH_RE, "!__rx_match($1, $2)")
+    }
+    if rbHas(line, "=~") {
+        line = reReplace(line, RB_MATCH_RE, "__rx_match($1, $2)")
+    }
+    if rbHas(line, "$") {
+        line = reReplace(line, RB_CAPTURE_RE, "__rx_$1")
+    }
+    return line
+}
+
+let RB_SYMBOL_PROC_RE = "([(,]\\s*)&:([A-Za-z_][A-Za-z0-9_]*[?!]?)\\s*\\)"
+let RB_BLOCK_CAPTURE_RE = "([(,]\\s*)&([A-Za-z_][A-Za-z0-9_]*)\\s*\\)"
+let RB_BLOCK_CALL_RE = "\\b([A-Za-z_][A-Za-z0-9_]*)\\.call\\("
+let RB_BLOCK_CALL_BARE_RE = "\\b([A-Za-z_][A-Za-z0-9_]*)\\.call\\b(?!\\()"
+
+# `&block` parameters and arguments, `&:sym` procs, `block.call(x)`
+fn rbConvertBlockCapture(line, strict) {
+    if rbHas(line, "&:") {
+        line = reReplace(line, RB_SYMBOL_PROC_RE, "$1fn(__sp) { return __sp.$2() })")
+    }
+    if !strict {
+        return line
+    }
+    if rbHas(line, "&") {
+        line = reReplace(line, RB_BLOCK_CAPTURE_RE, "$1$2)")
+    }
+    if rbHas(line, ".call") {
+        line = reReplace(line, RB_BLOCK_CALL_RE, "$1(")
+        line = reReplace(line, RB_BLOCK_CALL_BARE_RE, "$1()")
+    }
+    return line
+}
+
+let RB_LVAL_RE = "^(@|self\\.)?[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*(\\[[^\\]]*\\]|\\([^()]*\\))?$"
+
+# `arr << expr` as a whole statement -> arr.push(expr); nil when not one
+fn rbTryPushAppend(code) {
+    let pos = rbFindTopLevel(code, "<<", 0)
+    if pos == -1 {
+        return nil
+    }
+    if pos + 2 < len(code) and code[pos + 2] == "=" {
+        return nil
+    }
+    let lhs = trimCopy(code.slice(0, pos))
+    let rhs = trimCopy(code.slice(pos + 2))
+    if lhs == "" or rhs == "" {
+        return nil
+    }
+    if lhs == "cout" or lhs == "cerr" or lhs == "clog" {
+        return nil
+    }
+    if rbFindTopLevel(rhs, "<<", 0) != -1 {
+        return nil
+    }
+    if !reFull(lhs, RB_LVAL_RE) {
+        return nil
+    }
+    return lhs + ".push(" + rhs + ")"
+}
+
+# `raise ClassName, "message"` -> `raise ClassName("message")`
+fn rbConvertRaiseComma(code) {
+    if !code.startsWith("raise ") {
+        return code
+    }
+    let rest = code.slice(6)
+    let comma = rbFindTopLevel(rest, ",", 0)
+    if comma == -1 {
+        return code
+    }
+    let ident = trimCopy(rest.slice(0, comma))
+    if !reFull(ident, "^[A-Za-z_][A-Za-z0-9_]*$") {
+        return code
+    }
+    return "raise " + ident + "(" + trimCopy(rest.slice(comma + 1)) + ")"
+}
+
+let RB_MAIN_GUARD_RE = "__FILE__\\s*==\\s*\\$(0|PROGRAM_NAME)|\\$(0|PROGRAM_NAME)\\s*==\\s*__FILE__"
+
+fn rbSubstituteMainGuard(cond) {
+    if sFind(cond, "__FILE__", 0) == -1 {
+        return cond
+    }
+    return reReplace(cond, RB_MAIN_GUARD_RE, "true")
+}
+
+let RB_BARE_SPLIT_RE = "\\.split(?:\\(\\s*\\))?(?!\\()"
+let RB_TRIM_SPLIT = ".trim().split(\"/\\\\s+/\")"
+
+# a bare `.split` -> a trimmed whitespace-regex split
+fn rbConvertBareSplit(code) {
+    # (spelled in two parts: this very line goes through the Ruby pass when
+    # the compiler compiles itself, and a whole `.split` would be rewritten)
+    if sFind(code, "." + "split", 0) == -1 {
+        return code
+    }
+    let out = []
+    let last = 0
+    for m in reAll(code, RB_BARE_SPLIT_RE) {
+        out.push(code.slice(last, m[0]))
+        out.push(RB_TRIM_SPLIT)
+        last = m[0] + m[1]
+    }
+    out.push(code.slice(last))
+    return out.join("")
+}
+
+let RB_BLOCK_METHOD_RE = "(^loop$)|(\\.(each|each_with_index|map|select|filter|reduce|none|any|all|every|some|times|sort_by|reject|find|detect)[?!]?(\\([^()]*\\))?$)"
+let RB_CTOR_BLOCK_RE = "\\.new(\\([^()]*\\))?$"
+let RB_CALL_TAIL_RE = "(?:^|\\.)([A-Za-z_][A-Za-z0-9_]*)[?!]?(\\([^()]*\\))?$"
+
+# whether the text before a `{` ends in a call taking a block
+fn rbPrefixEndsWithBlockMethod(prefix, st) {
+    if reTest(prefix, RB_BLOCK_METHOD_RE) {
+        return true
+    }
+    if reTest(prefix, RB_CTOR_BLOCK_RE) {
+        return true
+    }
+    let m = reSearch(prefix, RB_CALL_TAIL_RE)
+    if m != nil and reSG(m, 1) in st["blockMethods"] {
+        return true
+    }
+    return false
+}
+
+# a trailing one-line `{ |params| body }` block; nil or
+# {"prefix", "params", "body", "suffix"}
+fn rbTryInlineBraceBlock(code, st) {
+    if code != "" and code[0] == "}" {
+        return nil
+    }
+    let open = rbFindTopLevel(code, "{", 0)
+    if open == -1 {
+        return nil
+    }
+    let close = rbMatchBracket(code, open)
+    if close == -1 {
+        return nil
+    }
+    let prefix = trimCopy(code.slice(0, open))
+    let content = trimCopy(code.slice(open + 1, close))
+    let hasBlockParams = content != "" and content[0] == "|"
+    if prefix == "" or (!hasBlockParams and !rbPrefixEndsWithBlockMethod(prefix, st)) {
+        return nil
+    }
+    let out = {"prefix": prefix, "params": "", "body": content, "suffix": trimCopy(code.slice(close + 1))}
+    if hasBlockParams {
+        let p2 = sFind(content, "|", 1)
+        if p2 != -1 {
+            out["params"] = trimCopy(content.slice(1, p2))
+            out["body"] = trimCopy(content.slice(p2 + 1))
+        }
+    }
+    return out
+}
+
+let RB_TRAILING_DO_RE = "^(.*?)\\bdo(?:\\s*\\|([^|]*)\\|)?\\s*$"
+
+# a trailing `do |params|` (or bare `do`) opener: [prefix, params] or nil
+fn rbTryTrailingDoOpener(code) {
+    let m = reMatch(code, RB_TRAILING_DO_RE)
+    if m == nil {
+        return nil
+    }
+    return [trimCopy(reG(m, 1)), trimCopy(reG(m, 2))]
+}
+
+let RB_BRACE_PIPE_OPENER_RE = "^(\\s*)(.*?)\\{[ \t]*\\|([^|]*)\\|[ \t]*$"
+
+# multi-line `EXPR { |params|` ... `}` -> `EXPR do |params|` ... `end`
+fn rbConvertBracePipeBlocks(lines) {
+    let i = 0
+    while i < len(lines) {
+        let m = reMatch(lines[i], RB_BRACE_PIPE_OPENER_RE)
+        if m == nil {
+            i = i + 1
+            continue
+        }
+        let prefix = trimCopy(m[2])
+        if prefix == "" or rbFindTopLevel(lines[i], "{", 0) == -1 {
+            i = i + 1
+            continue
+        }
+        let depth = 1
+        let closeLine = -1
+        let closeCol = 0
+        let j = i + 1
+        while j < len(lines) and closeLine == -1 {
+            let s = lines[j]
+            let k = 0
+            while k < len(s) {
+                let c = s[k]
+                if rbIsQuote(c) {
+                    k = rbSkipString(s, k)
+                    continue
+                }
+                if c == "{" {
+                    depth = depth + 1
+                } else if c == "}" {
+                    depth = depth - 1
+                    if depth == 0 {
+                        closeLine = j
+                        closeCol = k
+                        break
+                    }
+                }
+                k = k + 1
+            }
+            j = j + 1
+        }
+        if closeLine == -1 {
+            i = i + 1
+            continue
+        }
+        lines[i] = m[1] + prefix + " do |" + m[3] + "|"
+        let cl = lines[closeLine]
+        if trimCopy(cl) == "}" {
+            lines[closeLine] = cl.slice(0, sFind(cl, "}", 0)) + "end"
+        } else {
+            lines[closeLine] = cl.slice(0, closeCol) + "end" + cl.slice(closeCol + 1)
+        }
+        i = i + 1
+    }
+    return lines
+}
+
+let RB_PAIRWISE_RE = "(?:\\b(each_with_index|times|reduce|inject|sort|new)[?!]?(\\([^()]*\\))?$|^[A-Z].*)"
+let RB_DESTRUCTURE_N = 0
+
+# a multi-parameter block on a one-value iterator destructures that value:
+# [bodyPrefix, params]
+fn rbApplyBlockDestructuring(prefix, params) {
+    let names = rbSplitTopLevel(params, ",")
+    if len(names) < 2 {
+        return ["", params]
+    }
+    if reTest(prefix, RB_PAIRWISE_RE) or sFind(prefix, ".", 0) == -1 {
+        return ["", params]
+    }
+    let tmp = "__destructure" + str(RB_DESTRUCTURE_N)
+    RB_DESTRUCTURE_N = RB_DESTRUCTURE_N + 1
+    let bodyPrefix = ""
+    let k = 0
+    while k < len(names) {
+        bodyPrefix = bodyPrefix + "let " + trimCopy(names[k]) + " = " + tmp + "[" + str(k) + "]; "
+        k = k + 1
+    }
+    return [bodyPrefix, tmp]
+}
+
+# the call-opening text for a block: "arr.each" + "x" -> "arr.each(fn(x) {"
+fn rbBuildBlockOpenText(prefix, params) {
+    if sLast(prefix) == ")" {
+        let base = prefix.slice(0, len(prefix) - 1)
+        if sLast(base) == "(" {
+            return base + "fn(" + params + ") {"
+        }
+        return base + ", fn(" + params + ") {"
+    }
+    return prefix + "(fn(" + params + ") {"
+}
+
+fn rbEscapeForString(raw) {
+    let out = []
+    for c in raw.split("") {
+        if c == "\"" {
+            out.push("\\\"")
+        } else if c == "\\" {
+            out.push("\\\\")
+        } else if c == "\n" {
+            out.push("\\n")
+        } else if c == "\t" {
+            out.push("\\t")
+        } else if c != "\r" {
+            out.push(c)
+        }
+    }
+    return out.join("")
+}
+
+let RB_HEREDOC_RE = "^(.*?)<<([~-]?)([\"']?)([A-Za-z_][A-Za-z0-9_]*)\\3(.*)$"
+
+# heredocs become one-line string literals; their lines are blanked
+fn rbExpandHeredocs(lines) {
+    let i = 0
+    while i < len(lines) {
+        let m = reMatch(lines[i], RB_HEREDOC_RE)
+        if m == nil {
+            i = i + 1
+            continue
+        }
+        let before = reG(m, 1)
+        let squiggly = reG(m, 2)
+        let tag = reG(m, 4)
+        let after = reG(m, 5)
+        let body = []
+        let j = i + 1
+        let closed = false
+        while j < len(lines) {
+            if trimCopy(lines[j]) == tag {
+                closed = true
+                break
+            }
+            body.push(lines[j])
+            j = j + 1
+        }
+        if !closed {
+            i = i + 1
+            continue
+        }
+        if squiggly == "~" {
+            let minIndent = -1
+            for b in body {
+                if trimCopy(b) == "" {
+                    continue
+                }
+                let ind = sFindFirstNotOf(b, " \t", 0)
+                if ind != -1 and (minIndent == -1 or ind < minIndent) {
+                    minIndent = ind
+                }
+            }
+            if minIndent > 0 {
+                let k = 0
+                while k < len(body) {
+                    if len(body[k]) >= minIndent {
+                        body[k] = body[k].slice(minIndent)
+                    }
+                    k = k + 1
+                }
+            }
+        }
+        let joined = ""
+        for b in body {
+            joined = joined + b + "\n"
+        }
+        lines[i] = before + "\"" + rbEscapeForString(joined) + "\"" + after
+        let k = i + 1
+        while k <= j and k < len(lines) {
+            lines[k] = ""
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return lines
+}
+
+# Ruby's Enumerable mixin, as Ruby lines (RubyStdlib.cpp)
+let RB_ENUMERABLE_SOURCE = [
+    "  def to_a", "    __r = []", "    self.each { |x| __r << x }", "    __r", "  end",
+    "  def map", "    __r = []", "    self.each { |x| __r << yield(x) }", "    __r", "  end",
+    "  def select", "    __r = []", "    self.each { |x| __r << x if yield(x) }", "    __r", "  end",
+    "  def reject", "    __r = []", "    self.each { |x| __r << x unless yield(x) }", "    __r", "  end",
+    "  def reduce(initial)", "    __acc = initial", "    self.each { |x| __acc = yield(__acc, x) }", "    __acc", "  end",
+    "  def sum", "    __t = 0", "    self.each { |x| __t += x }", "    __t", "  end",
+    "  def count", "    __n = 0", "    self.each { |x| __n += 1 }", "    __n", "  end",
+    "  def include?(item)", "    __found = false", "    self.each { |x| __found = true if x == item }", "    __found", "  end",
+    "  def min", "    __m = nil", "    self.each { |x| __m = x if __m == nil || x < __m }", "    __m", "  end",
+    "  def max", "    __m = nil", "    self.each { |x| __m = x if __m == nil || x > __m }", "    __m", "  end",
+    "  def sort", "    self.to_a.sort", "  end",
+    "  def any?", "    __found = false", "    self.each { |x| __found = true if yield(x) }", "    __found", "  end",
+    "  def all?", "    __r = true", "    self.each { |x| __r = false unless yield(x) }", "    __r", "  end",
+    "  def none?", "    __found = false", "    self.each { |x| __found = true if yield(x) }", "    !__found", "  end",
+    "  def first", "    __r = nil", "    __done = false", "    self.each do |x|", "      unless __done",
+    "        __r = x", "        __done = true", "      end", "    end", "    __r", "  end"
+]
+
+let RB_MODULE_RE = "^module\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*$"
+let RB_INCLUDE_RE = "^include\\s+([A-Za-z_][A-Za-z0-9_]*)\\s*$"
+
+fn rbModuleOpener(t) {
+    if t.startsWith("module ") or t.startsWith("class ") or t.startsWith("def ") or t == "begin" or t.startsWith("if ") or t.startsWith("unless ") or t.startsWith("while ") or t.startsWith("until ") or t.startsWith("case ") {
+        return true
+    }
+    return reTest(t, RB_DO_RE)
+}
+
+# `module M ... end` bodies are lifted out and spliced in at `include M`
+fn rbFlattenModules(lines) {
+    let modules = {"Enumerable": RB_ENUMERABLE_SOURCE}
+    let i = 0
+    while i < len(lines) {
+        let m = reMatch(trimCopy(lines[i]), RB_MODULE_RE)
+        if m == nil {
+            i = i + 1
+            continue
+        }
+        let name = m[1]
+        let depth = 1
+        let j = i + 1
+        let body = []
+        while j < len(lines) and depth > 0 {
+            let tj = trimCopy(lines[j])
+            if tj == "end" {
+                depth = depth - 1
+                if depth == 0 {
+                    break
+                }
+            } else if rbModuleOpener(tj) {
+                depth = depth + 1
+            }
+            body.push(lines[j])
+            j = j + 1
+        }
+        modules[name] = body
+        let k = i
+        while k <= j and k < len(lines) {
+            lines[k] = ""
+            k = k + 1
+        }
+        i = i + 1
+    }
+    let result = []
+    for line in lines {
+        let m = reMatch(trimCopy(line), RB_INCLUDE_RE)
+        if m != nil and m[1] in modules {
+            for bl in modules[m[1]] {
+                result.push(bl)
+            }
+        } else {
+            result.push(line)
+        }
+    }
+    return result
+}
+
+let RB_HASH_BLOCK_FORM_RE = "^(@?[A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*Hash\\.new\\s*\\{\\s*\\|[^|]*\\|\\s*[A-Za-z_][A-Za-z0-9_]*\\[[^\\]]*\\]\\s*=\\s*(.+?)\\s*\\}\\s*$"
+let RB_HASH_VALUE_FORM_RE = "^(@?[A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*Hash\\.new\\((.*)\\)\\s*$"
+let RB_HASH_EMPTY_FORM_RE = "^(@?[A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*Hash\\.new\\s*$"
+
+# `x = Hash.new(...)`: [name, {"defaultExpr", "vivify"}] or nil
+fn rbMatchDefaultHashDecl(code) {
+    let m = reMatch(code, RB_HASH_BLOCK_FORM_RE)
+    if m != nil {
+        return [m[1], {"defaultExpr": trimCopy(m[2]), "vivify": true}]
+    }
+    m = reMatch(code, RB_HASH_VALUE_FORM_RE)
+    if m != nil {
+        return [m[1], {"defaultExpr": trimCopy(reG(m, 2)), "vivify": false}]
+    }
+    m = reMatch(code, RB_HASH_EMPTY_FORM_RE)
+    if m != nil {
+        return [m[1], {"defaultExpr": "nil", "vivify": false}]
+    }
+    return nil
+}
+
+# reads of a defaulting hash go through __hget / __hget_vivify
+fn rbApplyDefaultHashReads(code, hashes) {
+    let names = Object.keys(hashes)
+    names.sort()
+    for name in names {
+        let entry = hashes[name]
+        let helper = "__hget"
+        if entry["vivify"] {
+            helper = "__hget_vivify"
+        }
+        let defExpr = entry["defaultExpr"]
+        let esc = ""
+        for c in name.split("") {
+            if !cIsAlnum(c) and c != "_" {
+                esc = esc + "\\"
+            }
+            esc = esc + c
+        }
+        if name[0] != "@" {
+            esc = "\\b" + esc
+        }
+        code = reReplace(code, esc + "\\[([^\\[\\]]*)\\]\\s*([-+*/])=\\s*(.+)$", name + "[$1] = " + helper + "(" + name + ", $1, " + defExpr + ") $2 ($3)")
+        code = reReplace(code, esc + "\\[([^\\[\\]]*)\\](?!\\s*=[^=])", helper + "(" + name + ", $1, " + defExpr + ")")
+    }
+    return code
+}
+
+let RB_SIMPLE_ASSIGN_RE = "^([A-Za-z_][A-Za-z0-9_]*)\\s*=(?!=)\\s*(.+)$"
+let RB_RESERVED_LOCALS = {"self": true, "this": true, "true": true, "false": true, "nil": true, "null": true,
+                          "let": true, "const": true, "return": true}
+
+# the name a method body's first assignment declares (as a `let`), or ""
+fn rbLocalDeclName(code, declared) {
+    let m = reMatch(code, RB_SIMPLE_ASSIGN_RE)
+    if m == nil {
+        return ""
+    }
+    let name = m[1]
+    # chained assignments: slow = fast = expr declares fast too
+    let rhs = m[2]
+    while true {
+        let mr = reMatch(rhs, RB_SIMPLE_ASSIGN_RE)
+        if mr == nil {
+            break
+        }
+        if !(mr[1] in RB_RESERVED_LOCALS) {
+            declared[mr[1]] = true
+        }
+        rhs = mr[2]
+    }
+    if name in declared or name in RB_RESERVED_LOCALS {
+        return ""
+    }
+    return name
+}
+
+let RB_MULTI_TARGET_RE = "^[A-Za-z_][A-Za-z0-9_]*(\\[[^\\]]*\\]|\\.[A-Za-z_][A-Za-z0-9_]*)*$"
+let RB_MULTI_ASSIGN_N = 0
+
+# `a, b = b, a` -> temporaries; the expanded lines, or nil
+fn rbTryMultiAssign(code) {
+    let eq = rbFindTopLevelAssign(code)
+    if eq == -1 {
+        return nil
+    }
+    for kw in [" if ", " unless ", " while ", " until "] {
+        if rbFindTopLevel(code, kw, 0) != -1 {
+            return nil
+        }
+    }
+    let targets = rbSplitTopLevel(trimCopy(code.slice(0, eq)), ",")
+    let values = rbSplitTopLevel(trimCopy(code.slice(eq + 1)), ",")
+    if len(targets) < 2 or len(targets) != len(values) {
+        return nil
+    }
+    for t in targets {
+        if !reFull(t, RB_MULTI_TARGET_RE) {
+            return nil
+        }
+    }
+    let tag = "__ma" + str(RB_MULTI_ASSIGN_N) + "_"
+    RB_MULTI_ASSIGN_N = RB_MULTI_ASSIGN_N + 1
+    let out = []
+    let k = 0
+    while k < len(values) {
+        out.push(tag + str(k) + " = " + values[k])
+        k = k + 1
+    }
+    k = 0
+    while k < len(targets) {
+        out.push(targets[k] + " = " + tag + str(k))
+        k = k + 1
+    }
+    return out
+}
+
+# mixed mode: `STMT while COND` is Ruby's loop modifier, not C
+fn rbIsRubyLoopModifier(stmt, cond) {
+    let st = trimCopy(stmt)
+    let cd = trimCopy(cond)
+    return st != "" and sLast(st) != ";" and !st.startsWith("do ") and st != "do" and cd != "" and cd[0] != "("
+}
+
+# mixed mode: `STMT if COND` is Ruby's modifier-if, not two C statements
+fn rbIsRubyIfModifier(stmt, cond) {
+    let st = trimCopy(stmt)
+    let cd = trimCopy(cond)
+    if st == "" or sLast(st) == ";" {
+        return false
+    }
+    if cd != "" and cd[0] == "(" {
+        let close = rbMatchBracket(cd, 0)
+        if close != -1 {
+            let rest = trimCopy(cd.slice(close + 1))
+            if rest != "" and rest != ";" {
+                return false
+            }
+        }
+    }
+    return true
+}
+
+# a bare `input` variable -> `__rb_input` in the code part of a line
+fn rbRenameBareInput(s) {
+    let out = []
+    let n = len(s)
+    let i = 0
+    while i < n {
+        let c = s[i]
+        if rbIsQuote(c) {
+            let j = rbSkipString(s, i)
+            out.push(s.slice(i, j))
+            i = j
+            continue
+        }
+        if c == "/" and i + 1 < n and (s[i + 1] == "/" or s[i + 1] == "*") {
+            out.push(s.slice(i))
+            break
+        }
+        if rbIsIdentStart(c) and (i == 0 or !rbIsIdentChar(s[i - 1])) {
+            let j = i
+            while j < n and rbIsIdentChar(s[j]) {
+                j = j + 1
+            }
+            let ident = s.slice(i, j)
+            let k = j
+            while k < n and (s[k] == " " or s[k] == "\t") {
+                k = k + 1
+            }
+            let call = k < n and s[k] == "("
+            if ident == "input" and !call {
+                out.push("__rb_input")
+            } else {
+                out.push(ident)
+            }
+            i = j
+            continue
+        }
+        out.push(c)
+        i = i + 1
+    }
+    return out.join("")
+}
+
+# a `#` starting a trailing comment (after whitespace, outside strings)
+fn rbFindHashComment(s) {
+    if sFind(s, "#", 0) == -1 {
+        return -1
+    }
+    let n = len(s)
+    let i = 0
+    while i < n {
+        let c = s[i]
+        if rbIsQuote(c) {
+            i = rbSkipString(s, i)
+            continue
+        }
+        if c == "#" and i > 0 and (s[i - 1] == " " or s[i - 1] == "\t") {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+let RB_PREPROCESSOR_RE = "^#(include|define|undef|ifdef|ifndef|if|elif|else|endif|pragma|error|warning|line)\\b.*"
+
+fn rbIsPreprocessorLine(code) {
+    return reFull(code, RB_PREPROCESSOR_RE)
+}
+
+# the open triple-quote ("" outside one) after scanning `line`
+fn rbScanTripleQuotes(line, quote) {
+    # the state changes only at a triple quote
+    if quote == "" and sFind(line, sRepeat("\"", 3), 0) == -1 and sFind(line, sRepeat("'", 3), 0) == -1 {
+        return ""
+    }
+    if quote != "" and sFind(line, sRepeat(quote, 3), 0) == -1 {
+        return quote
+    }
+    let n = len(line)
+    let i = 0
+    while i < n {
+        if quote != "" {
+            if line.slice(i, i + 3) == sRepeat(quote, 3) {
+                quote = ""
+                i = i + 3
+            } else if line[i] == "\\" {
+                i = i + 2
+            } else {
+                i = i + 1
+            }
+            continue
+        }
+        let c = line[i]
+        if (c == "\"" or c == "'") and line.slice(i, i + 3) == sRepeat(c, 3) {
+            quote = c
+            i = i + 3
+            continue
+        }
+        if rbIsQuote(c) {
+            i = rbSkipString(line, i)
+            continue
+        }
+        if c == "#" {
+            break
+        }
+        i = i + 1
+    }
+    return quote
+}
+
+let RB_LAMBDA_BRACE_RE = "\\b(?:lambda|proc|async)\\s*\\{\\s*\\|([^|]*)\\|"
+let RB_LAMBDA_PIPE_RE = "\\blambda\\s*\\|([^|]*)\\|\\s*\\{"
+let RB_STABBY_RE = "(^|[=,(>:]\\s*)->\\s*\\(([^()]*)\\)\\s*\\{"
+let RB_ANON_DEF_RE = "\\bdef\\s*\\(([^()]*)\\)\\s*:\\s*(.+)$"
+let RB_METHOD_BLOCK_RE = "\\.([A-Za-z_][A-Za-z0-9_]*[?!]?)(\\([^()]*\\))?\\s*\\{\\s*\\|([^|]*)\\|"
+
+# a closure body that is one expression returns it
+fn rbReturnBody(body) {
+    if rbLooksLikeReturnable(body) and rbFindTopLevel(body, ";", 0) == -1 {
+        return "return " + body
+    }
+    return body
+}
+
+# mixed mode: inline Ruby closure literals -> fn(...) { ... }
+fn rbConvertClosureLiterals(line) {
+    let m = nil
+    if rbHas(line, "def") {
+        m = reSearch(line, RB_ANON_DEF_RE)
+    }
+    if m != nil {
+        let body = trimCopy(reSG(m, 2))
+        let after = ""
+        if sLast(body) == "," {
+            body = body.slice(0, len(body) - 1)
+            after = ","
+        }
+        if rbLooksLikeReturnable(body) {
+            body = "return " + body
+        }
+        line = line.slice(0, m[0]) + "fn(" + trimCopy(reSG(m, 1)) + ") { " + trimCopy(body) + " }" + after
+    }
+    let guard = 0
+    while guard < 8 and (rbHas(line, "lambda") or rbHas(line, "proc") or rbHas(line, "async") or rbHas(line, "->")) {
+        let start = 0
+        let open = 0
+        let bodyStart = 0
+        let params = ""
+        let mb = reSearch(line, RB_LAMBDA_BRACE_RE)
+        if mb != nil {
+            start = mb[0]
+            open = sFind(line, "{", start)
+            bodyStart = mb[0] + mb[1]
+            params = reSG(mb, 1)
+        } else {
+            mb = reSearch(line, RB_LAMBDA_PIPE_RE)
+            if mb != nil {
+                start = mb[0]
+                open = mb[0] + mb[1] - 1
+                bodyStart = open + 1
+                params = reSG(mb, 1)
+            } else {
+                mb = reSearch(line, RB_STABBY_RE)
+                if mb == nil {
+                    break
+                }
+                start = mb[0] + len(reSG(mb, 1))
+                open = mb[0] + mb[1] - 1
+                bodyStart = open + 1
+                params = reSG(mb, 2)
+            }
+        }
+        let close = rbMatchBracket(line, open)
+        if close == -1 {
+            break
+        }
+        let body = rbReturnBody(trimCopy(line.slice(bodyStart, close)))
+        line = line.slice(0, start) + "fn(" + trimCopy(params) + ") { " + body + " }" + line.slice(close + 1)
+        guard = guard + 1
+    }
+    let scanFrom = 0
+    guard = 0
+    while guard < 8 and rbHas(line, "|") {
+        let rest = line.slice(scanFrom)
+        let mm = reSearch(rest, RB_METHOD_BLOCK_RE)
+        if mm == nil {
+            break
+        }
+        let start = scanFrom + mm[0]
+        # only a block nested inside call parens or brackets
+        let depth = 0
+        let k = 0
+        while k < start {
+            if rbIsQuote(line[k]) {
+                k = rbSkipString(line, k)
+                continue
+            }
+            if line[k] == "(" or line[k] == "[" {
+                depth = depth + 1
+            } else if line[k] == ")" or line[k] == "]" {
+                depth = depth - 1
+            }
+            k = k + 1
+        }
+        let open = sFind(line, "{", start + 1 + len(reSG(mm, 1)) + len(reSG(mm, 2)))
+        let close = rbMatchBracket(line, open)
+        if depth <= 0 or close == -1 {
+            scanFrom = start + 1
+            guard = guard + 1
+            continue
+        }
+        let bodyStart = start + mm[1]
+        let body = rbReturnBody(trimCopy(line.slice(bodyStart, close)))
+        let closure = "fn(" + trimCopy(reSG(mm, 3)) + ") { " + body + " }"
+        let args = reSG(mm, 2)
+        let call = ""
+        if args == "" {
+            call = "(" + closure + ")"
+        } else {
+            call = args.slice(0, len(args) - 1)
+            if len(args) > 2 {
+                call = call + ", "
+            }
+            call = call + closure + ")"
+        }
+        line = line.slice(0, start) + "." + reSG(mm, 1) + call + line.slice(close + 1)
+        scanFrom = start + 1
+        guard = guard + 1
+    }
+    return line
+}
+
+# mixed mode: `'+' => v` / `1 => v` (a literal key) -> `key: v`
+fn rbConvertLiteralKeyRockets(line) {
+    if sFind(line, "=>", 0) == -1 {
+        return line
+    }
+    let out = []
+    let n = len(line)
+    let i = 0
+    while i < n {
+        let litEnd = -1
+        let c = line[i]
+        if rbIsQuote(c) and c != "`" {
+            litEnd = rbSkipString(line, i)
+        } else if cIsDigit(c) and (i == 0 or !rbIsIdentChar(line[i - 1])) {
+            litEnd = i
+            while litEnd < n and (cIsDigit(line[litEnd]) or line[litEnd] == ".") {
+                litEnd = litEnd + 1
+            }
+        } else if rbIsQuote(c) {
+            let end = rbSkipString(line, i)
+            out.push(line.slice(i, end))
+            i = end
+            continue
+        }
+        if litEnd == -1 {
+            out.push(c)
+            i = i + 1
+            continue
+        }
+        out.push(line.slice(i, litEnd))
+        let j = litEnd
+        while j < n and (line[j] == " " or line[j] == "\t") {
+            j = j + 1
+        }
+        if line.slice(j, j + 2) == "=>" {
+            out.push(":")
+            i = j + 2
+        } else {
+            i = litEnd
+        }
+    }
+    return out.join("")
+}

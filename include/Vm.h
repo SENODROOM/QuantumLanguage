@@ -120,6 +120,15 @@ public:
 
     // Execute a compiled chunk (top-level script).
     void run(std::shared_ptr<Chunk> chunk);
+    // Lifts the instruction budget (MAX_STEPS) for a trusted program, such
+    // as the self-hosted compiler run from its bytecode (qrun --exec).
+    void unlimitedSteps() { maxSteps_ = INT64_MAX; }
+    // Calls a global function of the program run() loaded (the self-hosted
+    // compiler's entry points, src/HostedCompiler.cpp).
+    QuantumValue callGlobal(const std::string &name, const std::vector<QuantumValue> &args)
+    {
+        return invokeCallable(globals->get(name), args);
+    }
 
     // Expose globals so the REPL can persist state across calls.
     std::shared_ptr<Environment> globals;

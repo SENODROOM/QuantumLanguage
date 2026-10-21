@@ -1,0 +1,98 @@
+# The Quantum compiler, written in Quantum. qrun runs it from its bytecode
+# (selfhost/compiler.qbc, embedded in the executable) through the two entry
+# points at the bottom; selfhost/qc.sa is a command-line front end to it.
+#
+# The pipeline for a program in the multi-syntax family (.sa .py .js .rb,
+# and C/C++ outside the typed front-end's subset):
+#   dialect.sa    source-to-source passes (C++ project structure, Ruby)
+#   lexer.sa      tokens
+#   parser*.sa    the AST (ast.sa)
+#   modules.sa    `# @use` modules inlined, on-disk `import`s resolved
+#   typecheck.sa  type-mismatch warnings
+#   codegen.sa    bytecode chunks
+#   serializer.sa the bytecode file format
+# @use "./modules.sa"
+# @use "./typecheck.sa"
+# @use "./codegen.sa"
+# @use "./serializer.sa"
+
+# Compiles program text already through the dialect passes to a chunk.
+fn compileDialected(source, path) {
+    let python = fileExtLower(path) == ".py"
+    let ast = parseProgram(lexTokenize(source), python)
+    # a Python program prints Python's way (True / None / 'str' in lists)
+    if python {
+        ast["statements"].insert(0, nExprStmt(nCall(nIdent("__python_repr__", 0), [], 0), 0))
+    }
+    resolveUseDirectives(ast, source, path)
+    resolveImports(ast, path)
+    typeCheck(ast)
+    return compileProgram(ast)
+}
+
+# Compiles program text (as read from `path`) to a chunk; `dialect` false
+# skips the dialect passes (all but the byte-order-mark strip).
+fn compileSourceText(source, path, dialect) {
+    if dialect {
+        return compileDialected(applyDialect(source, path), path)
+    }
+    return compileDialected(modStripBom(source), path)
+}
+
+# a compiler error as {"kind", "message", "line", "col"}: ParseError,
+# LexError, Fatal, or InternalError for a fault in the compiler itself
+fn hcError(e) {
+    if typeof(e) == "object" and "kind" in e {
+        return e
+    }
+    return {"kind": "InternalError", "message": str(e), "line": 0, "col": 0}
+}
+
+# Entry point for qrun: {"ok": true, "bytes", "compiled"} or {"ok": false,
+# "kind", "message", "line", "col", "compiled"}, where "compiled" is the
+# program text after the dialect passes (error reports quote its lines).
+fn hostedCompile(source, path, dialect) {
+    let compiled = source
+    try {
+        if dialect {
+            compiled = applyDialect(source, path)
+        } else {
+            compiled = modStripBom(source)
+        }
+        let chunk = compileDialected(compiled, path)
+        return {"ok": true, "bytes": serialize(chunk), "compiled": compiled}
+    } catch (e) {
+        let r = hcError(e)
+        r["ok"] = false
+        r["compiled"] = compiled
+        return r
+    }
+}
+
+# Entry point for `qrun --check`: the dialect passes, the parse and the type
+# warnings, without module resolution or code generation.
+fn hostedCheck(source, path) {
+    let compiled = source
+    try {
+        compiled = applyDialect(source, path)
+        typeCheck(parseProgram(lexTokenize(compiled), false))
+        return {"ok": true, "compiled": compiled}
+    } catch (e) {
+        let r = hcError(e)
+        r["ok"] = false
+        r["compiled"] = compiled
+        return r
+    }
+}
+
+# Entry point for the C/C++ and Java front-ends: code generation for the
+# AST they built (as ast.sa nodes). {"ok", "bytes"} or an error.
+fn hostedCompileAst(ast) {
+    try {
+        return {"ok": true, "bytes": serialize(compileProgram(ast))}
+    } catch (e) {
+        let r = hcError(e)
+        r["ok"] = false
+        return r
+    }
+}
