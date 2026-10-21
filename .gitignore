@@ -65,3 +65,8 @@ CLAUDE.md
 /test_copy.txt
 /test_output.txt
 /test_output.txt.backup.*
+*.txt
+# Alternate out-of-tree build
+build_new/
+build_new_log.txt
+!/CMakeLists.txt
