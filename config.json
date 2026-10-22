@@ -1,0 +1,6 @@
+{
+  "app_name": "Quantum Language",
+  "version": "1.0.0",
+  "settings": { "debug": true, "max_connections": 100, "timeout": 30 },
+  "features": ["interpreter", "compiler", "debugger"]
+}

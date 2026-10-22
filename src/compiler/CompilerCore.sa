@@ -360,52 +360,48 @@ void Compiler::endLoop() {
 
 void Compiler::compileNode(ASTNode &node) {
   int ln = node.line;
-  std::visit(
-      [&](auto &n) {
-        using T = std::decay_t<decltype(n)>;
-        if constexpr (std::is_same_v<T, BlockStmt>)
-          compileBlock(n);
-        else if constexpr (std::is_same_v<T, VarDecl>)
-          compileVarDecl(n, ln);
-        else if constexpr (std::is_same_v<T, FunctionDecl>)
-          compileFunctionDecl(n, ln);
-        else if constexpr (std::is_same_v<T, ClassDecl>)
-          compileClassDecl(n, ln);
-        else if constexpr (std::is_same_v<T, IfStmt>)
-          compileIf(n, ln);
-        else if constexpr (std::is_same_v<T, WhileStmt>)
-          compileWhile(n, ln);
-        else if constexpr (std::is_same_v<T, ForStmt>)
-          compileFor(n, ln);
-        else if constexpr (std::is_same_v<T, ReturnStmt>)
-          compileReturn(n, ln);
-        else if constexpr (std::is_same_v<T, PrintStmt>)
-          compilePrint(n, ln);
-        else if constexpr (std::is_same_v<T, InputStmt>)
-          compileInput(n, ln);
-        else if constexpr (std::is_same_v<T, TryStmt>)
-          compileTry(n, ln);
-        else if constexpr (std::is_same_v<T, RaiseStmt>)
-          compileRaise(n, ln);
-        else if constexpr (std::is_same_v<T, BreakStmt>)
-          emitBreak(ln);
-        else if constexpr (std::is_same_v<T, ContinueStmt>)
-          emitContinue(ln);
-        else if constexpr (std::is_same_v<T, ImportStmt>)
-          compileImport(n, ln);
-        else if constexpr (std::is_same_v<T, GlobalStmt>) {
-          // scoping only — read by compileFunction's local analysis
-        }
-        else if constexpr (std::is_same_v<T, ExprStmt>) {
-          compileExpr(*n.expr);
-          if (!n.expr->template is<ReturnStmt>())
-            emit(Op::POP, 0, ln);
-        } else {
-          compileExpr(node);
-          emit(Op::POP, 0, ln);
-        }
-      },
-      node.node);
+  // One get_if per node kind (a std::visit with a generic lambda would do the
+  // same; this form is also what the self-hosting front-end can type).
+  if (auto *p = std::get_if<BlockStmt>(&node.node)) {
+    compileBlock(*p);
+  } else if (auto *p = std::get_if<VarDecl>(&node.node)) {
+    compileVarDecl(*p, ln);
+  } else if (auto *p = std::get_if<FunctionDecl>(&node.node)) {
+    compileFunctionDecl(*p, ln);
+  } else if (auto *p = std::get_if<ClassDecl>(&node.node)) {
+    compileClassDecl(*p, ln);
+  } else if (auto *p = std::get_if<IfStmt>(&node.node)) {
+    compileIf(*p, ln);
+  } else if (auto *p = std::get_if<WhileStmt>(&node.node)) {
+    compileWhile(*p, ln);
+  } else if (auto *p = std::get_if<ForStmt>(&node.node)) {
+    compileFor(*p, ln);
+  } else if (auto *p = std::get_if<ReturnStmt>(&node.node)) {
+    compileReturn(*p, ln);
+  } else if (auto *p = std::get_if<PrintStmt>(&node.node)) {
+    compilePrint(*p, ln);
+  } else if (auto *p = std::get_if<InputStmt>(&node.node)) {
+    compileInput(*p, ln);
+  } else if (auto *p = std::get_if<TryStmt>(&node.node)) {
+    compileTry(*p, ln);
+  } else if (auto *p = std::get_if<RaiseStmt>(&node.node)) {
+    compileRaise(*p, ln);
+  } else if (std::holds_alternative<BreakStmt>(node.node)) {
+    emitBreak(ln);
+  } else if (std::holds_alternative<ContinueStmt>(node.node)) {
+    emitContinue(ln);
+  } else if (auto *p = std::get_if<ImportStmt>(&node.node)) {
+    compileImport(*p, ln);
+  } else if (std::holds_alternative<GlobalStmt>(node.node)) {
+    // scoping only — read by compileFunction's local analysis
+  } else if (auto *p = std::get_if<ExprStmt>(&node.node)) {
+    compileExpr(*p->expr);
+    if (!p->expr->is<ReturnStmt>())
+      emit(Op::POP, 0, ln);
+  } else {
+    compileExpr(node);
+    emit(Op::POP, 0, ln);
+  }
 }
 
 void Compiler::compileBlock(BlockStmt &b) {
@@ -429,66 +425,62 @@ void Compiler::compileBlock(BlockStmt &b) {
 
 void Compiler::compileExpr(ASTNode &node) {
   int ln = node.line;
-  std::visit(
-      [&](auto &n) {
-        using T = std::decay_t<decltype(n)>;
-        if constexpr (std::is_same_v<T, NumberLiteral>)
-          emit(Op::LOAD_CONST, addConst(QuantumValue(n.value)), ln);
-        else if constexpr (std::is_same_v<T, StringLiteral>)
-          emit(Op::LOAD_CONST, addConst(QuantumValue(n.value)), ln);
-        else if constexpr (std::is_same_v<T, BoolLiteral>)
-          emit(n.value ? Op::LOAD_TRUE : Op::LOAD_FALSE, 0, ln);
-        else if constexpr (std::is_same_v<T, NilLiteral>)
-          emit(Op::LOAD_NIL, 0, ln);
-        else if constexpr (std::is_same_v<T, Identifier>)
-          compileIdentifier(n, ln);
-        else if constexpr (std::is_same_v<T, BinaryExpr>)
-          compileBinary(n, ln);
-        else if constexpr (std::is_same_v<T, UnaryExpr>)
-          compileUnary(n, ln);
-        else if constexpr (std::is_same_v<T, AssignExpr>)
-          compileAssign(n, ln);
-        else if constexpr (std::is_same_v<T, CallExpr>)
-          compileCall(n, ln);
-        else if constexpr (std::is_same_v<T, IndexExpr>)
-          compileIndex(n, ln);
-        else if constexpr (std::is_same_v<T, SliceExpr>)
-          compileSlice(n, ln);
-        else if constexpr (std::is_same_v<T, MemberExpr>)
-          compileMember(n, ln);
-        else if constexpr (std::is_same_v<T, ArrayLiteral>)
-          compileArray(n, ln);
-        else if constexpr (std::is_same_v<T, DictLiteral>)
-          compileDict(n, ln);
-        else if constexpr (std::is_same_v<T, TupleLiteral>)
-          compileTuple(n, ln);
-        else if constexpr (std::is_same_v<T, LambdaExpr>)
-          compileLambda(n, ln);
-        else if constexpr (std::is_same_v<T, TernaryExpr>)
-          compileTernary(n, ln);
-        else if constexpr (std::is_same_v<T, ListComp>)
-          compileListComp(n, ln);
-        else if constexpr (std::is_same_v<T, SuperExpr>)
-          compileSuper(n, ln);
-        else if constexpr (std::is_same_v<T, NewExpr>)
-          compileNew(n, ln);
-        else if constexpr (std::is_same_v<T, AddressOfExpr>)
-          compileAddressOf(n, ln);
-        else if constexpr (std::is_same_v<T, DerefExpr>)
-          compileDeref(n, ln);
-        else if constexpr (std::is_same_v<T, ArrowExpr>)
-          compileArrow(n, ln);
-        else if constexpr (std::is_same_v<T, ReturnStmt>)
-          compileReturn(n, ln);
-        else if constexpr (std::is_same_v<T, RaiseStmt>) {
-          // A raise expression never produces its value; the nil only
-          // keeps the enclosing expression's stack shape balanced.
-          compileRaise(n, ln);
-          emit(Op::LOAD_NIL, 0, ln);
-        } else
-          throw std::runtime_error("Compiler: unhandled expression node");
-      },
-      node.node);
+  if (auto *p = std::get_if<NumberLiteral>(&node.node)) {
+    emit(Op::LOAD_CONST, addConst(QuantumValue(p->value)), ln);
+  } else if (auto *p = std::get_if<StringLiteral>(&node.node)) {
+    emit(Op::LOAD_CONST, addConst(QuantumValue(p->value)), ln);
+  } else if (auto *p = std::get_if<BoolLiteral>(&node.node)) {
+    emit(p->value ? Op::LOAD_TRUE : Op::LOAD_FALSE, 0, ln);
+  } else if (std::holds_alternative<NilLiteral>(node.node)) {
+    emit(Op::LOAD_NIL, 0, ln);
+  } else if (auto *p = std::get_if<Identifier>(&node.node)) {
+    compileIdentifier(*p, ln);
+  } else if (auto *p = std::get_if<BinaryExpr>(&node.node)) {
+    compileBinary(*p, ln);
+  } else if (auto *p = std::get_if<UnaryExpr>(&node.node)) {
+    compileUnary(*p, ln);
+  } else if (auto *p = std::get_if<AssignExpr>(&node.node)) {
+    compileAssign(*p, ln);
+  } else if (auto *p = std::get_if<CallExpr>(&node.node)) {
+    compileCall(*p, ln);
+  } else if (auto *p = std::get_if<IndexExpr>(&node.node)) {
+    compileIndex(*p, ln);
+  } else if (auto *p = std::get_if<SliceExpr>(&node.node)) {
+    compileSlice(*p, ln);
+  } else if (auto *p = std::get_if<MemberExpr>(&node.node)) {
+    compileMember(*p, ln);
+  } else if (auto *p = std::get_if<ArrayLiteral>(&node.node)) {
+    compileArray(*p, ln);
+  } else if (auto *p = std::get_if<DictLiteral>(&node.node)) {
+    compileDict(*p, ln);
+  } else if (auto *p = std::get_if<TupleLiteral>(&node.node)) {
+    compileTuple(*p, ln);
+  } else if (auto *p = std::get_if<LambdaExpr>(&node.node)) {
+    compileLambda(*p, ln);
+  } else if (auto *p = std::get_if<TernaryExpr>(&node.node)) {
+    compileTernary(*p, ln);
+  } else if (auto *p = std::get_if<ListComp>(&node.node)) {
+    compileListComp(*p, ln);
+  } else if (auto *p = std::get_if<SuperExpr>(&node.node)) {
+    compileSuper(*p, ln);
+  } else if (auto *p = std::get_if<NewExpr>(&node.node)) {
+    compileNew(*p, ln);
+  } else if (auto *p = std::get_if<AddressOfExpr>(&node.node)) {
+    compileAddressOf(*p, ln);
+  } else if (auto *p = std::get_if<DerefExpr>(&node.node)) {
+    compileDeref(*p, ln);
+  } else if (auto *p = std::get_if<ArrowExpr>(&node.node)) {
+    compileArrow(*p, ln);
+  } else if (auto *p = std::get_if<ReturnStmt>(&node.node)) {
+    compileReturn(*p, ln);
+  } else if (auto *p = std::get_if<RaiseStmt>(&node.node)) {
+    // A raise expression never produces its value; the nil only
+    // keeps the enclosing expression's stack shape balanced.
+    compileRaise(*p, ln);
+    emit(Op::LOAD_NIL, 0, ln);
+  } else {
+    throw std::runtime_error("Compiler: unhandled expression node");
+  }
 }
 
 // ─── Statements ──────────────────────────────────────────────────────────────

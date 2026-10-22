@@ -302,7 +302,7 @@ private:
             "&&", "||", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "##", ".*"};
         for (const char *p : puncts)
         {
-            size_t n = std::char_traits<char>::length(p);
+            size_t n = std::strlen(p);
             if (s_.compare(i_, n, p) == 0)
             {
                 t.kind = TK::Punct;
@@ -399,6 +399,7 @@ public:
         def("M_E", "2.71828182845904523536");
         def("M_SQRT2", "1.41421356237309504880");
         def("INFINITY", "(1.0/0.0)");
+        def("HUGE_VAL", "(1.0/0.0)");
         def("NAN", "(0.0/0.0)");
     }
 
@@ -614,6 +615,23 @@ private:
                 }
             }
             return; // <system> headers: the library is built in
+        }
+        // #pragma quantum tu "file": compile `file` as a translation unit of
+        // this program (a driver lists the implementation files that no header
+        // name leads to, e.g. Lexer.h -> lexer/LexerCore.cpp ...).
+        if (name == "pragma" && d.size() >= 4 && d[1].text == "quantum" && d[2].text == "tu" &&
+            d[3].kind == TK::String)
+        {
+            fs::path target = cppResolveInclude(d[3].value, path);
+            if (target.empty())
+                fail("#pragma quantum tu: file not found: " + d[3].value, hash);
+            std::string key = pathKey(target);
+            if (!queued_.count(key))
+            {
+                queued_.insert(key);
+                impls_.push_back(target);
+            }
+            return;
         }
         if (name == "error")
             fail("#error in source", hash);

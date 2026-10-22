@@ -241,6 +241,10 @@ private:
     // ── Upvalue helpers ───────────────────────────────────────────────────────
     std::shared_ptr<Upvalue> captureUpvalue(size_t stackIdx);
     void closeUpvalues(size_t fromIdx);
+    // Handler entry: pad the stack so the exception lands in the local slot the
+    // handler's first instruction (DEFINE_LOCAL) names. Locals declared in the
+    // try body that were never reached are nil.
+    void padForHandler(const ExceptionHandler &h);
     // Inserts below the top of the stack, keeping open upvalues on the
     // shifted slots attached to their variables.
     void insertOnStack(size_t pos, QuantumValue v);

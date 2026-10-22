@@ -35,104 +35,141 @@ static std::string quoteForDisplay(const std::string &s)
 
 bool QuantumValue::isTruthy() const
 {
-    return std::visit([](const auto &v) -> bool
-                      {
-        using T = std::decay_t<decltype(v)>;
-        if constexpr (std::is_same_v<T, QuantumNil>)    return false;
-        if constexpr (std::is_same_v<T, bool>)          return v;
-        if constexpr (std::is_same_v<T, double>)        return v != 0.0;
-        if constexpr (std::is_same_v<T, std::string>)   return !v.empty() && !(v.size() == 1 && v[0] == '\0');
-        if constexpr (std::is_same_v<T, std::shared_ptr<Array>>) return !v->empty();
-        if constexpr (std::is_same_v<T, std::shared_ptr<QuantumPointer>>) return v && !v->isNull();
-        return true; }, data);
+    if (std::holds_alternative<QuantumNil>(data))
+        return false;
+    if (auto *v = std::get_if<bool>(&data))
+        return *v;
+    if (auto *v = std::get_if<double>(&data))
+        return *v != 0.0;
+    if (auto *v = std::get_if<std::string>(&data))
+        return !v->empty() && !(v->size() == 1 && (*v)[0] == '\0');
+    if (auto *v = std::get_if<std::shared_ptr<Array>>(&data))
+        return !(*v)->empty();
+    if (auto *v = std::get_if<std::shared_ptr<QuantumPointer>>(&data))
+        return *v && !(*v)->isNull();
+    return true;
 }
 
 std::string QuantumValue::toString() const
 {
-    return std::visit([](const auto &v) -> std::string
-                      {
-        using T = std::decay_t<decltype(v)>;
-        if constexpr (std::is_same_v<T, QuantumNil>)  return g_pythonRepr ? "None" : "nil";
-        if constexpr (std::is_same_v<T, bool>)
-            return g_pythonRepr ? (v ? "True" : "False") : (v ? "true" : "false");
-        if constexpr (std::is_same_v<T, double>) {
-            if (std::floor(v) == v && std::abs(v) < 1e15)
-                return std::to_string((long long)v);
-            std::ostringstream oss;
-            oss << std::setprecision(10) << v;
-            return oss.str();
+    if (std::holds_alternative<QuantumNil>(data))
+        return g_pythonRepr ? "None" : "nil";
+    if (auto *b = std::get_if<bool>(&data))
+        return g_pythonRepr ? (*b ? "True" : "False") : (*b ? "true" : "false");
+    if (auto *d = std::get_if<double>(&data))
+    {
+        double v = *d;
+        if (std::floor(v) == v && std::abs(v) < 1e15)
+            return std::to_string((long long)v);
+        std::ostringstream oss;
+        oss << std::setprecision(10) << v;
+        return oss.str();
+    }
+    if (auto *s = std::get_if<std::string>(&data))
+        return *s;
+    if (auto *a = std::get_if<std::shared_ptr<Array>>(&data))
+    {
+        const auto &v = *a;
+        std::string s = "[";
+        for (size_t i = 0; i < v->size(); i++)
+        {
+            if (i)
+                s += ", ";
+            if ((*v)[i].isString())
+                s += quoteForDisplay((*v)[i].asString());
+            else
+                s += (*v)[i].toString();
         }
-        if constexpr (std::is_same_v<T, std::string>) return v;
-        if constexpr (std::is_same_v<T, std::shared_ptr<Array>>) {
-            std::string s = "[";
-            for (size_t i = 0; i < v->size(); i++) {
-                if (i) s += ", ";
-                if ((*v)[i].isString()) s += quoteForDisplay((*v)[i].asString());
-                else s += (*v)[i].toString();
+        return s + "]";
+    }
+    if (auto *dd = std::get_if<std::shared_ptr<Dict>>(&data))
+    {
+        const auto &v = *dd;
+        bool special = false;
+        std::string shown = jsDisplayString(v, special); // Date, URL, ...
+        if (special)
+            return shown;
+        std::string s = "{";
+        bool first = true;
+        for (auto &[k, val] : *v)
+        {
+            if (!first)
+                s += ", ";
+            s += quoteForDisplay(k) + ": ";
+            if (val.isString())
+                s += quoteForDisplay(val.asString());
+            else
+                s += val.toString();
+            first = false;
+        }
+        return s + "}";
+    }
+    if (auto *c = std::get_if<std::shared_ptr<Closure>>(&data))
+        return "<fn:" + (*c)->name + ">";
+    if (auto *n = std::get_if<std::shared_ptr<QuantumNative>>(&data))
+        return "<native:" + (*n)->name + ">";
+    if (auto *i = std::get_if<std::shared_ptr<QuantumInstance>>(&data))
+    {
+        const auto &v = *i;
+        // Call __str__ if defined
+        auto k = v->klass.get();
+        while (k)
+        {
+            auto mit = k->methods.find("__str__");
+            if (mit != k->methods.end())
+            {
+                break;
             }
-            return s + "]";
+            k = k->base.get();
         }
-        if constexpr (std::is_same_v<T, std::shared_ptr<Dict>>) {
-            bool special = false;
-            std::string shown = jsDisplayString(v, special); // Date, URL, ...
-            if (special) return shown;
-            std::string s = "{";
-            bool first = true;
-            for (auto& [k, val] : *v) {
-                if (!first) s += ", ";
-                s += quoteForDisplay(k) + ": ";
-                if (val.isString()) s += quoteForDisplay(val.asString());
-                else s += val.toString();
-                first = false;
-            }
-            return s + "}";
-        }
-        if constexpr (std::is_same_v<T, std::shared_ptr<Closure>>) return "<fn:" + v->name + ">";
-        if constexpr (std::is_same_v<T, std::shared_ptr<QuantumNative>>)   return "<native:" + v->name + ">";
-        if constexpr (std::is_same_v<T, std::shared_ptr<QuantumInstance>>) {
-            // Call __str__ if defined
-            auto k = v->klass.get();
-            while (k) {
-                auto mit = k->methods.find("__str__");
-                if (mit != k->methods.end()) {
-                    break;
-                }
-                k = k->base.get();
-            }
-            return "<instance:" + v->klass->name + ">";
-        }
-        if constexpr (std::is_same_v<T, std::shared_ptr<QuantumClass>>)    return "<class:" + v->name + ">";
-        if constexpr (std::is_same_v<T, std::shared_ptr<QuantumBoundMethod>>) return "<bound method>";
-        if constexpr (std::is_same_v<T, std::shared_ptr<QuantumPointer>>) {
-            if (!v || v->isNull()) return "0x0";
-            // Show a deterministic fake address based on cell pointer value
-            // so repeated prints of the same pointer give the same address
-            std::ostringstream oss;
-            oss << "0x" << std::hex << std::uppercase
-                << (reinterpret_cast<uintptr_t>(v->cell.get()) + (size_t)v->offset * 8);
-            return oss.str();
-        }
-        return "?"; }, data);
+        return "<instance:" + v->klass->name + ">";
+    }
+    if (auto *k = std::get_if<std::shared_ptr<QuantumClass>>(&data))
+        return "<class:" + (*k)->name + ">";
+    if (std::holds_alternative<std::shared_ptr<QuantumBoundMethod>>(data))
+        return "<bound method>";
+    if (auto *pp = std::get_if<std::shared_ptr<QuantumPointer>>(&data))
+    {
+        const auto &v = *pp;
+        if (!v || v->isNull())
+            return "0x0";
+        // Show a deterministic fake address based on cell pointer value
+        // so repeated prints of the same pointer give the same address
+        std::ostringstream oss;
+        oss << "0x" << std::hex << std::uppercase
+            << (reinterpret_cast<uintptr_t>(v->cell.get()) + (size_t)v->offset * 8);
+        return oss.str();
+    }
+    return "?";
 }
 
 std::string QuantumValue::typeName() const
 {
-    return std::visit([](const auto &v) -> std::string
-                      {
-        using T = std::decay_t<decltype(v)>;
-        if constexpr (std::is_same_v<T, QuantumNil>)   return "nil";
-        if constexpr (std::is_same_v<T, bool>)         return "bool";
-        if constexpr (std::is_same_v<T, double>)       return "number";
-        if constexpr (std::is_same_v<T, std::string>)  return "string";
-        if constexpr (std::is_same_v<T, std::shared_ptr<Array>>)           return "array";
-        if constexpr (std::is_same_v<T, std::shared_ptr<Dict>>)            return "dict";
-        if constexpr (std::is_same_v<T, std::shared_ptr<Closure>>)         return "function";
-        if constexpr (std::is_same_v<T, std::shared_ptr<QuantumNative>>)   return "native";
-        if constexpr (std::is_same_v<T, std::shared_ptr<QuantumInstance>>) return v->klass->name;
-        if constexpr (std::is_same_v<T, std::shared_ptr<QuantumClass>>)    return "class";
-        if constexpr (std::is_same_v<T, std::shared_ptr<QuantumBoundMethod>>) return "method";
-        if constexpr (std::is_same_v<T, std::shared_ptr<QuantumPointer>>)  return "pointer";
-        return "unknown"; }, data);
+    if (std::holds_alternative<QuantumNil>(data))
+        return "nil";
+    if (std::holds_alternative<bool>(data))
+        return "bool";
+    if (std::holds_alternative<double>(data))
+        return "number";
+    if (std::holds_alternative<std::string>(data))
+        return "string";
+    if (std::holds_alternative<std::shared_ptr<Array>>(data))
+        return "array";
+    if (std::holds_alternative<std::shared_ptr<Dict>>(data))
+        return "dict";
+    if (std::holds_alternative<std::shared_ptr<Closure>>(data))
+        return "function";
+    if (std::holds_alternative<std::shared_ptr<QuantumNative>>(data))
+        return "native";
+    if (auto *i = std::get_if<std::shared_ptr<QuantumInstance>>(&data))
+        return (*i)->klass->name;
+    if (std::holds_alternative<std::shared_ptr<QuantumClass>>(data))
+        return "class";
+    if (std::holds_alternative<std::shared_ptr<QuantumBoundMethod>>(data))
+        return "method";
+    if (std::holds_alternative<std::shared_ptr<QuantumPointer>>(data))
+        return "pointer";
+    return "unknown";
 }
 
 // ─── Environment ─────────────────────────────────────────────────────────────
@@ -256,3 +293,10 @@ std::shared_ptr<QuantumNative> QuantumValue::asNative() const
         throw RuntimeError("Value is not a native function");
     return std::get<std::shared_ptr<QuantumNative>>(data);
 }
+#ifndef QUANTUM_SELFHOST
+void QuantumValue::badAccess(const char *want) const
+{
+    throw std::runtime_error(std::string("internal: expected a ") + want + " but the value is " + typeName() + " (" +
+                             toString() + ")");
+}
+#endif

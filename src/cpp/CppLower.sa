@@ -330,7 +330,10 @@ Scope *Lowerer::newScope(const std::string &qname, Scope *parent)
 
 void Lowerer::unsupported(const std::string &msg, int line)
 {
-    throw Unsupported(msg, "", line ? line : line_);
+    std::string file;
+    if (curFile_ >= 0 && curFile_ < (int)prog_.files.size())
+        file = prog_.files[curFile_];
+    throw Unsupported(msg, file, line ? line : line_);
 }
 
 std::string Lowerer::tempName() { return "__t" + std::to_string(++tempCounter_); }
@@ -688,6 +691,9 @@ TP Lowerer::builtinType(const TypeName &tn, Scope *sc, bool &ok)
     bool isStdQual = !n.empty() && n[0] == "std";
     if (isStdQual)
         n.erase(n.begin());
+    // std::filesystem::path -> path (types are matched by their last name)
+    if (isStdQual && n.size() == 2 && n[0] == "filesystem")
+        n.erase(n.begin());
     if (n.size() != 1)
     {
         // std::vector<int>::iterator, std::string::size_type, Cls::type
@@ -753,7 +759,7 @@ TP Lowerer::builtinType(const TypeName &tn, Scope *sc, bool &ok)
     if (w == "short" || w == "int" || w == "long" || w == "int16_t" || w == "int32_t" || w == "intptr_t" ||
         w == "ptrdiff_t" || w == "ssize_t")
         return intT(w == "int32_t" ? "int" : w.c_str(), false);
-    if (w == "long long" || w == "int64_t" || w == "intmax_t" || w == "streamsize" || w == "time_t" ||
+    if (w == "long long" || w == "int64_t" || w == "intmax_t" || w == "streamsize" || w == "streamoff" || w == "time_t" ||
         w == "clock_t")
         return intT("long long", false);
     if (w == "unsigned short" || w == "uint16_t")
@@ -789,6 +795,30 @@ TP Lowerer::builtinType(const TypeName &tn, Scope *sc, bool &ok)
     }
     if (w == "string" || w == "wstring" || w == "string_view")
         return tStr();
+    // std::filesystem: a path is a string tagged "path" (its operations are
+    // the __cpp_fs__ native); a directory_entry is the path it names
+    if (isStdQual && (w == "path" || w == "directory_entry"))
+        return mkT(T::Str, "path");
+    if (isStdQual && (w == "directory_iterator" || w == "recursive_directory_iterator"))
+    {
+        auto t = mkT(T::Vector, "vector");
+        t->a.push_back(mkT(T::Str, "path"));
+        return t;
+    }
+    if (isStdQual && w == "file_time_type")
+        return intT("long long", false);
+    if (isStdQual && (w == "copy_options" || w == "directory_options" || w == "perms" || w == "file_type"))
+        return intT("int", false);
+    if (isStdQual && w == "error_code")
+        return mkT(T::Dyn, "error_code");
+    // std::regex: the pattern, as a string; std::smatch: the array built by
+    // __cpp_re__ ([pos, len, source, group0, group1, ...], nil = no match)
+    if (isStdQual && (w == "regex" || w == "basic_regex"))
+        return mkT(T::Str, "regex");
+    if (isStdQual && (w == "smatch" || w == "cmatch"))
+        return mkT(T::Dyn, "smatch");
+    if (isStdQual && (w == "ssub_match" || w == "sub_match"))
+        return mkT(T::Str, "submatch");
     if (w == "vector" || w == "deque" || w == "list" || w == "forward_list" || w == "stack" || w == "queue" ||
         w == "priority_queue" || w == "initializer_list" || w == "valarray")
     {
@@ -1174,6 +1204,12 @@ void Lowerer::resolveFunc(FuncInfo *f)
         TP pt = resolveType(p.type, sc);
         f->params.push_back(pt);
         bool ref = (p.type->ref || p.type->rref) && !p.type->isConst;
+        // `T&&` of a template parameter T is a forwarding reference: the argument
+        // goes through as it is (objects are shared by reference already), not as a cell
+        if (p.type->rref && p.type->name.size() == 1 && p.type->pointers == 0)
+            for (const auto &tp : d->templateParams)
+                if (tp == p.type->name[0])
+                    ref = false;
         f->paramRef.push_back(ref);
         f->paramConstRef.push_back(p.type->ref && p.type->isConst);
         f->defaults.push_back(p.def);
@@ -1348,13 +1384,95 @@ ASTNodePtr Lowerer::run()
 
     // Lower: classes (ctors, methods), free functions. Lowering can add
     // entries (classes declared inside function bodies): index loops.
+    // QUANTUM_CPPFE_ALL=1 (diagnostics): keep going after an unsupported
+    // construct and report every one at the end, instead of only the first.
+    const bool collectAll = std::getenv("QUANTUM_CPPFE_ALL") != nullptr;
+    std::vector<std::string> gaps;
+    auto note = [&](const Unsupported &u)
+    {
+        std::string f = u.file.empty() || u.file == "?" ? "" : u.file;
+        size_t cut = f.find_last_of("/\\");
+        if (cut != std::string::npos)
+            f = f.substr(cut + 1);
+        gaps.push_back(f + ":" + std::to_string(u.line) + ": " + u.what());
+    };
     for (size_t i = 0; i < classOrder_.size(); ++i)
-        lowerClass(classOrder_[i]); // class templates once, with dynamic parameters
+    {
+        if (!collectAll)
+        {
+            lowerClass(classOrder_[i]); // class templates once, with dynamic parameters
+            continue;
+        }
+        try
+        {
+            lowerClass(classOrder_[i]);
+        }
+        catch (const Unsupported &u)
+        {
+            note(u);
+            fn_ = nullptr;
+        }
+    }
     for (size_t i = 0; i < allFuncs_.size(); ++i)
     {
         FuncInfo *f = allFuncs_[i];
-        if (!f->cls && f->def && !f->lowered)
+        if (!(!f->cls && f->def && !f->lowered))
+            continue;
+        if (f->isTemplate)
+        {
+            // generic lowering of a function template: a fallback, see lowerClass()
+            try
+            {
+                lowerFunction(f);
+            }
+            catch (const Unsupported &)
+            {
+                fn_ = nullptr;
+            }
+            continue;
+        }
+        if (!collectAll)
+        {
             lowerFunction(f);
+            continue;
+        }
+        try
+        {
+            lowerFunction(f);
+        }
+        catch (const Unsupported &u)
+        {
+            note(u);
+            fn_ = nullptr;
+        }
+    }
+    if (std::getenv("QUANTUM_DEBUG_CPPFE"))
+        std::cerr << "[cppfe] lowered: funcDecls=" << funcDecls_.size() << " allFuncs=" << allFuncs_.size()
+                  << " classes=" << classOrder_.size() << " topFns=" << topFns_.size() << std::endl;
+    // function templates instantiated with explicit arguments (instantiate())
+    for (size_t i = 0; i < pendingInst_.size(); ++i)
+    {
+        FuncInfo *inst = pendingInst_[i];
+        if (!collectAll)
+        {
+            lowerFunction(inst);
+            continue;
+        }
+        try
+        {
+            lowerFunction(inst);
+        }
+        catch (const Unsupported &u)
+        {
+            note(u);
+            fn_ = nullptr;
+        }
+    }
+    if (!gaps.empty())
+    {
+        for (const auto &g : gaps)
+            std::cerr << "[cppfe-gap] " << g << std::endl;
+        throw Unsupported(std::to_string(gaps.size()) + " unsupported construct(s) (see [cppfe-gap] lines)");
     }
 
     emitDescriptors();
@@ -1613,6 +1731,7 @@ void Lowerer::lowerFunction(FuncInfo *f)
     if (f->lowered || !f->def || f->isTemplate && false)
         return;
     f->lowered = true;
+    curFile_ = f->def->file;
     std::vector<std::string> params;
     ASTNodePtr body = lowerFunctionBody(f, params);
     topFns_.push_back(q::func(f->mangled, params, std::move(body), f->def->line));
@@ -1836,7 +1955,18 @@ void Lowerer::lowerClass(ClassInfo *c)
             lowerFunction(f);
     for (FuncInfo *f : c->methods)
         if (f->def && f->isTemplate)
-            lowerFunction(f);
+        {
+            // the generic lowering (T dynamic) only serves calls without explicit
+            // template arguments; calls with them use instantiate()
+            try
+            {
+                lowerFunction(f);
+            }
+            catch (const Unsupported &)
+            {
+                fn_ = nullptr;
+            }
+        }
 }
 
 void Lowerer::emitDescriptors()
@@ -2027,6 +2157,9 @@ void Lowerer::lowerVar(const VarDeclarator &v, bool isStatic, std::vector<ASTNod
     int ln = v.line;
     TypeNameP tn = v.type;
     TP t = resolveType(tn, fn_->scope);
+    // `auto *p = e`: the pointer type is the initializer's, like plain `auto`
+    if (tn->isAuto() && tn->pointers > 0 && v.init != VarDeclarator::None)
+        t = tDyn();
     std::vector<ExprP> args = v.args;
 
     // structured binding: auto [a, b] = e;  auto& [k, v] = e;
@@ -2166,6 +2299,34 @@ void Lowerer::lowerVar(const VarDeclarator &v, bool isStatic, std::vector<ASTNod
         Local &l = declareLocal(v.name, t);
         l.alias = true;
         l.aliasOf = a;
+        return;
+    }
+
+    // std::function<...> f = [&](...) { ... f(...) ... };  the name is visible
+    // inside its own lambda: declare it (nil) first, then assign the closure
+    if (v.init != VarDeclarator::None && t->k == T::Func && args.size() == 1 && args[0]->k == EK::Lambda)
+    {
+        Local *l0 = &declareLocal(v.name, t);
+        const std::string qn = l0->q;
+        const bool boxed0 = l0->boxed;
+        XV x = makeObjectFrom(t, args, v.init == VarDeclarator::Brace, ln);
+        ASTNodePtr closure = copyOf(std::move(x), ln);
+        pre_ = savedPre;
+        {
+            ASTNodePtr first = q::nil(ln);
+            if (boxed0)
+            {
+                std::vector<ASTNodePtr> e;
+                e.push_back(std::move(first));
+                first = q::arr(std::move(e), ln);
+            }
+            out.push_back(q::var(qn, std::move(first), ln));
+        }
+        for (auto &p : pre)
+            out.push_back(std::move(p));
+        Local *l1 = findLocal(v.name);
+        XV target = localXV(l1);
+        out.push_back(q::exprStmt(store(target, std::move(closure), ln), ln));
         return;
     }
 

@@ -70,3 +70,5 @@ CLAUDE.md
 build_new/
 build_new_log.txt
 !/CMakeLists.txt
+build_dev/
+build_dev_log.txt

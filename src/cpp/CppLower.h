@@ -281,11 +281,16 @@ public:
     ASTNodePtr streamKind(const TP &t);
     ASTNodePtr callFn(FuncInfo *f, std::vector<ExprP> &args, ASTNodePtr self, int line, bool virt);
     FuncInfo *pickOverload(const std::vector<FuncInfo *> &cands, std::vector<XV> &args, int line, bool hasSelf);
+    // f<targs>: a copy of the function template with its type parameters bound (explicit template arguments)
+    FuncInfo *instantiate(FuncInfo *f, const std::vector<TArg> &targs);
+    FuncInfo *instantiateWith(FuncInfo *f, const std::vector<TP> &tys);
+    FuncInfo *instantiateDeduced(FuncInfo *f, const std::vector<XV> &vals);
     ASTNodePtr userStreamOut(XV &stream, XV &val, int line, bool &handled);
     std::string tempName();
     TP elemType(const TP &t);
     TP deref(const TP &t);
     int line_ = 0;
+    int curFile_ = -1; // index into prog_.files of the function being lowered (diagnostics)
     FnCtx *fn_ = nullptr;
     std::vector<ASTNodePtr> *pre_ = nullptr; // hoisted temps of the current statement
     bool canHoist_ = false;
@@ -296,6 +301,8 @@ private:
     std::vector<std::unique_ptr<Scope>> scopes_;
     std::vector<std::unique_ptr<ClassInfo>> classes_;
     std::vector<std::unique_ptr<FuncInfo>> funcs_;
+    std::map<std::string, FuncInfo *> instances_; // instantiate() cache
+    std::vector<FuncInfo *> pendingInst_;         // instances still to be lowered
     std::vector<std::unique_ptr<EnumInfo>> enums_;
     std::vector<ClassInfo *> classOrder_;
     std::vector<std::pair<DeclP, Scope *>> globalsInOrder_;

@@ -9,6 +9,7 @@
 //   stream        dict {"__stream": kind, ...state}
 #include "Vm.h"
 #include "Error.h"
+#include "HostBridge.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -18,11 +19,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
 #include <memory>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -30,6 +33,8 @@
 
 extern std::vector<std::string> g_scriptArgv;
 extern bool g_testMode;
+std::string getExecutablePath(); // src/cli/Bundler
+static int g_hostLastExit = 0;
 
 namespace
 {
@@ -37,7 +42,14 @@ using QV = QuantumValue;
 using ArrP = std::shared_ptr<Array>;
 using DictP = std::shared_ptr<Dict>;
 
-QV arg(const std::vector<QV> &a, size_t i) { return i < a.size() ? a[i] : QV(); }
+// Natives get their arguments by reference: a string argument can be the whole
+// source text, and copying it for every character access made the compiler's
+// own scanning quadratic.
+const QV &arg(const std::vector<QV> &a, size_t i)
+{
+    static const QV nil;
+    return i < a.size() ? a[i] : nil;
+}
 double num(const QV &v)
 {
     if (v.isNumber())
@@ -59,13 +71,18 @@ QV B(bool b) { return QV(b); }
 ArrP newArr(size_t n = 0) { return std::make_shared<Array>(n); }
 QV A(ArrP a) { return QV(std::move(a)); }
 QV A(std::initializer_list<QV> l) { return QV(std::make_shared<Array>(l)); }
-std::string str(const QV &v)
+// The text of a value. Strings come back by reference (no copy); other values
+// are converted into one of a few rotating scratch strings, so a handful of
+// str() calls can be live in one expression.
+const std::string &str(const QV &v)
 {
     if (v.isString())
-        return v.asString();
-    if (v.isNil())
-        return "";
-    return v.toString();
+        return v.asStringRef();
+    static std::string scratch[8];
+    static unsigned next = 0;
+    std::string &out = scratch[next++ & 7];
+    out = v.isNil() ? std::string() : v.toString();
+    return out;
 }
 
 const double NPOS = 18446744073709551615.0;
@@ -1013,6 +1030,338 @@ void VM::registerCppNatives()
     reg("__cpp_clock__", [](std::vector<QV>) -> QV { return N((double)std::clock()); });
     reg("__cpp_system__", [](std::vector<QV> a) -> QV { std::cout.flush(); return N(std::system(str(arg(a, 0)).c_str())); });
 
+    reg("__cpp_getenv__", [](std::vector<QV> a) -> QV
+        {
+        const char *v = std::getenv(str(arg(a, 0)).c_str());
+        return v ? S(v) : QV(); });
+
+    // ── host intrinsics for the self-hosted compiler (include/HostBridge.h) ──
+    reg("__host_exe_path__", [](std::vector<QV>) -> QV { return S(getExecutablePath()); });
+    reg("__host_spawn__", [](std::vector<QV> a) -> QV { return N(hostSpawn(str(arg(a, 0)))); });
+    reg("__host_capture__", [](std::vector<QV> a) -> QV
+        {
+        int code = 0;
+        std::string out = hostCapture(str(arg(a, 0)), code);
+        g_hostLastExit = code;
+        return S(out); });
+    reg("__host_last_exit__", [](std::vector<QV>) -> QV { return N(g_hostLastExit); });
+    reg("__host_time_str__", [](std::vector<QV>) -> QV
+        {
+        std::time_t t = std::time(nullptr);
+        std::tm tmv{};
+#ifdef _WIN32
+        localtime_s(&tmv, &t);
+#else
+        localtime_r(&t, &tmv);
+#endif
+        char buf[64];
+        std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tmv);
+        return S(buf); });
+    reg("__host_append_bytes__", [](std::vector<QV> a) -> QV
+        {
+        std::vector<uint8_t> bytes;
+        if (arg(a, 1).isArray())
+            for (const QV &b : *arg(a, 1).asArray())
+                bytes.push_back((uint8_t)(int)num(b));
+        return B(hostAppendBytes(str(arg(a, 0)), bytes)); });
+    reg("__host_f64_bytes__", [](std::vector<QV> a) -> QV
+        {
+        double d = num(arg(a, 0));
+        uint8_t raw[8];
+        std::memcpy(raw, &d, 8);
+        auto out = newArr();
+        for (int i = 0; i < 8; ++i)
+            out->push_back(N(raw[i]));
+        return A(out); });
+    reg("__host_f64_from__", [](std::vector<QV> a) -> QV
+        {
+        uint8_t raw[8] = {0};
+        size_t off = (size_t)num(arg(a, 1));
+        if (arg(a, 0).isArray())
+        {
+            const Array &v = *arg(a, 0).asArray();
+            for (size_t i = 0; i < 8 && off + i < v.size(); ++i)
+                raw[i] = (uint8_t)(int)num(v[off + i]);
+        }
+        double d;
+        std::memcpy(&d, raw, 8);
+        return N(d); });
+    reg("__host_run_chunk__", [](std::vector<QV> a) -> QV
+        {
+        std::vector<uint8_t> bytes;
+        if (arg(a, 0).isArray())
+            for (const QV &b : *arg(a, 0).asArray())
+                bytes.push_back((uint8_t)(int)num(b));
+        std::vector<std::string> argv;
+        if (arg(a, 1).isArray())
+            for (const QV &s : *arg(a, 1).asArray())
+                argv.push_back(str(s));
+        return N(hostRunChunk(bytes, argv, arg(a, 2).isTruthy())); });
+
+    // ── std::regex (ECMAScript, like the C++ default) ──
+    // __cpp_re__(str, pattern, full) -> [pos, len, str, group0, group1, ...] | nil
+    // (a group that did not take part is nil)
+    reg("__cpp_re__", [](std::vector<QV> a) -> QV
+        {
+        static std::unordered_map<std::string, std::regex> cache;
+        const std::string s = str(arg(a, 0));
+        const std::string pat = str(arg(a, 1));
+        auto it = cache.find(pat);
+        if (it == cache.end())
+        {
+            try { it = cache.emplace(pat, std::regex(pat)).first; }
+            catch (const std::regex_error &e) { throw RuntimeError(std::string("regex_error: ") + e.what()); }
+        }
+        std::smatch m;
+        const bool ok = arg(a, 2).isTruthy() ? std::regex_match(s, m, it->second) : std::regex_search(s, m, it->second);
+        if (!ok)
+            return QV();
+        auto out = newArr();
+        out->push_back(N((double)m.position(0)));
+        out->push_back(N((double)m.length(0)));
+        out->push_back(S(s));
+        for (size_t i = 0; i < m.size(); ++i)
+            out->push_back(m[i].matched ? S(m[i].str()) : QV());
+        return A(out); });
+    reg("__cpp_re_replace__", [](std::vector<QV> a) -> QV
+        {
+        static std::unordered_map<std::string, std::regex> cache;
+        const std::string pat = str(arg(a, 1));
+        auto it = cache.find(pat);
+        if (it == cache.end())
+        {
+            try { it = cache.emplace(pat, std::regex(pat)).first; }
+            catch (const std::regex_error &e) { throw RuntimeError(std::string("regex_error: ") + e.what()); }
+        }
+        return S(std::regex_replace(str(arg(a, 0)), it->second, str(arg(a, 2)))); });
+    // __cpp_re_m__(match, op, n): accessors of a std::smatch / std::sub_match
+    reg("__cpp_re_m__", [](std::vector<QV> a) -> QV
+        {
+        const QV m = arg(a, 0);
+        const std::string op = str(arg(a, 1));
+        const long n = a.size() > 2 ? (long)num(arg(a, 2)) : 0;
+        if (op == "sub_str")
+            return m.isString() ? m : S("");
+        if (op == "sub_length" || op == "sub_size")
+            return N(m.isString() ? (double)m.asString().size() : 0.0);
+        if (op == "ready")
+            return B(true);
+        if (!m.isArray())
+            return op == "empty" ? B(true) : op == "size" ? N(0) : op == "group" ? QV() : (op == "position" || op == "length") ? N(0) : S("");
+        const Array &v = *m.asArray();
+        const size_t groups = v.size() >= 3 ? v.size() - 3 : 0;
+        auto group = [&](long i) -> QV { return i >= 0 && (size_t)i < groups ? v[3 + i] : QV(); };
+        if (op == "group")
+            return group(n);
+        if (op == "size")
+            return N((double)groups);
+        if (op == "empty")
+            return B(groups == 0);
+        if (op == "position")
+            return n == 0 ? v[0] : N(0);
+        if (op == "length")
+            return n == 0 ? v[1] : N(group(n).isString() ? (double)group(n).asString().size() : 0.0);
+        if (op == "str")
+            return group(n).isString() ? group(n) : S("");
+        const std::string src = str(v[2]);
+        const size_t pos = (size_t)num(v[0]), len = (size_t)num(v[1]);
+        if (op == "prefix")
+            return S(src.substr(0, pos));
+        if (op == "suffix")
+            return S(src.substr(std::min(src.size(), pos + len)));
+        throw RuntimeError("smatch member " + op); });
+
+    // ── std::filesystem: paths are UTF-8 strings; a trailing nil argument is a
+    //    std::error_code& (errors are then swallowed instead of thrown) ──
+    reg("__cpp_fs__", [](std::vector<QV> a) -> QV
+        {
+        namespace fs = std::filesystem;
+        const std::string op = str(arg(a, 0));
+        std::error_code ec;
+        const bool useEc = a.size() > 1 && arg(a, a.size() - 1).isNil();
+        auto P = [&](size_t i) { return fs::u8path(str(arg(a, i))); };
+        auto U = [](const fs::path &p) { return QV(p.u8string()); };
+        auto check = [&](const char *what)
+        {
+            if (ec && !useEc)
+                throw RuntimeError(std::string("filesystem error: ") + what + ": " + ec.message());
+        };
+        if (op == "join")
+            return U(P(1) / P(2));
+        if (op == "u8path")
+            return QV(str(arg(a, 1)));
+        if (op == "exists")
+            return B(fs::exists(P(1), ec));
+        if (op == "is_regular_file")
+            return B(fs::is_regular_file(P(1), ec));
+        if (op == "is_directory")
+            return B(fs::is_directory(P(1), ec));
+        if (op == "is_symlink")
+            return B(fs::is_symlink(P(1), ec));
+        if (op == "is_other")
+            return B(fs::is_other(P(1), ec));
+        if (op == "is_empty")
+        {
+            bool r = fs::is_empty(P(1), ec);
+            check("is_empty");
+            return B(r);
+        }
+        if (op == "equivalent")
+            return B(fs::equivalent(P(1), P(2), ec));
+        if (op == "absolute")
+        {
+            fs::path r = fs::absolute(P(1), ec);
+            check("absolute");
+            return U(r);
+        }
+        if (op == "weakly_canonical")
+        {
+            fs::path r = fs::weakly_canonical(P(1), ec);
+            check("weakly_canonical");
+            return U(r);
+        }
+        if (op == "canonical")
+        {
+            fs::path r = fs::canonical(P(1), ec);
+            check("canonical");
+            return U(r);
+        }
+        if (op == "relative" || op == "proximate")
+        {
+            fs::path base = a.size() > 2 && !arg(a, 2).isNil() ? P(2) : fs::current_path(ec);
+            fs::path r = op == "relative" ? fs::relative(P(1), base, ec) : fs::proximate(P(1), base, ec);
+            check("relative");
+            return U(r);
+        }
+        if (op == "current_path")
+        {
+            if (a.size() > 1 && !arg(a, 1).isNil())
+            {
+                fs::current_path(P(1), ec);
+                check("current_path");
+                return QV();
+            }
+            return U(fs::current_path(ec));
+        }
+        if (op == "temp_directory_path")
+            return U(fs::temp_directory_path(ec));
+        if (op == "create_directories")
+        {
+            bool r = fs::create_directories(P(1), ec);
+            check("create_directories");
+            return B(r);
+        }
+        if (op == "create_directory")
+        {
+            bool r = fs::create_directory(P(1), ec);
+            check("create_directory");
+            return B(r);
+        }
+        if (op == "remove")
+        {
+            bool r = fs::remove(P(1), ec);
+            check("remove");
+            return B(r);
+        }
+        if (op == "remove_all")
+        {
+            auto n = fs::remove_all(P(1), ec);
+            check("remove_all");
+            return N((double)n);
+        }
+        if (op == "copy_file" || op == "copy")
+        {
+            // copy_options: 1 skip_existing, 2 overwrite_existing, 4 update_existing, 8 recursive
+            int o = a.size() > 3 && arg(a, 3).isNumber() ? (int)arg(a, 3).asNumber() : 0;
+            fs::copy_options co = fs::copy_options::none;
+            if (o & 1) co |= fs::copy_options::skip_existing;
+            if (o & 2) co |= fs::copy_options::overwrite_existing;
+            if (o & 4) co |= fs::copy_options::update_existing;
+            if (o & 8) co |= fs::copy_options::recursive;
+            if (op == "copy_file")
+            {
+                bool r = fs::copy_file(P(1), P(2), co, ec);
+                check("copy_file");
+                return B(r);
+            }
+            fs::copy(P(1), P(2), co, ec);
+            check("copy");
+            return QV();
+        }
+        if (op == "rename")
+        {
+            fs::rename(P(1), P(2), ec);
+            check("rename");
+            return QV();
+        }
+        if (op == "file_size" || op == "m_file_size")
+        {
+            auto n = fs::file_size(P(1), ec);
+            check("file_size");
+            return N(ec ? -1.0 : (double)n);
+        }
+        if (op == "last_write_time")
+        {
+            auto t = fs::last_write_time(P(1), ec);
+            check("last_write_time");
+            return N((double)t.time_since_epoch().count());
+        }
+        if (op == "dir")
+        {
+            auto out = newArr();
+            const bool rec = arg(a, 2).isTruthy();
+            if (rec)
+            {
+                fs::recursive_directory_iterator it(P(1), fs::directory_options::skip_permission_denied, ec), end;
+                check("recursive_directory_iterator");
+                for (; !ec && it != end; it.increment(ec))
+                    out->push_back(QV(it->path().u8string()));
+            }
+            else
+            {
+                fs::directory_iterator it(P(1), fs::directory_options::skip_permission_denied, ec), end;
+                check("directory_iterator");
+                for (; !ec && it != end; it.increment(ec))
+                    out->push_back(QV(it->path().u8string()));
+            }
+            return QV(out);
+        }
+        // path members: m_<name>(self, args...)
+        if (op.rfind("m_", 0) == 0)
+        {
+            const std::string m = op.substr(2);
+            fs::path p = P(1);
+            if (m == "parent_path") return U(p.parent_path());
+            if (m == "filename") return U(p.filename());
+            if (m == "stem") return U(p.stem());
+            if (m == "extension") return U(p.extension());
+            if (m == "root_name") return U(p.root_name());
+            if (m == "root_directory") return U(p.root_directory());
+            if (m == "root_path") return U(p.root_path());
+            if (m == "relative_path") return U(p.relative_path());
+            if (m == "lexically_normal") return U(p.lexically_normal());
+            if (m == "lexically_relative") return U(p.lexically_relative(P(2)));
+            if (m == "path") return U(p);
+            if (m == "string" || m == "u8string" || m == "native") return QV(p.u8string());
+            if (m == "generic_string" || m == "generic_u8string") return QV(p.generic_u8string());
+            if (m == "is_absolute") return B(p.is_absolute());
+            if (m == "is_relative") return B(p.is_relative());
+            if (m == "has_extension") return B(p.has_extension());
+            if (m == "has_filename") return B(p.has_filename());
+            if (m == "has_parent_path") return B(p.has_parent_path());
+            if (m == "has_stem") return B(p.has_stem());
+            if (m == "has_root_path") return B(p.has_root_path());
+            if (m == "exists") return B(fs::exists(p, ec));
+            if (m == "is_directory") return B(fs::is_directory(p, ec));
+            if (m == "is_regular_file") return B(fs::is_regular_file(p, ec));
+            if (m == "is_symlink") return B(fs::is_symlink(p, ec));
+            if (m == "replace_extension") { p.replace_extension(a.size() > 2 ? P(2) : fs::path()); return U(p); }
+            if (m == "remove_filename") { p.remove_filename(); return U(p); }
+            if (m == "replace_filename") { p.replace_filename(P(2)); return U(p); }
+            if (m == "make_preferred") { p.make_preferred(); return U(p); }
+        }
+        throw RuntimeError("filesystem function " + op); });
+
     // ── values ──
     reg("__cpp_seq__", [](std::vector<QV> a) -> QV { return arg(a, a.empty() ? 0 : a.size() - 1); });
     reg("__cpp_seq3__", [](std::vector<QV> a) -> QV { return arg(a, 2); });
@@ -1113,7 +1462,8 @@ void VM::registerCppNatives()
         {
         QV v = arg(a, 0);
         if (std::getenv("QUANTUM_DEBUG_CPPFE") && !(v.isArray() && !v.asArray()->empty() && v.asArray()->at(0).isDict()))
-            std::cerr << "[cppfe] caught a non-C++ exception: " << str(v) << "\n";
+            std::cerr << "[cppfe] caught a non-C++ exception: " << str(v) << "  (testing for " << str(arg(a, 1))
+                      << ", value is a " << v.typeName() << ")\n";
         return B(isa(v, str(arg(a, 1)))); });
     reg("__cpp_dyncast__", [isa](std::vector<QV> a) -> QV
         {
@@ -1158,10 +1508,10 @@ void VM::registerCppNatives()
         return S(chr(num(c))); });
     reg("__cpp_str_at__", [](std::vector<QV> a) -> QV
         {
-        QV s = arg(a, 0);
+        const QV &s = arg(a, 0);
         long i = (long)num(arg(a, 1));
         if (!s.isString()) return N(0);
-        const std::string &x = s.asString();
+        const std::string &x = s.asStringRef();
         return N(i >= 0 && i < (long)x.size() ? (unsigned char)x[i] : 0); });
     reg("__cpp_str_set__", [](std::vector<QV> a) -> QV
         {
@@ -1179,14 +1529,14 @@ void VM::registerCppNatives()
         return N(i); });
     reg("__cpp_size__", [](std::vector<QV> a) -> QV
         {
-        QV v = arg(a, 0);
-        if (v.isString()) return N((double)v.asString().size());
+        const QV &v = arg(a, 0);
+        if (v.isString()) return N((double)v.asStringRef().size());
         if (v.isArray()) return N((double)v.asArray()->size());
         if (v.isDict()) return N((double)v.asDict()->size());
         return N(0); });
     reg("__cpp_substr__", [](std::vector<QV> a) -> QV
         {
-        std::string s = str(arg(a, 0));
+        const std::string &s = str(arg(a, 0));
         double pos = num(arg(a, 1)), len = num(arg(a, 2));
         if (pos > (double)s.size())
             throwExc("out_of_range", "basic_string::substr: __pos (which is " + fmtInt(pos, 10, false, false, false) +
@@ -1229,7 +1579,7 @@ void VM::registerCppNatives()
         return N(r == std::string::npos ? NPOS : (double)r); });
     reg("__cpp_str_compare__", [](std::vector<QV> a) -> QV
         {
-        std::string x = str(arg(a, 0)), y = str(arg(a, 1));
+        const std::string &x = str(arg(a, 0)), &y = str(arg(a, 1));
         size_t n = std::min(x.size(), y.size());
         for (size_t i = 0; i < n; ++i)
             if (x[i] != y[i]) return N((double)((int)(unsigned char)x[i] - (int)(unsigned char)y[i]));
@@ -1446,7 +1796,7 @@ void VM::registerCppNatives()
         double r = 0;
         if (fl)
             r = std::strtod(b, &end);
-        else if (fn == "stoul" || fn == "stoull" || fn == "strtoul")
+        else if (fn == "stoul" || fn == "stoull" || fn == "strtoul" || fn == "strtoull")
             r = (double)std::strtoull(b, &end, base);
         else
         {
@@ -1673,7 +2023,7 @@ void VM::registerCppNatives()
         return QV(); });
     reg("__cpp_push__", [](std::vector<QV> a) -> QV
         {
-        QV c = arg(a, 0);
+        const QV &c = arg(a, 0);
         if (c.isArray()) c.asArray()->push_back(arg(a, 1));
         return QV(); });
     reg("__cpp_push_front__", [](std::vector<QV> a) -> QV
@@ -1885,7 +2235,24 @@ void VM::registerCppNatives()
             if (ea.isArray() && eb.isArray()) return B(ea.asArray() == eb.asArray());
             return B(eqValues(ea, eb));
         }
-        if (p[0].isArray() && q[0].isArray()) return B(p[0].asArray() == q[0].asArray() && pp == qp);
+        if (p[0].isArray() && q[0].isArray())
+        {
+            if (p[0].asArray() == q[0].asArray()) return B(pp == qp);
+            if (pp != qp) return B(false);
+            // rbegin() / rend() each build their own reversed copy of the same
+            // container; iterators of different containers are never compared in
+            // valid C++, so same position over same-looking contents is "equal"
+            const Array &pa = *p[0].asArray(), &qa = *q[0].asArray();
+            if (pa.size() != qa.size()) return B(false);
+            if (pa.empty()) return B(true);
+            auto sameEl = [](const QV &x, const QV &y)
+            {
+                if (x.isArray() && y.isArray()) return x.asArray() == y.asArray();
+                if (x.isDict() && y.isDict()) return x.asDict() == y.asDict();
+                return eqValues(x, y);
+            };
+            return B(sameEl(pa.front(), qa.front()) && sameEl(pa.back(), qa.back()));
+        }
         return B(pp == qp && eqValues(p[0], q[0])); });
 
     // map / set
@@ -2055,11 +2422,45 @@ void VM::registerCppNatives()
         {
         QV o = arg(a, 0);
         return o.isNil() ? arg(a, 1) : o.asArray()->at(0); });
+    // __cpp_vwrap_dyn__(value, [tag per alternative]) -> [index, value]: a variant built from a value
+    // whose static type was unknown. Tags: a class name, "bool", "number", "string", "nil".
+    reg("__cpp_vwrap_dyn__", [](std::vector<QV> a) -> QV
+        {
+        const QV &v = arg(a, 0);
+        const Array &tags = *arg(a, 1).asArray();
+        long idx = -1;
+        auto tagIs = [&](size_t i, const std::string &t) { return tags[i].isString() && tags[i].asStringRef() == t; };
+        if (v.isArray() && !v.asArray()->empty() && v.asArray()->at(0).isDict())
+        {
+            DictP d = v.asArray()->at(0).asDict();
+            auto nm = d->find("name");
+            if (nm != d->end() && nm->second.isString())
+                for (size_t i = 0; i < tags.size() && idx < 0; ++i)
+                    if (tagIs(i, nm->second.asStringRef())) idx = (long)i;
+            auto bs = d->find("bases");
+            if (idx < 0 && bs != d->end() && bs->second.isArray())
+                for (const QV &b : *bs->second.asArray())
+                    for (size_t i = 0; i < tags.size() && idx < 0; ++i)
+                        if (b.isString() && tagIs(i, b.asStringRef())) idx = (long)i;
+        }
+        else
+        {
+            const char *kind = v.isBool() ? "bool" : v.isNumber() ? "number" : v.isString() ? "string" : v.isNil() ? "nil" : "";
+            for (size_t i = 0; i < tags.size() && idx < 0; ++i)
+                if (tagIs(i, kind)) idx = (long)i;
+        }
+        if (idx < 0)
+            throw RuntimeError("no variant alternative for a " + v.typeName() + " value");
+        return A({N((double)idx), tags[idx].isString() && tags[idx].asStringRef() == "nil" ? QV() : v}); });
     reg("__cpp_vcheck__", [](std::vector<QV> a) -> QV
         {
         QV v = arg(a, 0);
         if (!v.isArray() || num(v.asArray()->at(0)) != num(arg(a, 1)))
-            throwExc("bad_variant_access", "std::get: wrong index for variant");
+        {
+            std::string have = v.isArray() ? std::to_string((long long)num(v.asArray()->at(0))) : "(not a variant: " + v.typeName() + ")";
+            throwExc("bad_variant_access", "std::get: wrong index for variant (holds " + have + ", asked for " +
+                                               std::to_string((long long)num(arg(a, 1))) + ")");
+        }
         return v; });
     reg("__cpp_vget_if__", [](std::vector<QV> a) -> QV
         {
@@ -2071,6 +2472,38 @@ void VM::registerCppNatives()
         QV v = arg(a, 0);
         if (!v.isArray() || num(v.asArray()->at(0)) != num(arg(a, 1))) return QV();
         return v.asArray()->at(1); });
+    // s = __cpp_str_filter__(s, algorithm, x): the erase-remove idiom on a whole string.
+    // remove: drop characters equal to x; remove_if: drop those the predicate accepts;
+    // unique: collapse runs of equal characters.
+    reg("__cpp_str_filter__", [call](std::vector<QV> a) -> QV
+        {
+        const std::string &s = str(arg(a, 0));
+        const std::string algo = str(arg(a, 1));
+        const QV &x = arg(a, 2);
+        std::string out;
+        out.reserve(s.size());
+        if (algo == "unique")
+        {
+            for (char c : s)
+                if (out.empty() || out.back() != c)
+                    out += c;
+        }
+        else if (algo == "remove")
+        {
+            const int want = x.isString() && x.asStringRef().size() == 1 ? (unsigned char)x.asStringRef()[0] : (int)num(x);
+            for (char c : s)
+                if ((unsigned char)c != want)
+                    out += c;
+        }
+        else if (algo == "remove_if")
+        {
+            for (char c : s)
+                if (!call(x, {N((unsigned char)c)}).isTruthy())
+                    out += c;
+        }
+        else
+            throw RuntimeError("string algorithm " + algo);
+        return S(out); });
     reg("__cpp_visit__", [call](std::vector<QV> a) -> QV
         {
         QV v = arg(a, 1);

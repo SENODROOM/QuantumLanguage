@@ -584,9 +584,16 @@ static void rbCollectSymbols(const std::vector<std::string> &lines,
   std::string
       currentMethod; // name of the def whose body we're currently inside
   for (auto &line : lines) {
-    for (auto it = std::sregex_iterator(line.begin(), line.end(), ivarRe);
-         it != std::sregex_iterator(); ++it)
-      st.fields.insert((*it)[1].str());
+    {
+      // every @ivar on the line (the pattern has no anchors: the rest of the
+      // line can be searched on its own)
+      std::smatch iv;
+      std::string rest = line;
+      while (std::regex_search(rest, iv, ivarRe)) {
+        st.fields.insert(iv[1].str());
+        rest = iv.suffix().str();
+      }
+    }
     std::smatch m;
     if (std::regex_search(line, m, defRe)) {
       std::string name = m[1].str();
@@ -1098,15 +1105,16 @@ static std::string rbConvertBareSplit(const std::string &code) {
   std::string s = code;
   std::string result;
   size_t last = 0;
-  auto begin = std::sregex_iterator(s.begin(), s.end(), bareSplitRe);
-  auto end = std::sregex_iterator();
-  for (auto it = begin; it != end; ++it) {
+  std::string rest = s; // the pattern has no anchors: search what is left
+  while (std::regex_search(rest, m, bareSplitRe)) {
     // The trailing (?!\() guards against `.split(pattern)` — a real
     // argument means the optional empty-parens group can't consume it,
     // so the lookahead fails and this call is left untouched.
-    result += s.substr(last, it->position() - last);
+    size_t at = last + m.position();
+    result += s.substr(last, at - last);
     result += ".trim().split(" + std::string(R"("/\\s+/")") + ")";
-    last = it->position() + it->length();
+    last = at + m.length();
+    rest = s.substr(last);
   }
   result += s.substr(last);
   return result;

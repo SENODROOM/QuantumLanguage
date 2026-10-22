@@ -39,7 +39,9 @@ struct TestResult
 
 static void redirectStdinToNull()
 {
-#ifdef _WIN32
+#if defined(QUANTUM_SELFHOST)
+    // g_testMode feeds input() its defaults, so the child never reads stdin
+#elif defined(_WIN32)
     FILE *n = nullptr;
     freopen_s(&n, "NUL", "r", stdin);
 #else
@@ -89,6 +91,7 @@ int runSingleFileForTest(const std::string &path)
     // hang the whole suite. A detached timer thread force-exits this child with
     // a timeout marker if execution runs long, so the parent records a FAIL and
     // moves on. 20s is far above any legitimate test's runtime.
+#ifndef QUANTUM_SELFHOST // the self-hosted program has no threads; see hostCapture()
     std::thread([]() {
         std::this_thread::sleep_for(std::chrono::seconds(20));
         std::cout << "\n"
@@ -98,6 +101,7 @@ int runSingleFileForTest(const std::string &path)
         std::cout.flush();
         std::_Exit(2);
     }).detach();
+#endif
 
     std::ifstream f(path);
     if (!f.is_open())
@@ -194,7 +198,15 @@ static std::string spawnChild(const std::string &path, const fs::path &workDir,
         cdPrefix = "cd \"" + workDir.string() + "\" && ";
 #endif
     }
-#ifdef _WIN32
+#if defined(QUANTUM_SELFHOST)
+    {
+        // same command as below; the host runs it and hands back the output
+        std::string hostCmd = "\"" + cdPrefix + "\"" + exe + "\" --__runone \"" + target + "\" 2>&1\"";
+        std::string captured = __host_capture(hostCmd);
+        exitCode = __host_last_exit();
+        return captured;
+    }
+#elif defined(_WIN32)
     // cmd.exe strips the outermost pair of quotes from the whole command, so
     // wrap everything once more: ""exe" --__runone "path" 2>&1".
     std::string cmd = "\"" + cdPrefix + "\"" + exe + "\" --__runone \"" + target + "\" 2>&1\"";
@@ -203,6 +215,7 @@ static std::string spawnChild(const std::string &path, const fs::path &workDir,
     std::string cmd = cdPrefix + "\"" + exe + "\" --__runone \"" + target + "\" 2>&1";
     FILE *pipe = popen(cmd.c_str(), "r");
 #endif
+#ifndef QUANTUM_SELFHOST
     if (!pipe)
     {
         exitCode = -1;
@@ -220,6 +233,7 @@ static std::string spawnChild(const std::string &path, const fs::path &workDir,
     exitCode = (status == -1) ? -1 : (WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status));
 #endif
     return out;
+#endif
 }
 
 static TestResult testFile(const std::string &path, const fs::path &workDir)
@@ -357,6 +371,9 @@ static void openProgressiveReport(const std::string &dir, int totalFiles)
 
     g_reportStream << "Quantum Language — Test Results (in progress)\n";
     g_reportStream << "Generated : ";
+#ifdef QUANTUM_SELFHOST
+    g_reportStream << __host_time_str(); // local time, "%Y-%m-%d %H:%M:%S"
+#else
     {
         std::time_t t = std::time(nullptr);
         char buf[64];
@@ -369,6 +386,7 @@ static void openProgressiveReport(const std::string &dir, int totalFiles)
         std::strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", &tm_i);
         g_reportStream << buf;
     }
+#endif
     g_reportStream << "\nDirectory : " << fs::absolute(fs::path(dir)).string() << "\n";
     g_reportStream << "Total     : " << totalFiles << "   (running...)\n";
     g_reportStream << std::string(72, '=') << "\n\n";

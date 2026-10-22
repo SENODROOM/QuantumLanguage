@@ -305,7 +305,7 @@ XV Lowerer::convert(XV x, const TP &to, int line, bool forInit)
     if (!to || to->k == T::Dyn || to->k == T::Void)
         return x;
     const TP from = x.t;
-    if (from->k == T::Dyn)
+    if (from->k == T::Dyn && to->k != T::Variant) // (a Dyn value into a variant is wrapped at run time below)
     {
         x.t = to;
         return x;
@@ -448,6 +448,31 @@ XV Lowerer::convert(XV x, const TP &to, int line, bool forInit)
         {
             x.t = to;
             return x;
+        }
+        if (from->k == T::Dyn)
+        {
+            // A value of unknown static type (a generic lambda's `auto &&`):
+            // pick the alternative at run time from the value's class / scalar kind.
+            std::vector<ASTNodePtr> tags;
+            for (const TP &alt : to->a)
+            {
+                std::string tag = "?";
+                if (alt->k == T::Class && alt->cls)
+                    tag = alt->cls->qname;
+                else if (alt->k == T::Bool)
+                    tag = "bool";
+                else if (alt->k == T::Int || alt->k == T::Float || alt->k == T::Char)
+                    tag = "number";
+                else if (alt->k == T::Str || alt->k == T::CStr)
+                    tag = "string";
+                else if (alt->k == T::Monostate)
+                    tag = "nil";
+                tags.push_back(q::str(tag, line));
+            }
+            std::vector<ASTNodePtr> a;
+            a.push_back(copyOf(std::move(x), line));
+            a.push_back(q::arr(std::move(tags), line));
+            return mkxv(q::call("__cpp_vwrap_dyn__", std::move(a), line), to);
         }
         int best = -1, bestCost = 99;
         for (size_t i = 0; i < to->a.size(); ++i)
@@ -1323,6 +1348,15 @@ XV Lowerer::lowerBinary(const ExprP &e)
         args.push_back(read(b));
         return mkxv(q::call("__cpp_cmp__", std::move(args), ln), tInt());
     }
+    // std::filesystem::path operator/ (a path is a string; `/` on strings is otherwise ill-formed)
+    if (op == "/" && a.t->k == T::Str && a.t->name == "path")
+    {
+        std::vector<ASTNodePtr> args;
+        args.push_back(q::str("join", ln));
+        args.push_back(read(a));
+        args.push_back(read(b));
+        return mkxv(q::call("__cpp_fs__", std::move(args), ln), mkT(T::Str, "path"));
+    }
     return arith(op, std::move(a), std::move(b), ln);
 }
 
@@ -1386,6 +1420,16 @@ XV Lowerer::lowerAssign(const ExprP &e)
     }
     // compound: a op= b  →  a = a op b
     std::string bop = op.substr(0, op.size() - 1);
+    if (t.t->k == T::Str && t.t->name == "path" && bop == "/")
+    {
+        XV v = lowerExpr(e->kids[1]);
+        std::vector<ASTNodePtr> args;
+        args.push_back(q::str("join", ln));
+        args.push_back(peekRead(t));
+        args.push_back(read(v));
+        TP tt = t.t;
+        return mkxv(store(t, q::call("__cpp_fs__", std::move(args), ln), ln), tt, false);
+    }
     if (t.t->k == T::Str && bop == "+")
     {
         XV v = lowerExprTo(e->kids[1], tStr());
@@ -1475,6 +1519,14 @@ XV Lowerer::lowerMember(const ExprP &e)
         x.key = q::num(m == "first" ? 0 : 1, ln);
         return x;
     }
+    if ((t->k == T::Str || t->k == T::CStr) && m == "npos")
+        return mkxv(q::num(18446744073709551615.0, ln), tSize());
+    if (t->k == T::Str && t->name == "submatch" && m == "matched")
+    {
+        std::vector<ASTNodePtr> a;
+        a.push_back(read(obj));
+        return mkxv(q::un("!", q::call("__cpp_isnull__", std::move(a), ln), ln), tBool());
+    }
     if (t->k == T::Dyn)
     {
         XV x;
@@ -1519,6 +1571,15 @@ XV Lowerer::lowerIndex(const ExprP &e)
         return x;
     }
     XV i = lowerExpr(e->kids[1]);
+    // std::smatch[i]: the i-th group (a string, or nil when it did not take part)
+    if (t->k == T::Dyn && t->name == "smatch")
+    {
+        std::vector<ASTNodePtr> a;
+        a.push_back(read(obj));
+        a.push_back(q::str("group", ln));
+        a.push_back(read(i));
+        return mkxv(q::call("__cpp_re_m__", std::move(a), ln), mkT(T::Str, "submatch"));
+    }
     if (t->k == T::Str || t->k == T::CStr)
     {
         XV x;
@@ -1827,6 +1888,8 @@ ASTNodePtr Lowerer::ctorCall(ClassInfo *c, std::vector<ExprP> &args, bool braced
     FuncInfo *f = pickOverload(cands, vals, line, false);
     if (!f)
         unsupported("no constructor of " + c->qname + " takes these arguments", line);
+    if (f->isTemplate)
+        f = instantiateDeduced(f, vals);
     ASTNodePtr self = alloc();
     if (f->cls != c)
     {
@@ -1844,6 +1907,17 @@ XV Lowerer::lowerConstruct(const ExprP &e)
     int ln = e->line;
     TP t = resolveType(e->type, currentScope());
     std::vector<ExprP> args = e->kids;
+    // std::filesystem::[recursive_]directory_iterator(dir): the entries, as an array of paths
+    if (e->type && !e->type->name.empty() && !args.empty() &&
+        (e->type->name.back() == "directory_iterator" || e->type->name.back() == "recursive_directory_iterator"))
+    {
+        XV d = lowerExpr(args[0]);
+        std::vector<ASTNodePtr> a;
+        a.push_back(q::str("dir", ln));
+        a.push_back(read(d));
+        a.push_back(q::boolean(e->type->name.back() == "recursive_directory_iterator", ln));
+        return mkxv(q::call("__cpp_fs__", std::move(a), ln), t);
+    }
     if (t->k == T::Class && t->cls)
     {
         if (e->braced)
@@ -2228,6 +2302,90 @@ FuncInfo *Lowerer::pickOverload(const std::vector<FuncInfo *> &cands, std::vecto
     return best;
 }
 
+// A function template is instantiated per set of template arguments: its body
+// is lowered again with the template parameters bound to concrete types, so
+// type-dependent code (std::get<T>, holds_alternative<T>, a variant built from
+// a `T&&`, ...) sees the real type. The arguments are the explicit ones
+// (`x.as<Foo>()`, `f<int>(a)`) or, failing those, deduced from the call's
+// argument types. When neither works the single generic lowering (T dynamic)
+// is used.
+FuncInfo *Lowerer::instantiateWith(FuncInfo *f, const std::vector<TP> &tys)
+{
+    const DeclP &d = f->def;
+    if (!d || tys.empty() || d->templateParams.size() < tys.size())
+        return f;
+    std::string key = f->mangled + "<";
+    for (const TP &t : tys)
+        key += t->str() + ",";
+    auto hit = instances_.find(key);
+    if (hit != instances_.end())
+        return hit->second;
+    funcs_.push_back(std::make_unique<FuncInfo>(*f));
+    FuncInfo *inst = funcs_.back().get();
+    inst->isTemplate = false;
+    inst->lowered = false;
+    inst->mangled = key + ">";
+    Scope *sc = newScope(f->scope ? f->scope->qname : "", f->scope);
+    if (f->scope)
+        sc->cls = f->scope->cls;
+    for (size_t i = 0; i < tys.size(); ++i)
+    {
+        Symbol s;
+        s.kind = Symbol::Type;
+        s.type = tys[i];
+        sc->syms[d->templateParams[i]] = s;
+    }
+    inst->scope = sc;
+    instances_[key] = inst;
+    int savedLine = line_;
+    resolveFunc(inst);
+    line_ = savedLine;
+    pendingInst_.push_back(inst);
+    return inst;
+}
+
+FuncInfo *Lowerer::instantiate(FuncInfo *f, const std::vector<TArg> &targs)
+{
+    if (!f || !f->isTemplate || !f->def || targs.empty())
+        return f;
+    std::vector<TP> tys;
+    for (const auto &a : targs)
+    {
+        if (!a.type)
+            return f; // a non-type argument: stay generic
+        tys.push_back(resolveType(a.type, currentScope()));
+    }
+    return instantiateWith(f, tys);
+}
+
+// Deduce each template parameter from the call's argument types: a function
+// parameter declared as `T`, `T&`, `T&&` or `const T&` binds T to the argument's type.
+FuncInfo *Lowerer::instantiateDeduced(FuncInfo *f, const std::vector<XV> &vals)
+{
+    if (!f || !f->isTemplate || !f->def)
+        return f;
+    const DeclP &d = f->def;
+    if (d->templateParams.empty())
+        return f;
+    std::vector<TP> tys(d->templateParams.size());
+    for (size_t k = 0; k < d->templateParams.size(); ++k)
+    {
+        for (size_t i = 0; i < d->params.size() && i < vals.size(); ++i)
+        {
+            const TypeNameP &pt = d->params[i].type;
+            if (pt && pt->name.size() == 1 && pt->name[0] == d->templateParams[k] && pt->pointers == 0 &&
+                vals[i].t && vals[i].t->k != T::Dyn)
+            {
+                tys[k] = vals[i].t;
+                break;
+            }
+        }
+        if (!tys[k])
+            return f; // not deducible from the arguments: generic lowering
+    }
+    return instantiateWith(f, tys);
+}
+
 XV Lowerer::callArgs(FuncInfo *f, std::vector<ExprP> &args, ASTNodePtr self, int line, bool virt,
                      std::vector<XV> *lowered)
 {
@@ -2467,6 +2625,8 @@ XV Lowerer::lowerCall(const ExprP &e)
                 FuncInfo *f = pickOverload(fn.overloads, vals, ln, false);
                 if (!f)
                     unsupported("no matching function " + name.back(), ln);
+                if (f->isTemplate)
+                    f = callee->hasTargs ? instantiate(f, callee->targs) : instantiateDeduced(f, vals);
                 if (f->cls && !f->isStatic)
                 {
                     if (!fn_ || !fn_->hasThis)
@@ -2561,12 +2721,14 @@ XV Lowerer::lowerCall(const ExprP &e)
             FuncInfo *f = pickOverload(ms, vals, ln, true);
             if (!f)
                 unsupported("no matching method " + m, ln);
+            if (f->isTemplate)
+                f = callee->hasTargs ? instantiate(f, callee->targs) : instantiateDeduced(f, vals);
             if (f->isStatic)
                 return callArgs(f, args, nullptr, ln, false);
             bool qualified = false;
             return callArgs(f, args, read(obj), ln, f->isVirtual && !qualified);
         }
-        if (obj.t->k == T::Dyn)
+        if (obj.t->k == T::Dyn && obj.t->name != "smatch")
         {
             ASTNodePtr callee2 = std::make_unique<ASTNode>(MemberExpr{read(obj), m}, ln);
             return dynCall(std::move(callee2), args, ln);

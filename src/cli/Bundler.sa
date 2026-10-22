@@ -80,7 +80,9 @@ static std::string quoteWinArg(const std::string &a)
 
 std::string getExecutablePath()
 {
-#ifdef _WIN32
+#if defined(QUANTUM_SELFHOST)
+    return __host_exe_path();
+#elif defined(_WIN32)
     char buffer[MAX_PATH];
     GetModuleFileNameA(NULL, buffer, MAX_PATH);
     return std::string(buffer);
@@ -99,6 +101,11 @@ std::string getExecutablePath()
 
 std::shared_ptr<Chunk> loadEmbeddedBytecode(const std::string &exePath)
 {
+#ifdef QUANTUM_SELFHOST
+    // Only the native stub reads its own payload; the compiler never does.
+    (void)exePath;
+    return nullptr;
+#else
     std::ifstream file(exePath, std::ios::binary | std::ios::ate);
     if (!file)
         return nullptr;
@@ -140,6 +147,7 @@ std::shared_ptr<Chunk> loadEmbeddedBytecode(const std::string &exePath)
     {
         return nullptr;
     }
+#endif
 }
 // ─── findStubPath ─────────────────────────────────────────────────────────────
 // Searches for quantum_stub.exe next to quantum.exe (or in build/ subdirs).
@@ -258,6 +266,23 @@ int bundleAndRun(const std::string &path, const std::string &exePath, const std:
     }
 
     // 7. Append payload: [bytes] [size: uint32 LE] [magic: "QNTM_VM!" 8 bytes]
+#ifdef QUANTUM_SELFHOST
+    {
+        std::vector<uint8_t> blob = payload;
+        for (int i = 0; i < 4; ++i)
+            blob.push_back(static_cast<uint8_t>((payloadSize >> (8 * i)) & 0xFF));
+        const std::string magic = "QNTM_VM!";
+        for (char c : magic)
+            blob.push_back(static_cast<uint8_t>(c));
+        if (!__host_append_bytes(outName, blob))
+        {
+            std::cout << Colors::RED << "[Error] " << Colors::RESET
+                      << "Write failed on " << outName << "\n";
+            std::cout.flush();
+            return 1;
+        }
+    }
+#else
     {
         std::ofstream out(outName, std::ios::binary | std::ios::app);
         if (!out)
@@ -279,6 +304,7 @@ int bundleAndRun(const std::string &path, const std::string &exePath, const std:
             return 1;
         }
     }
+#endif
 
     std::cout << Colors::GREEN << "[Compiled] " << Colors::RESET
               << path << "  ->  " << outName << "  (" << payloadSize << " bytes)\n";
@@ -288,7 +314,20 @@ int bundleAndRun(const std::string &path, const std::string &exePath, const std:
     std::cout << Colors::CYAN << "[Running]  " << Colors::RESET << outName << "\n\n";
     std::cout.flush();
 
-#ifdef _WIN32
+#if defined(QUANTUM_SELFHOST)
+    std::string cmd = "\"" + outName + "\"";
+    for (const auto &a : runArgs)
+        cmd += " " + quoteWinArg(a);
+    int hostCode = __host_spawn(cmd);
+    if (hostCode < 0)
+    {
+        std::cout << Colors::RED << "[Error] " << Colors::RESET
+                  << "Could not launch " << outName << "\n";
+        std::cout.flush();
+        return 1;
+    }
+    return hostCode;
+#elif defined(_WIN32)
     STARTUPINFOA si{};
     si.cb = sizeof(si);
     PROCESS_INFORMATION pi{};
@@ -340,7 +379,19 @@ int runQpm(const std::vector<std::string> &args, const std::string &exePath)
     std::error_code ec;
     if (!fs::is_regular_file(qpm, ec))
         qpm = "qpm"; // resolved through PATH
-#ifdef _WIN32
+#if defined(QUANTUM_SELFHOST)
+    std::string cmd = quoteWinArg(qpm.string());
+    for (const auto &a : args)
+        cmd += " " + quoteWinArg(a);
+    int hostCode = __host_spawn(cmd);
+    if (hostCode < 0)
+    {
+        std::cerr << Colors::RED << "[Error] " << Colors::RESET << "couldn't run qpm (" << qpm.string()
+                  << "); it ships next to quantum.exe\n";
+        return 1;
+    }
+    return hostCode;
+#elif defined(_WIN32)
     std::string cmd = quoteWinArg(qpm.string());
     for (const auto &a : args)
         cmd += " " + quoteWinArg(a);

@@ -8,6 +8,7 @@
 
 #include <cstring>
 #include <functional>
+#include <iostream>
 
 namespace cpp
 {
@@ -87,7 +88,7 @@ public:
             "intptr_t", "uintptr_t", "intmax_t", "uintmax_t", "nullptr_t", "initializer_list", "numeric_limits",
             "nullopt_t", "streamsize", "bitset", "less", "greater", "hash", "mt19937", "mt19937_64",
             "random_device", "uniform_int_distribution", "uniform_real_distribution", "FILE", "time_t",
-            "clock_t", "any", "reference_wrapper", "ssize_t", "byte"};
+            "clock_t", "any", "reference_wrapper", "ssize_t", "byte", "enable_shared_from_this", "streamoff"};
         for (const char *n : std_types)
             types_.insert(n);
         static const char *std_templates[] = {
@@ -95,13 +96,35 @@ public:
             "optional", "variant", "unique_ptr", "shared_ptr", "weak_ptr", "function", "array", "deque", "list",
             "forward_list", "stack", "queue", "priority_queue", "numeric_limits", "initializer_list", "bitset",
             "less", "greater", "hash", "uniform_int_distribution", "uniform_real_distribution",
-            "reference_wrapper", "basic_string",
+            "reference_wrapper", "basic_string", "enable_shared_from_this",
             // function templates called with explicit arguments
             "static_cast", "dynamic_cast", "const_cast", "reinterpret_cast", "make_unique", "make_shared",
             "get", "get_if", "holds_alternative", "max", "min", "make_pair", "make_tuple", "any_cast",
             "accumulate", "to_underlying", "clamp", "swap", "forward", "move", "declval", "bit_cast"};
         for (const char *n : std_templates)
             templates_.insert(n);
+        // std::filesystem and friends: types only when qualified, so a
+        // variable called `path` stays a variable.
+        static const char *qual_types[] = {"path", "directory_entry", "directory_iterator",
+                                           "recursive_directory_iterator", "file_time_type", "filesystem_error",
+                                           "error_code", "copy_options", "directory_options", "file_status",
+                                           "file_type", "perms", "regex", "basic_regex", "smatch", "cmatch", "ssub_match", "sub_match"};
+        for (const char *n : qual_types)
+            qualTypes_.insert(n);
+    }
+
+    // `fs::x` -> `std::filesystem::x` for a recorded `namespace fs = std::filesystem;`
+    void expandAlias(std::vector<std::string> &name, std::vector<std::vector<TArg>> &targs)
+    {
+        if (name.size() < 2)
+            return;
+        auto it = aliases_.find(name[0]);
+        if (it == aliases_.end())
+            return;
+        name.erase(name.begin());
+        name.insert(name.begin(), it->second.begin(), it->second.end());
+        targs.erase(targs.begin());
+        targs.insert(targs.begin(), it->second.size(), std::vector<TArg>());
     }
 
     Program run()
@@ -122,6 +145,8 @@ private:
     size_t p_ = 0;
     std::set<std::string> types_;     // last name component of every known type
     std::set<std::string> templates_; // names that take <template arguments>
+    std::set<std::string> qualTypes_; // types that only count when written qualified (fs::path, std::error_code)
+    std::map<std::string, std::vector<std::string>> aliases_; // namespace fs = std::filesystem;
     std::vector<std::string> classStack_; // enclosing class names while parsing members
 
     // ─── Token helpers ─────────────────────────────────────────────────────
@@ -147,7 +172,13 @@ private:
         }
         return false;
     }
-    [[noreturn]] void fail(const std::string &msg) const { throw ParseFail{msg, cur().line, cur().file}; }
+    [[noreturn]] void fail(const std::string &msg) const
+    {
+        if (std::getenv("QUANTUM_DEBUG_PARSEFAIL"))
+            std::cerr << "[cppfe] parse fail: " << msg << " (line " << cur().line << " near '" << cur().text << "')"
+                      << std::endl;
+        throw ParseFail{msg, cur().line, cur().file};
+    }
     void expect(const char *s)
     {
         if (!accept(s))
@@ -227,7 +258,8 @@ private:
         size_t j = k;
         while (peekTok(j).kind == TK::Ident && peekTok(j + 1).kind == TK::Punct && peekTok(j + 1).text == "::")
             j += 2;
-        if (j != k && peekTok(j).kind == TK::Ident && types_.count(peekTok(j).text))
+        if (j != k && peekTok(j).kind == TK::Ident &&
+            (types_.count(peekTok(j).text) || qualTypes_.count(peekTok(j).text)))
             return true;
         return false;
     }
@@ -419,6 +451,7 @@ private:
                     }
                     break;
                 }
+                expandAlias(ty->name, ty->targs);
             }
         }
         // trailing cv / specifiers: `int const`, `std::string const&`
@@ -703,9 +736,16 @@ private:
             if (accept("="))
             {
                 // namespace alias: namespace fs = std::filesystem;
-                while (!is(";"))
+                std::vector<std::string> target;
+                while (!is(";") && !at(TK::End))
+                {
+                    if (at(TK::Ident))
+                        target.push_back(cur().text);
                     ++p_;
+                }
                 expect(";");
+                if (!d->name.empty() && !target.empty())
+                    aliases_[d->name[0]] = target;
                 return {};
             }
             expect("{");
@@ -1186,6 +1226,42 @@ private:
         if (x.kind == TK::Ident && (x.text == "true" || x.text == "false" || x.text == "nullptr" ||
                                     x.text == "this" || x.text == "new"))
             return true;
+        if (startsType(k))
+        {
+            // `T x(std::string("a") + b)`: a type name followed by ( or { is a
+            // functional cast, i.e. the start of an initializer expression
+            size_t j = k;
+            if (peekTok(j).kind == TK::Punct && peekTok(j).text == "::")
+                ++j;
+            while (peekTok(j).kind == TK::Ident)
+            {
+                ++j;
+                if (peekTok(j).kind == TK::Punct && peekTok(j).text == "<")
+                {
+                    int depth = 0;
+                    do
+                    {
+                        const std::string &tx = peekTok(j).text;
+                        if (peekTok(j).kind == TK::Punct && tx == "<")
+                            ++depth;
+                        else if (peekTok(j).kind == TK::Punct && tx == ">")
+                            --depth;
+                        else if (peekTok(j).kind == TK::Punct && tx == ">>")
+                            depth -= 2;
+                        ++j;
+                    } while (depth > 0 && peekTok(j).kind != TK::End);
+                }
+                if (peekTok(j).kind == TK::Punct && peekTok(j).text == "::")
+                {
+                    ++j;
+                    continue;
+                }
+                break;
+            }
+            const Token &nx = peekTok(j);
+            if (nx.kind == TK::Punct && (nx.text == "(" || nx.text == "{"))
+                return true;
+        }
         return !startsType(k);
     }
 
@@ -1563,7 +1639,7 @@ private:
         if (at(TK::Ident) && isAt(1, ":") && !isAt(2, ":") && !isKeyword(cur().text) && !types_.count(cur().text))
             fail("labels are not supported");
         if ((is("struct") || is("class") || is("union") || is("enum") || is("using") || is("typedef") ||
-             is("static_assert") || is("template")) &&
+             is("static_assert") || is("template") || (is("namespace") && isAt(2, "="))) &&
             !(is("using") && isAt(1, "namespace") && false))
         {
             // local type / alias / using-directive
@@ -2414,9 +2490,11 @@ private:
             }
             break;
         }
+        expandAlias(e->name, allTargs);
         e->targs = allTargs.back();
         // A type used as a value: T(args) / T{args}
-        bool isType = types_.count(e->name.back()) > 0;
+        bool isType = types_.count(e->name.back()) > 0 ||
+                      (e->name.size() > 1 && qualTypes_.count(e->name.back()) > 0);
         if (isType && (is("(") || is("{")))
         {
             auto ty = std::make_shared<TypeName>();

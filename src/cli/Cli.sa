@@ -102,35 +102,46 @@ namespace
             dir = dir.parent_path();
         }
         int scanned = 0;
-        fs::recursive_directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end;
-        for (; it != end && scanned < 2000; it.increment(ec))
+        // Depth-first walk with an explicit stack: skip dot-folders, build/
+        // and node_modules/ without descending into them.
+        std::vector<fs::path> pending;
+        pending.push_back(dir);
+        while (!pending.empty() && scanned < 2000)
         {
-            if (ec)
-                break;
-            const fs::path p = it->path();
-            std::string name = p.filename().string();
-            if (it->is_directory(ec))
+            const fs::path cur = pending.back();
+            pending.pop_back();
+            std::vector<fs::path> subdirs;
+            for (const auto &entry : fs::directory_iterator(cur, fs::directory_options::skip_permission_denied, ec))
             {
-                if (name.empty() || name[0] == '.' || name == "build" || name == "node_modules")
-                    it.disable_recursion_pending();
-                continue;
+                if (scanned >= 2000)
+                    break;
+                const fs::path p = entry.path();
+                std::string name = p.filename().string();
+                if (entry.is_directory(ec))
+                {
+                    if (!(name.empty() || name[0] == '.' || name == "build" || name == "node_modules"))
+                        subdirs.push_back(p);
+                    continue;
+                }
+                std::string ext = fileExtLower(name);
+                if (ext != ".h" && ext != ".hpp" && ext != ".hh" && ext != ".c" && ext != ".cpp" && ext != ".cc" &&
+                    ext != ".sa")
+                    continue;
+                ++scanned;
+                std::ifstream in(p, std::ios::binary);
+                std::ostringstream text;
+                text << in.rdbuf();
+                if (int at = uniqueLine(text.str(), code))
+                {
+                    file = fs::relative(p, fs::current_path(), ec).string();
+                    if (ec || file.empty())
+                        file = p.string();
+                    line = at;
+                    return true;
+                }
             }
-            std::string ext = fileExtLower(name);
-            if (ext != ".h" && ext != ".hpp" && ext != ".hh" && ext != ".c" && ext != ".cpp" && ext != ".cc" &&
-                ext != ".sa")
-                continue;
-            ++scanned;
-            std::ifstream in(p, std::ios::binary);
-            std::ostringstream text;
-            text << in.rdbuf();
-            if (int at = uniqueLine(text.str(), code))
-            {
-                file = fs::relative(p, fs::current_path(), ec).string();
-                if (ec || file.empty())
-                    file = p.string();
-                line = at;
-                return true;
-            }
+            for (size_t i = subdirs.size(); i-- > 0;)
+                pending.push_back(subdirs[i]);
         }
         return false;
     }

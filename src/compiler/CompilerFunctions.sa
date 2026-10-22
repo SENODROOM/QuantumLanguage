@@ -29,111 +29,111 @@ struct PyLocalScan {
   void visit(ASTNode *n) {
     if (!n)
       return;
-    std::visit(
-        [&](auto &v) {
-          using T = std::decay_t<decltype(v)>;
-          if constexpr (std::is_same_v<T, Identifier>)
-            seen.insert(v.name);
-          else if constexpr (std::is_same_v<T, GlobalStmt>)
-            for (auto &name : v.names) {
-              excluded.insert(name);
-              seen.insert(name);
-            }
-          else if constexpr (std::is_same_v<T, AssignExpr>) {
-            visit(v.value.get()); // the right side runs first
-            if (v.op == "kwarg")
-              return; // f(key=value) binds a parameter, not a variable
-            if (v.target && v.target->template is<Identifier>()) {
-              const std::string &name = v.target->template as<Identifier>().name;
-              if (v.op == "=")
-                write(name);
-              else
-                seen.insert(name); // `x += 1` reads x first
-            } else if (v.target && v.target->template is<TupleLiteral>()) {
-              for (auto &el : v.target->template as<TupleLiteral>().elements)
-                if (el->template is<Identifier>())
-                  write(el->template as<Identifier>().name);
-            } else
-              visit(v.target.get()); // obj.f = ..., a[i] = ...
-          } else if constexpr (std::is_same_v<T, BinaryExpr>) {
-            visit(v.left.get());
-            visit(v.right.get());
-          } else if constexpr (std::is_same_v<T, UnaryExpr>)
-            visit(v.operand.get());
-          else if constexpr (std::is_same_v<T, CallExpr>) {
-            visit(v.callee.get());
-            for (auto &a : v.args)
-              visit(a.get());
-          } else if constexpr (std::is_same_v<T, IndexExpr>) {
-            visit(v.object.get());
-            visit(v.index.get());
-          } else if constexpr (std::is_same_v<T, SliceExpr>) {
-            visit(v.object.get());
-            visit(v.start.get());
-            visit(v.stop.get());
-            visit(v.step.get());
-          } else if constexpr (std::is_same_v<T, MemberExpr>)
-            visit(v.object.get());
-          else if constexpr (std::is_same_v<T, ArrowExpr>)
-            visit(v.object.get());
-          else if constexpr (std::is_same_v<T, ArrayLiteral> ||
-                             std::is_same_v<T, TupleLiteral>)
-            for (auto &e : v.elements)
-              visit(e.get());
-          else if constexpr (std::is_same_v<T, DictLiteral>)
-            for (auto &kv : v.pairs) {
-              visit(kv.first.get());
-              visit(kv.second.get());
-            }
-          else if constexpr (std::is_same_v<T, ListComp>) {
-            visit(v.iterable.get());
-            visit(v.expr.get());
-            visit(v.condition.get());
-          } else if constexpr (std::is_same_v<T, TernaryExpr>) {
-            visit(v.condition.get());
-            visit(v.thenExpr.get());
-            visit(v.elseExpr.get());
-          } else if constexpr (std::is_same_v<T, AddressOfExpr> ||
-                               std::is_same_v<T, DerefExpr>)
-            visit(v.operand.get());
-          else if constexpr (std::is_same_v<T, NewExpr>) {
-            for (auto &a : v.args)
-              visit(a.get());
-            visit(v.sizeExpr.get());
-          } else if constexpr (std::is_same_v<T, VarDecl>)
-            visit(v.initializer.get());
-          else if constexpr (std::is_same_v<T, ReturnStmt>)
-            visit(v.value.get());
-          else if constexpr (std::is_same_v<T, RaiseStmt>)
-            visit(v.value.get());
-          else if constexpr (std::is_same_v<T, IfStmt>) {
-            visit(v.condition.get());
-            visit(v.thenBranch.get());
-            visit(v.elseBranch.get());
-          } else if constexpr (std::is_same_v<T, WhileStmt>) {
-            visit(v.condition.get());
-            visit(v.body.get());
-            visit(v.post.get());
-          } else if constexpr (std::is_same_v<T, ForStmt>) {
-            visit(v.iterable.get());
-            visit(v.body.get());
-          } else if constexpr (std::is_same_v<T, BlockStmt>)
-            for (auto &s : v.statements)
-              visit(s.get());
-          else if constexpr (std::is_same_v<T, ExprStmt>)
-            visit(v.expr.get());
-          else if constexpr (std::is_same_v<T, PrintStmt>)
-            for (auto &a : v.args)
-              visit(a.get());
-          else if constexpr (std::is_same_v<T, TryStmt>) {
-            visit(v.body.get());
-            for (auto &h : v.handlers)
-              visit(h.body.get());
-            visit(v.finallyBody.get());
-          }
-          // FunctionDecl / LambdaExpr / ClassDecl: their own scopes.
-        },
-        n->node);
+    // One get_if per node kind (the self-hosting front-end types these).
+    if (auto *p = std::get_if<Identifier>(&n->node)) {
+      seen.insert(p->name);
+    } else if (auto *p = std::get_if<GlobalStmt>(&n->node)) {
+      for (auto &name : p->names) {
+        excluded.insert(name);
+        seen.insert(name);
+      }
+    } else if (auto *p = std::get_if<AssignExpr>(&n->node)) {
+      auto &v = *p;
+      visit(v.value.get()); // the right side runs first
+      if (v.op == "kwarg")
+        return; // f(key=value) binds a parameter, not a variable
+      if (v.target && v.target->is<Identifier>()) {
+        const std::string &name = v.target->as<Identifier>().name;
+        if (v.op == "=")
+          write(name);
+        else
+          seen.insert(name); // `x += 1` reads x first
+      } else if (v.target && v.target->is<TupleLiteral>()) {
+        for (auto &el : v.target->as<TupleLiteral>().elements)
+          if (el->is<Identifier>())
+            write(el->as<Identifier>().name);
+      } else
+        visit(v.target.get()); // obj.f = ..., a[i] = ...
+    } else if (auto *p = std::get_if<BinaryExpr>(&n->node)) {
+      visit(p->left.get());
+      visit(p->right.get());
+    } else if (auto *p = std::get_if<UnaryExpr>(&n->node)) {
+      visit(p->operand.get());
+    } else if (auto *p = std::get_if<CallExpr>(&n->node)) {
+      visit(p->callee.get());
+      for (auto &a : p->args)
+        visit(a.get());
+    } else if (auto *p = std::get_if<IndexExpr>(&n->node)) {
+      visit(p->object.get());
+      visit(p->index.get());
+    } else if (auto *p = std::get_if<SliceExpr>(&n->node)) {
+      visit(p->object.get());
+      visit(p->start.get());
+      visit(p->stop.get());
+      visit(p->step.get());
+    } else if (auto *p = std::get_if<MemberExpr>(&n->node)) {
+      visit(p->object.get());
+    } else if (auto *p = std::get_if<ArrowExpr>(&n->node)) {
+      visit(p->object.get());
+    } else if (auto *p = std::get_if<ArrayLiteral>(&n->node)) {
+      for (auto &e : p->elements)
+        visit(e.get());
+    } else if (auto *p = std::get_if<TupleLiteral>(&n->node)) {
+      for (auto &e : p->elements)
+        visit(e.get());
+    } else if (auto *p = std::get_if<DictLiteral>(&n->node)) {
+      for (auto &kv : p->pairs) {
+        visit(kv.first.get());
+        visit(kv.second.get());
+      }
+    } else if (auto *p = std::get_if<ListComp>(&n->node)) {
+      visit(p->iterable.get());
+      visit(p->expr.get());
+      visit(p->condition.get());
+    } else if (auto *p = std::get_if<TernaryExpr>(&n->node)) {
+      visit(p->condition.get());
+      visit(p->thenExpr.get());
+      visit(p->elseExpr.get());
+    } else if (auto *p = std::get_if<AddressOfExpr>(&n->node)) {
+      visit(p->operand.get());
+    } else if (auto *p = std::get_if<DerefExpr>(&n->node)) {
+      visit(p->operand.get());
+    } else if (auto *p = std::get_if<NewExpr>(&n->node)) {
+      for (auto &a : p->args)
+        visit(a.get());
+      visit(p->sizeExpr.get());
+    } else if (auto *p = std::get_if<VarDecl>(&n->node)) {
+      visit(p->initializer.get());
+    } else if (auto *p = std::get_if<ReturnStmt>(&n->node)) {
+      visit(p->value.get());
+    } else if (auto *p = std::get_if<RaiseStmt>(&n->node)) {
+      visit(p->value.get());
+    } else if (auto *p = std::get_if<IfStmt>(&n->node)) {
+      visit(p->condition.get());
+      visit(p->thenBranch.get());
+      visit(p->elseBranch.get());
+    } else if (auto *p = std::get_if<WhileStmt>(&n->node)) {
+      visit(p->condition.get());
+      visit(p->body.get());
+      visit(p->post.get());
+    } else if (auto *p = std::get_if<ForStmt>(&n->node)) {
+      visit(p->iterable.get());
+      visit(p->body.get());
+    } else if (auto *p = std::get_if<BlockStmt>(&n->node)) {
+      for (auto &s : p->statements)
+        visit(s.get());
+    } else if (auto *p = std::get_if<ExprStmt>(&n->node)) {
+      visit(p->expr.get());
+    } else if (auto *p = std::get_if<PrintStmt>(&n->node)) {
+      for (auto &a : p->args)
+        visit(a.get());
+    } else if (auto *p = std::get_if<TryStmt>(&n->node)) {
+      visit(p->body.get());
+      for (auto &h : p->handlers)
+        visit(h.body.get());
+      visit(p->finallyBody.get());
+    }
+    // FunctionDecl / LambdaExpr / ClassDecl: their own scopes.
   }
 };
 } // namespace

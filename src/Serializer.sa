@@ -11,59 +11,109 @@ enum class ValueType : uint8_t {
     VAL_CLOSURE = 5
 };
 
-template <typename T>
-void Serializer::writeRaw(std::vector<uint8_t>& out, const T& t) {
-    const uint8_t* ptr = reinterpret_cast<const uint8_t*>(&t);
-    out.insert(out.end(), ptr, ptr + sizeof(T));
+// Fixed-width little-endian encoders. No raw memory: the same code runs as
+// native C++ and as Quantum bytecode (src/selfhost/quantum.cpp).
+void Serializer::putU8(std::vector<uint8_t>& out, uint8_t v) {
+    out.push_back(v);
 }
 
-template <typename T>
-T Serializer::readRaw(const std::vector<uint8_t>& data, size_t& offset) {
-    if (offset + sizeof(T) > data.size()) {
+void Serializer::putU32(std::vector<uint8_t>& out, uint32_t v) {
+    for (int i = 0; i < 4; ++i)
+        out.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF));
+}
+
+void Serializer::putI32(std::vector<uint8_t>& out, int32_t v) {
+    putU32(out, static_cast<uint32_t>(v));
+}
+
+void Serializer::putF64(std::vector<uint8_t>& out, double v) {
+#ifdef QUANTUM_SELFHOST
+    std::vector<int> raw = __host_f64_bytes(v);
+    for (int b : raw)
+        out.push_back(static_cast<uint8_t>(b));
+#else
+    uint8_t raw[8];
+    std::memcpy(raw, &v, 8);
+    out.insert(out.end(), raw, raw + 8);
+#endif
+}
+
+static void need(const std::vector<uint8_t>& data, size_t offset, size_t n) {
+    if (offset + n > data.size()) {
         throw std::runtime_error("Unexpected end of file while deserializing");
     }
-    T t;
-    std::memcpy(&t, data.data() + offset, sizeof(T));
-    offset += sizeof(T);
-    return t;
+}
+
+uint8_t Serializer::getU8(const std::vector<uint8_t>& data, size_t& offset) {
+    need(data, offset, 1);
+    return data[offset++];
+}
+
+uint32_t Serializer::getU32(const std::vector<uint8_t>& data, size_t& offset) {
+    need(data, offset, 4);
+    uint32_t v = 0;
+    for (int i = 0; i < 4; ++i)
+        v |= static_cast<uint32_t>(data[offset + i]) << (8 * i);
+    offset += 4;
+    return v;
+}
+
+int32_t Serializer::getI32(const std::vector<uint8_t>& data, size_t& offset) {
+    return static_cast<int32_t>(getU32(data, offset));
+}
+
+double Serializer::getF64(const std::vector<uint8_t>& data, size_t& offset) {
+    need(data, offset, 8);
+#ifdef QUANTUM_SELFHOST
+    double d = __host_f64_from(data, offset);
+#else
+    double d;
+    std::memcpy(&d, data.data() + offset, 8);
+#endif
+    offset += 8;
+    return d;
 }
 
 void Serializer::writeString(std::vector<uint8_t>& out, const std::string& s) {
-    writeRaw<uint32_t>(out, static_cast<uint32_t>(s.size()));
-    out.insert(out.end(), s.begin(), s.end());
+    putU32(out, static_cast<uint32_t>(s.size()));
+    for (char c : s)
+        out.push_back(static_cast<uint8_t>(c));
 }
 
 std::string Serializer::readString(const std::vector<uint8_t>& data, size_t& offset) {
-    uint32_t len = readRaw<uint32_t>(data, offset);
+    uint32_t len = getU32(data, offset);
     if (offset + len > data.size()) {
         throw std::runtime_error("Unexpected string length while deserializing");
     }
-    std::string s(reinterpret_cast<const char*>(data.data() + offset), len);
+    std::string s;
+    s.reserve(len);
+    for (uint32_t i = 0; i < len; ++i)
+        s.push_back(static_cast<char>(data[offset + i]));
     offset += len;
     return s;
 }
 
 void Serializer::writeValue(std::vector<uint8_t>& out, const QuantumValue& val) {
     if (val.isNil()) {
-        writeRaw(out, ValueType::VAL_NIL);
+        putU8(out, static_cast<uint8_t>(ValueType::VAL_NIL));
     } else if (val.isBool()) {
-        writeRaw(out, ValueType::VAL_BOOL);
-        writeRaw(out, static_cast<uint8_t>(val.asBool() ? 1 : 0));
+        putU8(out, static_cast<uint8_t>(ValueType::VAL_BOOL));
+        putU8(out, static_cast<uint8_t>(val.asBool() ? 1 : 0));
     } else if (val.isNumber()) {
-        writeRaw(out, ValueType::VAL_NUMBER);
-        writeRaw(out, val.asNumber());
+        putU8(out, static_cast<uint8_t>(ValueType::VAL_NUMBER));
+        putF64(out, val.asNumber());
     } else if (val.isString()) {
-        writeRaw(out, ValueType::VAL_STRING);
+        putU8(out, static_cast<uint8_t>(ValueType::VAL_STRING));
         writeString(out, val.asString());
     } else if (val.isArray()) {
-        writeRaw(out, ValueType::VAL_ARRAY);
+        putU8(out, static_cast<uint8_t>(ValueType::VAL_ARRAY));
         auto arr = val.asArray();
-        writeRaw<uint32_t>(out, static_cast<uint32_t>(arr->size()));
+        putU32(out, static_cast<uint32_t>(arr->size()));
         for (const auto& item : *arr) {
             writeValue(out, item);
         }
     } else if (val.isFunction()) {
-        writeRaw(out, ValueType::VAL_CLOSURE);
+        putU8(out, static_cast<uint8_t>(ValueType::VAL_CLOSURE));
         writeChunk(out, val.asFunction()->chunk);
     } else {
         throw std::runtime_error("Cannot serialize value of type " + val.typeName());
@@ -71,18 +121,18 @@ void Serializer::writeValue(std::vector<uint8_t>& out, const QuantumValue& val) 
 }
 
 QuantumValue Serializer::readValue(const std::vector<uint8_t>& data, size_t& offset) {
-    ValueType type = readRaw<ValueType>(data, offset);
+    ValueType type = static_cast<ValueType>(getU8(data, offset));
     switch (type) {
         case ValueType::VAL_NIL:
             return QuantumValue();
         case ValueType::VAL_BOOL:
-            return QuantumValue(readRaw<uint8_t>(data, offset) != 0);
+            return QuantumValue(getU8(data, offset) != 0);
         case ValueType::VAL_NUMBER:
-            return QuantumValue(readRaw<double>(data, offset));
+            return QuantumValue(getF64(data, offset));
         case ValueType::VAL_STRING:
             return QuantumValue(readString(data, offset));
         case ValueType::VAL_ARRAY: {
-            uint32_t size = readRaw<uint32_t>(data, offset);
+            uint32_t size = getU32(data, offset);
             auto arr = std::make_shared<Array>(size);
             for (uint32_t i = 0; i < size; ++i) {
                 (*arr)[i] = readValue(data, offset);
@@ -102,30 +152,30 @@ void Serializer::writeChunk(std::vector<uint8_t>& out, std::shared_ptr<Chunk> ch
     writeString(out, chunk->name);
     
     // code
-    writeRaw<uint32_t>(out, static_cast<uint32_t>(chunk->code.size()));
+    putU32(out, static_cast<uint32_t>(chunk->code.size()));
     for (const auto& instr : chunk->code) {
-        writeRaw(out, instr.op);
-        writeRaw(out, instr.operand);
-        writeRaw(out, instr.line);
+        putU8(out, static_cast<uint8_t>(instr.op));
+        putI32(out, instr.operand);
+        putI32(out, instr.line);
     }
     
     // params
-    writeRaw<uint32_t>(out, static_cast<uint32_t>(chunk->params.size()));
+    putU32(out, static_cast<uint32_t>(chunk->params.size()));
     for (const auto& param : chunk->params) {
         writeString(out, param);
     }
     
     // paramIsRef
-    writeRaw<uint32_t>(out, static_cast<uint32_t>(chunk->paramIsRef.size()));
+    putU32(out, static_cast<uint32_t>(chunk->paramIsRef.size()));
     for (bool isRef : chunk->paramIsRef) {
-        writeRaw<uint8_t>(out, isRef ? 1 : 0);
+        putU8(out, isRef ? 1 : 0);
     }
     
     // upvalueCount
-    writeRaw(out, chunk->upvalueCount);
+    putI32(out, chunk->upvalueCount);
     
     // constants
-    writeRaw<uint32_t>(out, static_cast<uint32_t>(chunk->constants.size()));
+    putU32(out, static_cast<uint32_t>(chunk->constants.size()));
     for (const auto& c : chunk->constants) {
         writeValue(out, c);
     }
@@ -136,35 +186,35 @@ std::shared_ptr<Chunk> Serializer::readChunk(const std::vector<uint8_t>& data, s
     chunk->name = readString(data, offset);
     
     // code
-    uint32_t codeSize = readRaw<uint32_t>(data, offset);
+    uint32_t codeSize = getU32(data, offset);
     chunk->code.reserve(codeSize);
     for (uint32_t i = 0; i < codeSize; ++i) {
         Instruction instr;
-        instr.op = readRaw<Op>(data, offset);
-        instr.operand = readRaw<int32_t>(data, offset);
-        instr.line = readRaw<int>(data, offset);
+        instr.op = static_cast<Op>(getU8(data, offset));
+        instr.operand = getI32(data, offset);
+        instr.line = getI32(data, offset);
         chunk->code.push_back(instr);
     }
     
     // params
-    uint32_t paramsSize = readRaw<uint32_t>(data, offset);
+    uint32_t paramsSize = getU32(data, offset);
     chunk->params.reserve(paramsSize);
     for (uint32_t i = 0; i < paramsSize; ++i) {
         chunk->params.push_back(readString(data, offset));
     }
     
     // paramIsRef
-    uint32_t refSize = readRaw<uint32_t>(data, offset);
+    uint32_t refSize = getU32(data, offset);
     chunk->paramIsRef.reserve(refSize);
     for (uint32_t i = 0; i < refSize; ++i) {
-        chunk->paramIsRef.push_back(readRaw<uint8_t>(data, offset) != 0);
+        chunk->paramIsRef.push_back(getU8(data, offset) != 0);
     }
     
     // upvalueCount
-    chunk->upvalueCount = readRaw<int>(data, offset);
+    chunk->upvalueCount = getI32(data, offset);
     
     // constants
-    uint32_t constSize = readRaw<uint32_t>(data, offset);
+    uint32_t constSize = getU32(data, offset);
     chunk->constants.reserve(constSize);
     for (uint32_t i = 0; i < constSize; ++i) {
         chunk->constants.push_back(readValue(data, offset));

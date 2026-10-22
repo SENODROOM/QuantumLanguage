@@ -1,10 +1,69 @@
 #include "Vm.h"
 #include "Error.h"
 #include "Disassembler.h"
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <string>
 #include <unordered_set>
+#include <vector>
+
+// QUANTUM_PROFILE=1: at exit, print where the time went — natives by total
+// time, and bytecode functions by instructions executed. Off by default.
+namespace
+{
+struct Profiler
+{
+    bool on = false;
+    std::unordered_map<std::string, long long> steps;
+    std::unordered_map<std::string, std::pair<long long, double>> natives;
+    Profiler() { on = std::getenv("QUANTUM_PROFILE") != nullptr; }
+    ~Profiler()
+    {
+        if (!on)
+            return;
+        std::vector<std::pair<std::string, std::pair<long long, double>>> nv(natives.begin(), natives.end());
+        std::sort(nv.begin(), nv.end(), [](const auto &a, const auto &b) { return a.second.second > b.second.second; });
+        std::cerr << "\n[profile] natives by total time (calls, seconds)\n";
+        for (size_t i = 0; i < nv.size() && i < 25; ++i)
+            std::cerr << "  " << nv[i].first << "  " << nv[i].second.first << "  " << nv[i].second.second << "\n";
+        std::vector<std::pair<std::string, long long>> sv(steps.begin(), steps.end());
+        std::sort(sv.begin(), sv.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+        std::cerr << "[profile] functions by instructions executed\n";
+        for (size_t i = 0; i < sv.size() && i < 25; ++i)
+            std::cerr << "  " << sv[i].first << "  " << sv[i].second << "\n";
+    }
+} g_prof;
+
+QuantumValue callNative(const std::shared_ptr<QuantumNative> &n, std::vector<QuantumValue> &args)
+{
+    if (!g_prof.on)
+        return n->fn(std::move(args));
+    auto t0 = std::chrono::steady_clock::now();
+    QuantumValue r = n->fn(std::move(args));
+    double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    auto &e = g_prof.natives[n->name];
+    ++e.first;
+    e.second += s;
+    return r;
+}
+} // namespace
+
+// The runaway-program guard. QUANTUM_MAX_STEPS=<n> raises it (0 = no limit): the
+// self-hosted compiler runs a whole C++ front-end as bytecode.
+static long long maxSteps()
+{
+    static const long long limit = []
+    {
+        const char *e = std::getenv("QUANTUM_MAX_STEPS");
+        if (!e)
+            return 200000000LL; // the default (Vm.h MAX_STEPS)
+        long long v = std::atoll(e);
+        return v <= 0 ? (long long)0x7fffffffffffffffLL : v;
+    }();
+    return limit;
+}
 
 // Method lookup on one class. The class parser stores a C++/JS/Ruby
 // `toString()` / `to_string()` / `to_s`-style method as `__str__` (so
@@ -18,6 +77,19 @@ findMethod(QuantumClass *k, const std::string &name)
         (name == "toString" || name == "to_string" || name == "to_str"))
         it = k->methods.find("__str__");
     return it;
+}
+
+void VM::padForHandler(const ExceptionHandler &h)
+{
+    if (frames_.empty() || h.catchIp < 0)
+        return;
+    const CallFrame &f = frames_.back();
+    const auto &code = f.closure->chunk->code;
+    if ((size_t)h.catchIp >= code.size() || code[h.catchIp].op != Op::DEFINE_LOCAL)
+        return;
+    const size_t want = f.stackBase + (size_t)code[h.catchIp].operand;
+    while (stack_.size() < want)
+        stack_.push_back(QuantumValue());
 }
 
 void VM::runFrame(size_t stopDepth)
@@ -49,7 +121,9 @@ void VM::runFrame(size_t stopDepth)
             continue;
         }
 
-        if (++stepCount_ > MAX_STEPS)
+        if (g_prof.on)
+            ++g_prof.steps[frame.closure->chunk->name];
+        if (++stepCount_ > maxSteps())
             throw RuntimeError("Execution step limit exceeded (possible infinite loop)");
 
         const Instruction &instr = code[frame.ip++];
@@ -511,12 +585,12 @@ void VM::runFrame(size_t stopDepth)
             {
                 std::vector<QuantumValue> args;
                 for (int i = 0; i < argCount; ++i)
-                    args.push_back(stack_[stack_.size() - argCount + i]);
+                    args.push_back(std::move(stack_[stack_.size() - argCount + i]));
                 for (int i = 0; i <= argCount; ++i)
                     stack_.pop_back(); // pop args and callee
                 try
                 {
-                    push(callee.asNative()->fn(args));
+                    push(callNative(callee.asNative(), args));
                 }
                 catch (QuantumError &)
                 {
@@ -524,6 +598,8 @@ void VM::runFrame(size_t stopDepth)
                 }
                 catch (std::exception &e)
                 {
+                    if (std::getenv("QUANTUM_DEBUG_NATIVE")) // which native raised a C++ exception
+                        throw RuntimeError(std::string(e.what()) + " [in native " + callee.asNative()->name + "]", line);
                     throw RuntimeError(e.what(), line);
                 }
                 break;
@@ -1145,10 +1221,10 @@ void VM::runFrame(size_t stopDepth)
                 std::vector<QuantumValue> args;
                 args.reserve(argCount);
                 for (int i = 0; i < argCount; ++i)
-                    args.push_back(stack_[stack_.size() - argCount + i]);
+                    args.push_back(std::move(stack_[stack_.size() - argCount + i]));
                 for (int i = 0; i <= argCount; ++i)
                     stack_.pop_back();
-                push(callee.asNative()->fn(args));
+                push(callNative(callee.asNative(), args));
                 break;
             }
             if (callee.isDict())
@@ -1160,7 +1236,7 @@ void VM::runFrame(size_t stopDepth)
                     std::vector<QuantumValue> args;
                     args.reserve(argCount);
                     for (int i = 0; i < argCount; ++i)
-                        args.push_back(stack_[stack_.size() - argCount + i]);
+                        args.push_back(std::move(stack_[stack_.size() - argCount + i]));
                     for (int i = 0; i <= argCount; ++i)
                         stack_.pop_back();
 
@@ -1250,6 +1326,7 @@ void VM::runFrame(size_t stopDepth)
             closeUpvalues(h.stackDepth);
             while (stack_.size() > h.stackDepth)
                 stack_.pop_back();
+            padForHandler(h);
             push(val);
             if (!frames_.empty())
                 frames_.back().ip = h.catchIp;
@@ -1357,6 +1434,7 @@ void VM::runFrame(size_t stopDepth)
             closeUpvalues(h.stackDepth);
             while (stack_.size() > h.stackDepth)
                 stack_.pop_back();
+            padForHandler(h);
             if (auto *thrown = dynamic_cast<CppThrow *>(&e))
                 push(thrown->value);
             else if (e.line > 0 && std::getenv("QUANTUM_DEBUG_CPPFE"))

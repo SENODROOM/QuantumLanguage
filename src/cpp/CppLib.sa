@@ -96,6 +96,37 @@ XV Lowerer::libName(const std::vector<std::string> &nameIn, int line, bool &foun
         return mkxv(q::nil(line), mkT(T::Nullopt));
     if (n == "stdout" || n == "stderr" || n == "stdin")
         return mkxv(q::str(n, line), mkT(T::Dyn, "FILE"));
+    // std::filesystem option flags (the __cpp_fs__ native reads copy_options as bits)
+    if (n.rfind("filesystem::", 0) == 0)
+    {
+        static const std::map<std::string, int> fsConsts = {
+            {"copy_options::none", 0},
+            {"copy_options::skip_existing", 1},
+            {"copy_options::overwrite_existing", 2},
+            {"copy_options::update_existing", 4},
+            {"copy_options::recursive", 8},
+            {"copy_options::copy_symlinks", 16},
+            {"copy_options::skip_symlinks", 32},
+            {"copy_options::directories_only", 64},
+            {"directory_options::none", 0},
+            {"directory_options::follow_directory_symlink", 2},
+            {"directory_options::skip_permission_denied", 1}};
+        auto it = fsConsts.find(n.substr(12));
+        if (it != fsConsts.end())
+            return mkxv(q::num(it->second, line), tInt());
+    }
+    // <cctype> functions used as values (std::transform(..., ::tolower))
+    static const std::set<std::string> ctypeFns = {"isalpha", "isdigit", "isalnum", "isspace", "isupper",
+                                                   "islower", "ispunct", "isxdigit", "tolower", "toupper"};
+    if (ctypeFns.count(n))
+    {
+        std::vector<ASTNodePtr> st;
+        st.push_back(q::ret(q::call("__cpp_ctype__", args2(q::str(n, line), q::id("__c", line)), line), line));
+        auto ft = mkT(T::Func);
+        ft->a.push_back(tInt());
+        ft->a.push_back(tInt());
+        return mkxv(q::lambda({"__c"}, q::block(std::move(st), line), line), ft);
+    }
     if (n == "ios::app" || n == "ios_base::app")
         return mkxv(q::num(1, line), tInt());
     if (n == "ios::out" || n == "ios::in" || n == "ios::binary" || n == "ios::trunc" || n == "ios_base::out" ||
@@ -206,6 +237,15 @@ XV Lowerer::constructBuiltinType(const TP &t, std::vector<ExprP> &args, bool bra
         if (args.empty())
             return mkxv(q::nil(line), t);
         {
+            // shared_ptr<T>(owner, ptr) (the aliasing constructor): the pointer is `ptr`.
+            // Objects are held by reference here, so the owner has nothing to add.
+            if (args.size() == 2 && t->name == "shared_ptr")
+            {
+                lower(0);
+                XV b = lower(1);
+                b.t = t;
+                return b;
+            }
             XV a = lower(0);
             a.t = t;
             return a;
@@ -395,7 +435,7 @@ XV Lowerer::libCall(const std::string &fnIn, const ExprP &e, std::vector<ExprP> 
     }
     if (fn == "stoi" || fn == "stol" || fn == "stoll" || fn == "stoul" || fn == "stoull" || fn == "stof" ||
         fn == "stod" || fn == "stold" || fn == "atoi" || fn == "atol" || fn == "atoll" || fn == "atof" ||
-        fn == "strtol" || fn == "strtoll" || fn == "strtod" || fn == "strtoul")
+        fn == "strtol" || fn == "strtoll" || fn == "strtod" || fn == "strtoul" || fn == "strtoull")
     {
         need(1);
         XV s = lower(0);
@@ -422,7 +462,7 @@ XV Lowerer::libCall(const std::string &fnIn, const ExprP &e, std::vector<ExprP> 
         a.push_back(std::move(pos));
         a.push_back(std::move(base));
         a.push_back(q::str(fn, ln));
-        TP rt = fl ? tDouble() : (fn == "stoi" || fn == "atoi") ? tInt() : (fn == "stoul" || fn == "stoull" || fn == "strtoul") ? tSize() : tLL();
+        TP rt = fl ? tDouble() : (fn == "stoi" || fn == "atoi") ? tInt() : (fn == "stoul" || fn == "stoull" || fn == "strtoul" || fn == "strtoull") ? tSize() : tLL();
         return mkxv(q::call("__cpp_sto__", std::move(a), ln), rt);
     }
     if (fn == "getline")
@@ -578,6 +618,109 @@ XV Lowerer::libCall(const std::string &fnIn, const ExprP &e, std::vector<ExprP> 
     {
         XV a = lower(0);
         return mkxv(q::call("__cpp_system__", args1(read(a)), ln), tInt());
+    }
+    if (fn == "getenv")
+    {
+        need(1);
+        XV a = lower(0);
+        return mkxv(q::call("__cpp_getenv__", args1(read(a)), ln), tCStr());
+    }
+    if (fn == "make_move_iterator" || fn == "make_reverse_iterator")
+    {
+        need(1);
+        return lower(0); // moving from the range is an optimisation, not a semantic
+    }
+    // Host intrinsics (self-hosting, QUANTUM_SELFHOST): platform services the
+    // seed VM provides natively. __host_x(args) calls the native __host_x__.
+    if (fn.rfind("__host_", 0) == 0)
+    {
+        std::vector<ASTNodePtr> a;
+        for (size_t i = 0; i < args.size(); ++i)
+        {
+            XV x = lower(i);
+            a.push_back(read(x));
+        }
+        TP rt;
+        if (fn == "__host_exe_path" || fn == "__host_capture" || fn == "__host_read_file" || fn == "__host_time_str")
+            rt = tStr();
+        else if (fn == "__host_spawn" || fn == "__host_last_exit" || fn == "__host_run_chunk")
+            rt = tInt();
+        else if (fn == "__host_append_bytes" || fn == "__host_write_file")
+            rt = tBool();
+        else if (fn == "__host_f64_from")
+            rt = tDouble();
+        else if (fn == "__host_f64_bytes" || fn == "__host_file_bytes")
+        {
+            rt = mkT(T::Vector, "vector");
+            rt->a.push_back(tInt());
+        }
+        else if (fn == "__host_exit")
+            rt = tVoid();
+        else
+            unsupported("unknown host intrinsic " + fn, ln);
+        return mkxv(q::call(fn + "__", std::move(a), ln), rt);
+    }
+    // <regex>: the work is done by the __cpp_re__ / __cpp_re_replace__ natives (std::regex, ECMAScript)
+    if (fn == "regex_search" || fn == "regex_match")
+    {
+        const bool full = fn == "regex_match";
+        if (args.size() == 2)
+        {
+            XV s = lower(0), re = lower(1);
+            std::vector<ASTNodePtr> a;
+            a.push_back(read(s));
+            a.push_back(read(re));
+            a.push_back(q::num(full ? 1 : 0, ln));
+            ASTNodePtr r = q::call("__cpp_re__", std::move(a), ln);
+            return mkxv(q::un("!", q::call("__cpp_isnull__", args1(std::move(r)), ln), ln), tBool());
+        }
+        need(3);
+        XV s = lower(0), m = lower(1), re = lower(2);
+        std::vector<ASTNodePtr> a;
+        a.push_back(read(s));
+        a.push_back(read(re));
+        a.push_back(q::num(full ? 1 : 0, ln));
+        ASTNodePtr st = store(m, q::call("__cpp_re__", std::move(a), ln), ln);
+        std::vector<ASTNodePtr> seq;
+        seq.push_back(std::move(st));
+        seq.push_back(q::un("!", q::call("__cpp_isnull__", args1(peekRead(m)), ln), ln));
+        return mkxv(q::call("__cpp_seq__", std::move(seq), ln), tBool());
+    }
+    if (fn == "regex_replace")
+    {
+        need(3);
+        XV s = lower(0), re = lower(1), f = lower(2);
+        std::vector<ASTNodePtr> a;
+        a.push_back(read(s));
+        a.push_back(read(re));
+        a.push_back(read(f));
+        return mkxv(q::call("__cpp_re_replace__", std::move(a), ln), tStr());
+    }
+    // <filesystem>: every call is __cpp_fs__(op, args...); a path is a string
+    // and a trailing std::error_code& argument is evaluated and ignored
+    if (fn.rfind("filesystem::", 0) == 0 || fn == "u8path")
+    {
+        std::string op = fn.rfind("filesystem::", 0) == 0 ? fn.substr(12) : fn;
+        static const std::set<std::string> boolOps = {
+            "exists", "is_regular_file", "is_directory", "is_empty", "equivalent", "create_directories",
+            "create_directory", "remove", "copy_file", "is_symlink", "is_other"};
+        static const std::set<std::string> pathOps = {"absolute", "weakly_canonical", "canonical", "relative",
+                                                      "proximate", "current_path", "temp_directory_path", "u8path"};
+        std::vector<ASTNodePtr> a;
+        a.push_back(q::str(op, ln));
+        for (size_t i = 0; i < args.size(); ++i)
+        {
+            XV x = lower(i);
+            a.push_back(read(x));
+        }
+        TP rt = boolOps.count(op) ? tBool()
+                : pathOps.count(op) ? mkT(T::Str, "path")
+                : (op == "file_size" || op == "remove_all") ? tSize()
+                : op == "last_write_time" ? tLL()
+                                          : tVoid();
+        if (op == "current_path" && args.size() == 1)
+            rt = tVoid();
+        return mkxv(q::call("__cpp_fs__", std::move(a), ln), rt);
     }
     if (fn == "fflush" || fn == "setvbuf" || fn == "ios::sync_with_stdio" || fn == "ios_base::sync_with_stdio")
     {
@@ -1019,11 +1162,79 @@ XV Lowerer::libMethod(XV &obj, const std::string &m, const ExprP &e, std::vector
     auto call = [&](const char *fn, std::vector<ASTNodePtr> a, TP rt, bool temp = true)
     { return mkxv(q::call(fn, std::move(a), ln), rt, temp); };
 
+    // std::smatch members: __cpp_re_m__(m, op, n)
+    if (t->k == T::Dyn && t->name == "smatch")
+    {
+        static const std::set<std::string> txt = {"str", "prefix", "suffix"};
+        static const std::set<std::string> num = {"size", "position", "length"};
+        if (txt.count(m) || num.count(m) || m == "empty" || m == "ready")
+        {
+            std::vector<ASTNodePtr> a;
+            a.push_back(self());
+            a.push_back(q::str(m, ln));
+            if (!args.empty())
+            {
+                XV x = lower(0);
+                a.push_back(read(x));
+            }
+            // prefix() / suffix() are sub_matches: .str() / .length() follow
+            TP rt = (m == "str" || m == "prefix" || m == "suffix") ? mkT(T::Str, m == "str" ? "string" : "submatch")
+                    : (m == "empty" || m == "ready")               ? tBool()
+                                                                   : tSize();
+            if (m == "str")
+                rt = tStr();
+            return call("__cpp_re_m__", std::move(a), rt);
+        }
+    }
+    // std::sub_match: str() / length() of a group that may be nil (did not take part)
+    if (t->k == T::Str && t->name == "submatch" && (m == "str" || m == "length" || m == "size"))
+    {
+        std::vector<ASTNodePtr> a;
+        a.push_back(self());
+        a.push_back(q::str("sub_" + m, ln));
+        return call("__cpp_re_m__", std::move(a), m == "str" ? tStr() : tSize());
+    }
+
     switch (t->k)
     {
     case T::Str:
     case T::CStr:
     {
+        // std::filesystem::path / directory_entry members: __cpp_fs__("m_<name>", self, args...)
+        static const std::set<std::string> pathText = {"string", "u8string", "generic_string", "native",
+                                                       "generic_u8string"};
+        static const std::set<std::string> pathPath = {"parent_path", "filename", "stem", "extension", "root_name",
+                                                       "root_directory", "root_path", "relative_path",
+                                                       "lexically_normal", "lexically_relative", "path"};
+        static const std::set<std::string> pathBool = {"is_absolute", "is_relative", "has_extension", "has_filename",
+                                                       "has_parent_path", "has_stem", "has_root_path", "exists",
+                                                       "is_directory", "is_regular_file", "is_symlink"};
+        static const std::set<std::string> pathMut = {"replace_extension", "remove_filename", "replace_filename",
+                                                      "make_preferred"};
+        if (pathText.count(m) || pathPath.count(m) || pathBool.count(m) || pathMut.count(m) || m == "file_size")
+        {
+            std::vector<ASTNodePtr> a;
+            a.push_back(q::str("m_" + m, ln));
+            a.push_back(self());
+            for (size_t i = 0; i < args.size(); ++i)
+            {
+                XV x = lower(i);
+                a.push_back(read(x));
+            }
+            if (pathMut.count(m))
+                return mkxv(store(obj, q::call("__cpp_fs__", std::move(a), ln), ln), mkT(T::Str, "path"), false);
+            TP rt = pathText.count(m) ? tStr()
+                    : pathPath.count(m) ? mkT(T::Str, "path")
+                    : m == "file_size" ? tSize()
+                                       : tBool();
+            return call("__cpp_fs__", std::move(a), rt);
+        }
+        if (m == "reserve" || m == "shrink_to_fit")
+        {
+            for (size_t i = 0; i < args.size(); ++i)
+                lower(i);
+            return mkxv(q::nil(ln), tVoid());
+        }
         if (m == "size" || m == "length")
             return call("__cpp_size__", args1(self()), tSize());
         if (m == "empty")
@@ -1155,10 +1366,31 @@ XV Lowerer::libMethod(XV &obj, const std::string &m, const ExprP &e, std::vector
             (args[0]->kids[0]->name.back() == "remove" || args[0]->kids[0]->name.back() == "remove_if" ||
              args[0]->kids[0]->name.back() == "unique"))
         {
-            // erase-remove idiom on a string: the algorithm drops the characters itself
-            XV r = lowerExpr(args[0]);
-            (void)r;
-            return mkxv(q::nil(ln), tVoid());
+            // erase-remove idiom on a string: s.erase(std::remove(s.begin(), s.end(), x), s.end()).
+            // Strings are values, so the algorithm cannot drop characters in place:
+            // s = __cpp_str_filter__(s, algorithm, x-or-predicate).
+            const ExprP &c = args[0];
+            const std::string algo = c->kids[0]->name.back();
+            const size_t extra = algo == "unique" ? 0 : 1; // value / predicate argument
+            if (c->kids.size() < 3 + extra || c->kids[1]->k != EK::Call || c->kids[1]->kids[0]->k != EK::Member ||
+                c->kids[1]->kids[0]->op != "begin")
+                unsupported("std::" + algo + " on part of a string", ln);
+            std::vector<ASTNodePtr> f;
+            f.push_back(peekRead(obj));
+            f.push_back(q::str(algo, ln));
+            if (extra)
+            {
+                if (c->kids[3]->k == EK::Lambda)
+                    lambdaHints_ = {tInt()};
+                XV x = lowerExpr(c->kids[3]);
+                lambdaHints_.clear();
+                if (x.isFuncName)
+                    x = convert(std::move(x), mkT(T::Func), ln);
+                f.push_back(read(x));
+            }
+            else
+                f.push_back(q::nil(ln));
+            return mkxv(store(obj, q::call("__cpp_str_filter__", std::move(f), ln), ln), tVoid(), false);
         }
         if (m == "insert" || m == "erase" || m == "replace" || m == "resize" || m == "assign" || m == "swap")
         {
@@ -1413,6 +1645,33 @@ XV Lowerer::libMethod(XV &obj, const std::string &m, const ExprP &e, std::vector
             return mkxv(q::bin("==", q::call("__cpp_size__", args1(self()), ln), q::num(0, ln), ln), tBool());
         if (m == "clear")
             return call("__cpp_clear__", args1(self()), tVoid());
+        if (m == "equal_range")
+        {
+            // pair<lower_bound(k), upper_bound(k)>
+            XV k = lowerTo(0, kt);
+            ASTNodePtr kk = simple(read(k), ln);
+            auto bound = [&](const char *which)
+            {
+                std::vector<ASTNodePtr> a;
+                a.push_back(q::str(which, ln));
+                a.push_back(self());
+                a.push_back(q::clone(kk));
+                a.push_back(q::boolean(t->sorted, ln));
+                return q::call("__cpp_dict_find__", std::move(a), ln);
+            };
+            std::vector<ASTNodePtr> el;
+            el.push_back(bound("lower_bound"));
+            el.push_back(bound("upper_bound"));
+            auto pt = mkT(T::Pair);
+            pt->a = {iterOf(t), iterOf(t)};
+            return mkxv(q::arr(std::move(el), ln), pt);
+        }
+        if (m == "reserve" || m == "rehash" || m == "max_load_factor")
+        {
+            for (size_t i = 0; i < args.size(); ++i)
+                lower(i);
+            return mkxv(q::nil(ln), tVoid());
+        }
         if (m == "count" || m == "contains")
         {
             XV k = lowerTo(0, kt);
@@ -1565,7 +1824,7 @@ XV Lowerer::libMethod(XV &obj, const std::string &m, const ExprP &e, std::vector
         if (m == "release")
         {
             std::string tmp = tempName();
-            if (pre_ && canHoist_)
+            if (pre_ && canHoist_ && obj.lk != XV::RV) // a temporary has nothing to null
             {
                 pre_->push_back(q::var(tmp, self(), ln));
                 ASTNodePtr st = store(obj, q::nil(ln), ln);
@@ -1596,6 +1855,18 @@ XV Lowerer::libMethod(XV &obj, const std::string &m, const ExprP &e, std::vector
                 return call("__cpp_ss_str__", args1(self()), tStr());
             XV s = lower(0);
             return call("__cpp_ss_setstr__", args2(self(), read(s)), tVoid());
+        }
+        if (m == "open")
+        {
+            // f.open(path[, mode]): the same stream a constructor would make
+            std::vector<ASTNodePtr> f;
+            f.push_back(q::str(t->name, ln));
+            for (size_t i = 0; i < args.size() && i < 2; ++i)
+            {
+                XV x = lower(i);
+                f.push_back(read(x));
+            }
+            return mkxv(store(obj, q::call("__cpp_stream_new__", std::move(f), ln), ln), tVoid(), false);
         }
         static const std::set<std::string> simpleMethods = {
             "good", "fail", "eof", "bad", "clear", "close", "is_open", "flush", "get", "peek", "ignore",

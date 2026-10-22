@@ -103,9 +103,11 @@ struct QuantumValue
     bool isPointer() const { return std::holds_alternative<std::shared_ptr<QuantumPointer>>(data); }
 
     // Accessors
+#ifdef QUANTUM_SELFHOST
     bool asBool() const { return std::get<bool>(data); }
     double asNumber() const { return std::get<double>(data); }
     std::string asString() const { return std::get<std::string>(data); }
+    const std::string &asStringRef() const { return std::get<std::string>(data); }
     std::shared_ptr<Array> asArray() const { return std::get<std::shared_ptr<Array>>(data); }
     std::shared_ptr<Dict> asDict() const { return std::get<std::shared_ptr<Dict>>(data); }
     std::shared_ptr<Closure> asFunction() const { return std::get<std::shared_ptr<Closure>>(data); }
@@ -113,6 +115,33 @@ struct QuantumValue
     std::shared_ptr<QuantumClass> asClass() const { return std::get<std::shared_ptr<QuantumClass>>(data); }
     std::shared_ptr<QuantumBoundMethod> asBoundMethod() const { return std::get<std::shared_ptr<QuantumBoundMethod>>(data); }
     std::shared_ptr<QuantumPointer> asPointer() const { return std::get<std::shared_ptr<QuantumPointer>>(data); }
+#else
+    // A wrong-type access reports what was wanted and what the value is
+    // (std::get would only say "wrong index for variant").
+    bool asBool() const { return get<bool>("bool"); }
+    double asNumber() const { return get<double>("number"); }
+    std::string asString() const { return get<std::string>("string"); }
+    const std::string &asStringRef() const { return get<std::string>("string"); }
+    std::shared_ptr<Array> asArray() const { return get<std::shared_ptr<Array>>("array"); }
+    std::shared_ptr<Dict> asDict() const { return get<std::shared_ptr<Dict>>("dict"); }
+    std::shared_ptr<Closure> asFunction() const { return get<std::shared_ptr<Closure>>("function"); }
+    std::shared_ptr<QuantumInstance> asInstance() const { return get<std::shared_ptr<QuantumInstance>>("instance"); }
+    std::shared_ptr<QuantumClass> asClass() const { return get<std::shared_ptr<QuantumClass>>("class"); }
+    std::shared_ptr<QuantumBoundMethod> asBoundMethod() const { return get<std::shared_ptr<QuantumBoundMethod>>("bound method"); }
+    std::shared_ptr<QuantumPointer> asPointer() const { return get<std::shared_ptr<QuantumPointer>>("pointer"); }
+
+private:
+    template <class X>
+    const X &get(const char *want) const
+    {
+        if (const X *p = std::get_if<X>(&data))
+            return *p;
+        badAccess(want);
+    }
+    [[noreturn]] void badAccess(const char *want) const;
+
+public:
+#endif
 
     bool isNative() const;
     std::shared_ptr<QuantumNative> asNative() const;

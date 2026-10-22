@@ -1,0 +1,97 @@
+// Host services for the self-hosted compiler (see include/HostBridge.h).
+// Native-only: this file is part of the seed build, never of the self-hosted
+// program (src/selfhost/quantum.cpp).
+
+#include "HostBridge.h"
+#include "Pipeline.h"
+#include "Serializer.h"
+#include "Vm.h"
+
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
+#include <iostream>
+
+#ifdef _WIN32
+    #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+    #endif
+    #ifndef NOMINMAX
+    #define NOMINMAX
+    #endif
+    #include <windows.h>
+#else
+    #include <sys/wait.h>
+#endif
+
+int hostSpawn(const std::string &cmdline)
+{
+    std::cout.flush();
+#ifdef _WIN32
+    STARTUPINFOA si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    std::vector<char> buf(cmdline.begin(), cmdline.end());
+    buf.push_back('\0');
+    if (!CreateProcessA(nullptr, buf.data(), nullptr, nullptr, TRUE, 0, nullptr, nullptr, &si, &pi))
+        return -1;
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD code = 1;
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    return static_cast<int>(code);
+#else
+    int rc = std::system(cmdline.c_str());
+    if (rc == -1)
+        return -1;
+    return WIFEXITED(rc) ? WEXITSTATUS(rc) : 1;
+#endif
+}
+
+std::string hostCapture(const std::string &cmd, int &exitCode)
+{
+    std::cout.flush();
+#ifdef _WIN32
+    FILE *pipe = _popen(cmd.c_str(), "r");
+#else
+    FILE *pipe = popen(cmd.c_str(), "r");
+#endif
+    if (!pipe)
+    {
+        exitCode = -1;
+        return "";
+    }
+    std::string out;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), pipe)) > 0)
+        out.append(buf, n);
+#ifdef _WIN32
+    exitCode = _pclose(pipe);
+#else
+    int status = pclose(pipe);
+    exitCode = (status == -1) ? -1 : (WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status));
+#endif
+    return out;
+}
+
+bool hostAppendBytes(const std::string &path, const std::vector<uint8_t> &bytes)
+{
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    if (!out)
+        return false;
+    out.write(reinterpret_cast<const char *>(bytes.data()), (std::streamsize)bytes.size());
+    out.flush();
+    return static_cast<bool>(out);
+}
+
+int hostRunChunk(const std::vector<uint8_t> &chunkBytes, const std::vector<std::string> &argv, bool testMode)
+{
+    auto chunk = Serializer::deserialize(chunkBytes);
+    g_scriptArgv = argv;
+    g_testMode = testMode;
+    VM vm;
+    vm.run(chunk);
+    return 0;
+}
